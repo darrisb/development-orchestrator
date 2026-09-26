@@ -1,0 +1,53 @@
+# Long-lived services only. Coding workers are disposable containers created
+# per task by the WorkerService (build.md section 11) and are never declared here.
+#
+# The orchestrator service can create disposable workers through the host
+# daemon. This grants it Docker-daemon authority; start only PostgreSQL when
+# that trust is not intended (`docker compose up -d postgres`).
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: orchestrator
+      POSTGRES_PASSWORD: orchestrator
+      POSTGRES_DB: orchestrator
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orchestrator -d orchestrator"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://orchestrator:orchestrator@postgres:5432/orchestrator
+      ARTIFACT_ROOT: /data
+      WORKTREE_ROOT: /workspace/worktrees
+      # Docker bind sources are resolved by the host daemon, so worker mounts
+      # use the host spelling while all orchestrator file I/O uses /workspace.
+      HOST_WORKTREE_ROOT: ${PWD}/workspace/worktrees
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+      # Managed repositories and their task worktrees. Workers are given only
+      # their own worktree, never this whole mount.
+      - ./workspace:/workspace
+      # Deliberate trust boundary: required only for the containerized
+      # orchestrator to create and destroy disposable worker containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  postgres-data:

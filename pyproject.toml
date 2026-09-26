@@ -1,0 +1,59 @@
+[project]
+name = "local-dev-orchestrator"
+version = "0.1.0"
+description = "Local AI development orchestrator: deterministic workflow, LLMs as workers."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "sqlalchemy>=2.0.36",
+    "alembic>=1.14",
+    "psycopg[binary]>=3.2",
+    "structlog>=24.4",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+    "langgraph>=1.0,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["apps"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Async tests are marked explicitly rather than auto-detected, so a coroutine
+# test that loses its marker fails loudly instead of silently never running.
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: tests that require a live database or external service",
+]
+filterwarnings = ["error::DeprecationWarning:apps.*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+# UP046: PEP 695 generics would drop the TypeVar names the repository base
+# relies on for readable signatures.
+ignore = ["UP046"]
+
+[tool.ruff.lint.per-file-ignores]
+# B008: `Depends(...)` in a default argument is the FastAPI idiom.
+"apps/orchestrator/api/*" = ["B008"]
+# Alembic writes these files; do not reformat generated migrations.
+"migrations/versions/*" = ["E501"]
