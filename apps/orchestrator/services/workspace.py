@@ -24,7 +24,7 @@ from ..domain.enums import RunEventType
 from ..domain.git import (
     DiffSummary,
     checkpoint_tag_name,
-    task_branch_name,
+    run_branch_name,
     task_commit_message,
     worktree_dir_name,
 )
@@ -127,7 +127,7 @@ def prepare_workspace(
     from .integration import integration_baseline
 
     starting_commit = integration_baseline(repository, project)
-    branch = task_branch_name(task.external_task_id, task.title)
+    branch = run_branch_name(task.external_task_id, task.title, run.run_number)
     directory = worktree_dir_name(task.external_task_id, run.run_number)
     path = config.worktree_root / str(project.id) / directory
 

@@ -13,6 +13,13 @@ from sqlalchemy.orm import Session
 from apps.orchestrator.config import get_settings
 from apps.orchestrator.db.session import get_db
 from apps.orchestrator.main import create_app
+from apps.orchestrator.services.git_errors import (
+    BranchAlreadyExists,
+    DirtyWorktree,
+    GitCommandTimeout,
+    ProtectedBranch,
+    WorktreeMissing,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -171,3 +178,47 @@ def test_resuming_a_project_that_is_not_paused_is_a_conflict(client: TestClient,
     project = _register(client, tmp_path)
     response = client.post(f"/projects/{project['id']}/resume")
     assert response.status_code == 409
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (DirtyWorktree("/repo", ("uncommitted.txt",)), 409),
+        (WorktreeMissing("the run's worktree is gone"), 409),
+        (ProtectedBranch("main", "write"), 409),
+        (GitCommandTimeout(("git", "fetch"), 120.0), 503),
+        # Deliberately not translated: after concern 59 a branch collision means
+        # a run identity is wrong, and a bug should arrive as a bug rather than
+        # as a tidy 409 that reads like an operator problem.
+        (BranchAlreadyExists("agent/TS-001-x-run1"), None),
+    ],
+)
+def test_git_preparation_failures_are_classified_rather_than_opaque(
+    error: Exception, expected_status: int | None, tmp_path: Path, monkeypatch
+):
+    """Concern 59's second half. The branch collision surfaced as an
+    unclassified 500, which is what made it slow to diagnose: the taxonomy in
+    ``services.git_errors`` already distinguishes an operator problem from a
+    bug, and the API was not reading it.
+
+    Driven through the real app and its registered handlers rather than by
+    reading the table, and it asserts the *absence* of a mapping too -- that is
+    the half that stops this from becoming a blanket ``GitError`` catch.
+    """
+    monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    get_settings.cache_clear()
+    app = create_app()
+
+    @app.get("/_raise_for_test")
+    def _raise() -> None:
+        raise error
+
+    with TestClient(app, raise_server_exceptions=False) as test_client:
+        response = test_client.get("/_raise_for_test")
+
+    if expected_status is None:
+        assert response.status_code == 500
+    else:
+        assert response.status_code == expected_status, response.text
+        assert response.json()["error"] == type(error).__name__
+    get_settings.cache_clear()

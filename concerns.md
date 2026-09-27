@@ -1772,3 +1772,121 @@ one dropped for the budget, one with no stated reason, and the manifest entry).
 Restoring the truncation-only guard fails the oversized-writable test with the
 coder having been asked for an answer, which is the check that it describes the
 behaviour rather than decorating it.
+
+## 59. A task could not start a second run once it had a branch — **resolved**
+
+Found by resuming the synthetic TraceStack campaign through the supported
+operator path. TS-106 had escalated before any model call (concerns 55, 56 and
+58); its escalation was answered with `RETRY_TASK`, the task returned to
+`READY`, a second run row was created — and `POST /projects/{id}/run` answered
+`500`.
+
+**Reproduction.** From the incident, and reproduced in a test with real Git:
+
+```
+apps/orchestrator/api/projects.py:110      run_project
+apps/orchestrator/workflow/graph.py:265    _prepare_workspace
+apps/orchestrator/services/workspace.py:134  prepare_workspace
+apps/orchestrator/services/git_service.py:352  create_worktree
+    raise BranchAlreadyExists: Branch agent/TS-106-remove-every-entry-belonging-to-one-file already exists
+```
+
+Deterministic: every later `POST /run` failed identically, and run 2 was reused
+rather than multiplied, so the task was stuck with no way forward that did not
+involve deleting a branch by hand.
+
+**Root cause.** `worktree_dir_name` is run-scoped and says so in its own
+docstring — *"includes the run number so a retried task never collides with the
+leftovers of an earlier run"* — while `task_branch_name` was task-scoped. Run 1
+of TS-106 created the branch; run 2 built a new run-specific worktree directory
+and then asked Git for the same branch again. The collision was anticipated for
+the directory and not for the branch.
+
+**Which the branch represents: one run, not the task's lifetime.** This was
+answered from the existing architecture rather than chosen. `branch_name` is a
+column on `task_runs`, not on `tasks`. The generator had exactly one caller —
+`prepare_workspace`, and only for a run with no branch yet — while every other
+consumer reads the persisted `run.branch_name`: `attach_workspace`,
+`integration.py`, `workflow/graph.py`, `workflow/recovery.py`,
+`services/worktrees.py`. The persisted model already treated branch identity as
+a property of a run. Only the name generator disagreed with it.
+
+Section 10 does not contradict that. Rule 2 says the orchestrator chooses branch
+names, and rule 7 asks that each task be *traceable* to a branch, which a name
+carrying the task id verbatim still satisfies. `agent/TS-004-navigation-tree`
+is an example, not a constraint.
+
+*Resolved* by making the generator agree with the model: `run_branch_name(task,
+title, run_number)` → `agent/TS-004-navigation-tree-run1`, derived from durable
+identity with no randomness, alongside `worktree_dir_name`'s `ts-004-run1`.
+
+**Why a suffix and not `agent/<task>/<run>`.** Git stores loose refs as files, so
+`refs/heads/agent/TS-106-x` being a file makes `refs/heads/agent/TS-106-x/run-2`
+impossible:
+
+```
+fatal: cannot lock ref 'refs/heads/agent/TS-106-slug/run-2':
+       'refs/heads/agent/TS-106-slug' exists; cannot create ...
+```
+
+Checked in a scratch repository before choosing. A path segment would have made
+every new branch fail in exactly the repositories that carry history from before
+this change, and the only remedy would have been rewriting historical refs. A
+suffix has no such conflict.
+
+**Retry and resume stay distinct**, and were already distinguished correctly:
+`graph.py` attaches when `run.branch_name` is set and prepares when it is not.
+A retry is a new run with a new branch from the current integration baseline; a
+resume re-opens the identity its run already holds. The retry does *not*
+continue from the failed run's branch merely because that branch exists — pinned
+by a test asserting the rejected commit is not an ancestor of the retry's branch
+and that its file is absent from the retry's tree.
+
+**Nothing is deleted.** The first run's branch stays where it is; it is that
+run's audit trail under rule 7, and `release_workspace` keeps branches by
+default. Cleanup is per run: releasing one run's workspace with
+`delete_branch=True` leaves another run's branch and worktree untouched.
+
+**The 500 was the second defect.** `services.git_errors` already distinguishes
+an operator problem from a bug, and the API was not reading it, so every Git
+failure — a dirty repository, a refused protected branch, a timeout — arrived as
+an unclassified 500. `DirtyWorktree`, `WorktreeMissing`, `ProtectedBranch` and
+`PushNotPermitted` now answer 409, and `GitCommandTimeout` 503.
+
+Deliberately *not* translated: `BranchAlreadyExists`, `WorktreePathRejected`,
+`GitCommandFailed`, `NotARepository`, `NothingToCommit`. Each now means an
+invariant is broken, and a 500 with a traceback is the honest answer to a bug.
+Mapping `GitError` wholesale would have turned a colliding run identity into a
+tidy 409 that reads like an operator problem — which is how this concern would
+have been hidden rather than found.
+
+**Compatibility: no migration, no rewritten refs.** Branch identity is
+persisted, not recomputed. The generator's single caller only runs for a run
+that has no branch yet, so TS-101 through TS-106 keep the task-scoped names in
+their records and every consumer keeps reading them. A test builds a run row the
+way a historical one looks — a task-scoped branch and a worktree created outside
+this code — and resumes it.
+
+The tests are in `tests/integration/test_workspace.py` (a second run prepares a
+distinct branch and worktree without deleting the first; the first run's branch
+stays inspectable and still resolves to its commit; the retry starts from the
+integration baseline and does not inherit the rejected candidate; a resume keeps
+its own identity; four sequential runs stay collision-free; two tasks stay
+isolated; names are recomputable from durable identity; releasing one run leaves
+another intact; checkpoint tags remain attempt-scoped; a pre-change run still
+attaches), in `tests/integration/test_projects_api.py` (the classification
+table, driven through the real app's handlers, including the absence of a
+mapping for the invariant breaches) and in `tests/unit/test_git_naming.py`.
+
+Real repositories and real worktrees throughout: the defect was in Git's own ref
+semantics, and a stub would have agreed with whatever the code did.
+
+One test asserted the old name and was changed deliberately rather than to make
+the suite pass: `test_prepare_creates_an_isolated_worktree_on_a_named_branch`
+now states that the branch names the run. The other `agent/TS-001-first` strings
+in `test_git_service.py` are arguments passed straight to `GitService` and never
+assumed task-uniqueness.
+
+Restoring task-scoped naming fails seven tests, the retry test among them, with
+`BranchAlreadyExists: Branch agent/TS-001-fix-the-answer already exists` at
+`git_service.py:352` — the same error, at the same line, as the TS-106 incident.

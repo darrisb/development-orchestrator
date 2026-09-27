@@ -165,18 +165,35 @@ def assert_safe_ref_component(component: str, *, label: str = "ref component") -
     return component
 
 
-def task_branch_name(
-    external_task_id: str, title: str, *, prefix: str = AGENT_BRANCH_PREFIX
+def run_branch_name(
+    external_task_id: str,
+    title: str,
+    run_number: int,
+    *,
+    prefix: str = AGENT_BRANCH_PREFIX,
 ) -> str:
-    """``agent/TS-004-navigation-tree``.
+    """``agent/TS-004-navigation-tree-run1``: one branch per *run* of a task.
 
     The task id is preserved verbatim so a branch is always traceable to its
-    task (section 10 rule 7); only the title is slugified.
+    task (section 10 rule 7); only the title is slugified. The run number is
+    what makes a second run of the same task possible at all, and it is the
+    same durable identity ``worktree_dir_name`` has always used -- a task may
+    run more than once over its lifetime, and before this the branch was the
+    one part of a run's workspace that did not say which run it belonged to
+    (concern 59).
+
+    The run is a *suffix* rather than a path segment. ``agent/TS-004-x/run-1``
+    cannot exist alongside ``agent/TS-004-x``, because Git stores loose refs as
+    files and a file cannot also be a directory; a repository carrying branches
+    from before this change would refuse every new one. A suffix has no such
+    conflict and matches ``worktree_dir_name``'s ``ts-004-run1``.
     """
     assert_safe_ref_component(external_task_id, label="task id")
+    if run_number < 1:
+        raise ValueError("run_number must be >= 1")
     slug = slugify(title)
     stem = f"{external_task_id}-{slug}" if slug else external_task_id
-    return f"{prefix}{stem}"
+    return f"{prefix}{stem}-run{run_number}"
 
 
 def task_commit_message(external_task_id: str, title: str) -> str:

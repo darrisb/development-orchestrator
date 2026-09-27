@@ -12,15 +12,35 @@ from apps.orchestrator.domain.git import (
     StatusEntry,
     assert_safe_ref_component,
     checkpoint_tag_name,
+    run_branch_name,
     slugify,
-    task_branch_name,
     task_commit_message,
     worktree_dir_name,
 )
 
 
-def test_branch_name_matches_the_documented_example():
-    assert task_branch_name("TS-004", "Navigation tree") == "agent/TS-004-navigation-tree"
+def test_branch_name_matches_the_documented_example_plus_its_run():
+    """Section 10's example is ``agent/TS-004-navigation-tree``, and rule 2 says
+    the orchestrator chooses branch names. The run suffix is that choice: a task
+    may run more than once, and each run needs its own branch (concern 59). The
+    documented stem is unchanged, so rule 7's traceability is unaffected."""
+    assert (
+        run_branch_name("TS-004", "Navigation tree", 1)
+        == "agent/TS-004-navigation-tree-run1"
+    )
+
+
+def test_each_run_of_a_task_gets_its_own_branch():
+    first = run_branch_name("TS-004", "Navigation tree", 1)
+    second = run_branch_name("TS-004", "Navigation tree", 2)
+    assert first != second
+    # And neither is a path prefix of the other, which Git could not represent.
+    assert not second.startswith(first + "/")
+
+
+def test_branch_name_rejects_a_zeroth_run():
+    with pytest.raises(ValueError):
+        run_branch_name("TS-004", "Navigation tree", 0)
 
 
 def test_commit_message_matches_the_documented_example():
@@ -31,11 +51,11 @@ def test_commit_message_matches_the_documented_example():
 
 def test_branch_name_keeps_the_task_id_verbatim():
     """Traceability (rule 7) depends on the id surviving unslugified."""
-    assert task_branch_name("TS-004", "x").startswith("agent/TS-004-")
+    assert run_branch_name("TS-004", "x", 1).startswith("agent/TS-004-")
 
 
 def test_branch_name_survives_a_title_with_no_usable_characters():
-    assert task_branch_name("TS-004", "!!! ???") == "agent/TS-004"
+    assert run_branch_name("TS-004", "!!! ???", 1) == "agent/TS-004-run1"
 
 
 def test_slug_is_truncated_at_a_word_boundary():
@@ -56,7 +76,7 @@ def test_slug_truncates_mid_word_when_there_is_no_boundary():
 def test_unsafe_task_ids_are_rejected(task_id: str):
     """A manifest is hand-edited; a bad id must never reach a command line."""
     with pytest.raises(ValueError):
-        task_branch_name(task_id, "title")
+        run_branch_name(task_id, "title", 1)
 
 
 def test_safe_ref_component_returns_its_input():

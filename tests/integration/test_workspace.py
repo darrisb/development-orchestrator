@@ -6,6 +6,7 @@ modify a fixture repository, capture the diff, commit, and clean up.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from uuid import uuid4
 
@@ -78,7 +79,10 @@ def workspace(
 def test_prepare_creates_an_isolated_worktree_on_a_named_branch(
     workspace: TaskWorkspace, fixture_repo: Path, git_settings: Settings
 ):
-    assert workspace.branch == "agent/TS-001-fix-the-answer"
+    """The branch names the *run*, not the task (concern 59). A task can run more
+    than once, and the branch is part of a run's isolated workspace exactly as
+    the worktree directory is -- ``ts-001-run1`` beside ``...-run1``."""
+    assert workspace.branch == "agent/TS-001-fix-the-answer-run1"
     assert workspace.path.is_dir()
     assert git_settings.worktree_root in workspace.path.parents
     assert workspace.path != fixture_repo
@@ -437,3 +441,238 @@ def test_a_dependency_path_that_leaves_the_repository_is_refused(
 
     with pytest.raises(ValueError):
         prepare_workspace(session, created.id, settings=git_settings)
+
+
+# --- one workspace per run, not per task (concern 59) ------------------------
+#
+# A task may run more than once: an operator answering an escalation with
+# RETRY_TASK asks for exactly that. Before this, the worktree directory was
+# run-scoped and the branch was not, so the second run of any task that had got
+# as far as creating its branch failed in preparation. Real repositories and real
+# worktrees throughout: the defect was in Git's own ref semantics, and a stub
+# would have agreed with whatever the code did.
+
+
+def _retry_run(session: Session, task: Task) -> TaskRun:
+    """What resolving an escalation with RETRY_TASK leaves behind: a fresh run
+    row for a task that is READY again, with no branch recorded yet. That empty
+    ``branch_name`` is what the graph reads to tell a retry from a resume."""
+    current = TaskRepository(session).get(task.id)
+    if current.status is not TaskStatus.READY:
+        TaskRepository(session).transition(task.id, TaskStatus.READY)
+    return create_run(session, task.id)
+
+
+def test_a_second_run_of_a_task_prepares_its_own_branch_and_worktree(
+    session: Session, task: Task, workspace: TaskWorkspace, git_settings: Settings
+):
+    """The defect, reproduced and closed. The first run's branch is left exactly
+    where it is -- deleting it was never an acceptable fix, it is the audit trail
+    of that run."""
+    first_branch = workspace.branch
+    repository = workspace.repository
+
+    second = prepare_workspace(session, _retry_run(session, task).id, settings=git_settings)
+
+    assert second.branch != first_branch
+    assert second.branch == "agent/TS-001-fix-the-answer-run2"
+    assert second.path != workspace.path
+    # Both branches exist, and the first run's is untouched.
+    assert repository.branch_exists(first_branch)
+    assert repository.branch_exists(second.branch)
+    assert second.git.get_current_branch() == second.branch
+    # Two live worktrees, each on its own branch.
+    assert workspace.path.is_dir() and second.path.is_dir()
+    assert workspace.git.get_current_branch() == first_branch
+
+
+def test_the_first_runs_branch_stays_inspectable_after_a_retry(
+    session: Session, task: Task, workspace: TaskWorkspace, git_settings: Settings
+):
+    """Requirement: historical runs remain attributable. The first run's commit
+    is still reachable from its own branch after the retry exists."""
+    (workspace.path / "src" / "app.js").write_text("// first run\n", encoding="utf-8")
+    first_commit = commit_task_work(session, workspace, task)
+    first_branch = workspace.branch
+
+    prepare_workspace(session, _retry_run(session, task).id, settings=git_settings)
+
+    repository = workspace.repository
+    assert repository.resolve_sha(first_branch) == first_commit
+    assert first_branch in run_git(repository.path, "branch", "--list", first_branch)
+
+
+def test_a_retry_starts_from_the_integration_baseline_not_the_failed_branch(
+    session: Session, task: Task, workspace: TaskWorkspace, git_settings: Settings
+):
+    """Requirement 4 and 5 together, and the one that matters most.
+
+    A branch that already exists is a tempting thing to continue from, and doing
+    so would silently carry a rejected candidate into the next attempt. The
+    retry starts from the integration baseline, so the failed run's commit is
+    not an ancestor of it.
+    """
+    (workspace.path / "src" / "app.js").write_text("// rejected work\n", encoding="utf-8")
+    rejected = commit_task_work(session, workspace, task)
+    baseline = workspace.starting_commit
+
+    second = prepare_workspace(session, _retry_run(session, task).id, settings=git_settings)
+
+    assert second.starting_commit == baseline
+    assert second.git.resolve_sha("HEAD") == baseline
+    # The rejected commit is not in the retry's history, and its file is not in
+    # the retry's tree.
+    with pytest.raises(subprocess.CalledProcessError):
+        run_git(
+            workspace.repository.path,
+            "merge-base",
+            "--is-ancestor",
+            rejected,
+            second.branch,
+        )
+    assert (second.path / "src" / "app.js").read_text() != "// rejected work\n"
+
+
+def test_resuming_a_run_keeps_its_own_branch_instead_of_making_another(
+    session: Session, workspace: TaskWorkspace, git_settings: Settings
+):
+    """Resume and retry are different operations and must stay that way. Resume
+    re-opens the identity the run already has; it never allocates a new one."""
+    from apps.orchestrator.services.workspace import attach_workspace
+
+    reattached = attach_workspace(session, workspace.task_run_id, settings=git_settings)
+
+    assert reattached.branch == workspace.branch
+    assert reattached.path == workspace.path
+    stored = TaskRunRepository(session).get(workspace.task_run_id)
+    assert stored.branch_name == workspace.branch
+
+
+def test_several_sequential_retries_stay_collision_free(
+    session: Session, task: Task, workspace: TaskWorkspace, git_settings: Settings
+):
+    branches = [workspace.branch]
+    paths = [workspace.path]
+    for _ in range(3):
+        nxt = prepare_workspace(session, _retry_run(session, task).id, settings=git_settings)
+        branches.append(nxt.branch)
+        paths.append(nxt.path)
+
+    assert len(set(branches)) == len(branches) == 4
+    assert len(set(paths)) == len(paths) == 4
+    assert branches[-1] == "agent/TS-001-fix-the-answer-run4"
+    for branch in branches:
+        assert workspace.repository.branch_exists(branch)
+
+
+def test_two_tasks_remain_isolated_from_each_other(
+    session: Session, project: Project, workspace: TaskWorkspace, git_settings: Settings
+):
+    other_task = TaskRepository(session).add(
+        Task(
+            project_id=project.id,
+            external_task_id="TS-002",
+            title="Another thing",
+            verify_commands=["npm test"],
+        )
+    )
+    TaskRepository(session).transition(other_task.id, TaskStatus.READY)
+
+    other = prepare_workspace(
+        session, create_run(session, other_task.id).id, settings=git_settings
+    )
+
+    assert other.branch == "agent/TS-002-another-thing-run1"
+    assert other.branch != workspace.branch
+    assert other.path != workspace.path
+
+
+def test_branch_and_worktree_names_are_deterministic_from_durable_identity(
+    session: Session, task: Task, workspace: TaskWorkspace, git_settings: Settings
+):
+    """No randomness: the run number is a durable identifier already, and a
+    name derived from it can be recomputed from the records years later."""
+    from apps.orchestrator.domain.git import run_branch_name, worktree_dir_name
+
+    stored = TaskRunRepository(session).get(workspace.task_run_id)
+    assert stored.branch_name == run_branch_name(
+        task.external_task_id, task.title, stored.run_number
+    )
+    assert workspace.path.name == worktree_dir_name(
+        task.external_task_id, stored.run_number
+    )
+
+
+def test_releasing_one_run_leaves_another_runs_branch_and_worktree_intact(
+    session: Session, task: Task, workspace: TaskWorkspace, git_settings: Settings
+):
+    """Requirement 12. Cleanup is per run, and a retry must not be able to
+    destroy the run it replaced -- nor the reverse."""
+    second = prepare_workspace(session, _retry_run(session, task).id, settings=git_settings)
+
+    release_workspace(second, delete_branch=True)
+
+    assert not second.path.exists()
+    assert not workspace.repository.branch_exists(second.branch)
+    # The first run is untouched.
+    assert workspace.path.is_dir()
+    assert workspace.repository.branch_exists(workspace.branch)
+    assert workspace.git.get_current_branch() == workspace.branch
+
+
+def test_a_checkpoint_tag_still_names_the_attempt_not_the_run_branch(
+    session: Session, task: Task, workspace: TaskWorkspace
+):
+    """Requirement 10. Checkpoint tags are attempt-scoped and unchanged by this;
+    they are how rule 8 resets a failed attempt, and they live alongside the
+    run's branch rather than being derived from it."""
+    (workspace.path / "src" / "app.js").write_text("// work\n", encoding="utf-8")
+    commit_task_work(session, workspace, task)
+
+    tagged_sha = checkpoint_workspace(workspace, 1)
+
+    # The helper answers with the SHA it marked; the tag is the durable part.
+    assert tagged_sha == workspace.git.resolve_sha("HEAD")
+    assert (
+        workspace.repository.resolve_sha("checkpoint/TS-001/attempt-1") == tagged_sha
+    )
+    # Attempt-scoped, and so unaffected by the run suffix on the branch: the
+    # tag is derived from the task and the attempt, never from the branch name.
+    from apps.orchestrator.domain.git import checkpoint_tag_name
+
+    assert checkpoint_tag_name("TS-001", 1) == "checkpoint/TS-001/attempt-1"
+    assert workspace.branch.endswith("-run1")
+    assert "run1" not in checkpoint_tag_name("TS-001", 1)
+
+
+def test_a_run_recorded_before_this_change_still_attaches(
+    session: Session, task: Task, run: TaskRun, fixture_repo: Path, git_settings: Settings
+):
+    """Compatibility. Runs TS-101..TS-106 were recorded with task-scoped branch
+    names, and those names are persisted rather than recomputed, so nothing has
+    to be migrated and no historical ref is rewritten.
+
+    The row is built the way a historical one looks -- a task-scoped branch and
+    a worktree made outside this code -- and then resumed.
+    """
+    legacy_branch = "agent/TS-001-fix-the-answer"
+    repository = repository_service(
+        ProjectRepository(session).get(task.project_id), settings=git_settings
+    )
+    head = run_git(fixture_repo, "rev-parse", "main").strip()
+    path = git_settings.worktree_root / str(task.project_id) / "ts-001-run1"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    run_git(fixture_repo, "worktree", "add", "-b", legacy_branch, str(path), head)
+    TaskRunRepository(session).update_fields(
+        run.id, branch_name=legacy_branch, starting_commit=head
+    )
+
+    from apps.orchestrator.services.workspace import attach_workspace
+
+    resumed = attach_workspace(session, run.id, settings=git_settings)
+
+    assert resumed.branch == legacy_branch
+    assert resumed.starting_commit == head
+    assert resumed.git.get_current_branch() == legacy_branch
+    # And it is still the branch Git has: nothing renamed it.
+    assert repository.branch_exists(legacy_branch)
