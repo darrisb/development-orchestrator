@@ -42,6 +42,7 @@ from ..domain.edits import (
     EDIT_SCHEMA_VERSION,
     CodeChangeSet,
     MalformedChangeSet,
+    max_edit_bytes_for_context,
 )
 from ..domain.enums import (
     FailureReason,
@@ -281,7 +282,10 @@ async def run_coding_attempt(
 
     try:
         change_set = CodeChangeSet.from_payload(
-            response.data or {}, max_edit_bytes=config.context_max_item_tokens * 4
+            response.data or {},
+            # Concern 11: the same number that bounded what the context builder
+            # could show of a file bounds what may come back for it.
+            max_edit_bytes=max_edit_bytes_for_context(config.context_max_item_tokens),
         )
     except MalformedChangeSet as error:
         # The endpoint answered and the JSON parsed; what came back was not a

@@ -145,6 +145,67 @@ def test_import_targets_are_extracted_in_order_without_duplicates():
     assert extract_import_targets(source) == ["./tree", "./styles.css", "../lib/b"]
 
 
+def test_python_imports_are_extracted():
+    source = "from apps.domain import scope\nimport apps.services.git\n"
+
+    assert extract_import_targets(source) == ["apps.domain", "apps.services.git"]
+
+
+def test_java_imports_are_extracted_without_the_static_keyword():
+    """Concern 30: a Java repository found nothing at all before these
+    patterns existed, so the reviewer saw the diff and nothing around it."""
+    source = (
+        "package com.example.nav;\n"
+        "\n"
+        "import static org.junit.Assert.assertEquals;\n"
+        "import com.example.navigation.Tree;\n"
+    )
+
+    assert extract_import_targets(source) == [
+        "com.example.navigation.Tree",
+        "org.junit.Assert.assertEquals",
+    ]
+
+
+def test_go_imports_are_extracted_from_a_parenthesised_block():
+    source = (
+        "package main\n"
+        "\n"
+        "import (\n"
+        '\t"fmt"\n'
+        '\tnav "example/project/navigation"\n'
+        ")\n"
+    )
+
+    assert extract_import_targets(source) == ["fmt", "example/project/navigation"]
+
+
+def test_a_single_go_import_is_extracted():
+    assert extract_import_targets('import "example/project/nav"') == [
+        "example/project/nav"
+    ]
+
+
+def test_a_quoted_string_outside_a_go_import_block_is_not_an_import():
+    """A bare quoted string is not evidence: a JSON fixture and a string in a
+    list literal both look like a Go import entry to a line-shaped pattern."""
+    source = (
+        "package main\n"
+        "\n"
+        "import (\n"
+        '\t"fmt"\n'
+        ")\n"
+        "\n"
+        'var path = "not/an/import"\n'
+    )
+
+    assert extract_import_targets(source) == ["fmt"]
+
+
+def test_a_json_document_yields_no_import_targets():
+    assert extract_import_targets('{\n  "name": "thing",\n  "main": "index.js"\n}\n') == []
+
+
 def test_relative_javascript_imports_resolve_to_repository_files():
     known = ["src/tree.ts", "src/widgets/index.tsx", "src/styles.css"]
 

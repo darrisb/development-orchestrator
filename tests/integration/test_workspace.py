@@ -350,3 +350,90 @@ def test_full_task_workspace_round_trip(
         RunEventType.WORKSPACE_CREATED,
         RunEventType.COMMIT_CREATED,
     ]
+
+
+# --- declared dependencies (concern 12) -------------------------------------
+
+
+def test_declared_git_ignored_dependencies_are_copied_into_a_new_worktree(
+    session: Session, fixture_repo: Path, git_settings: Settings
+):
+    """Concern 12: a worker has no network, so `npm ci` cannot run in one.
+
+    A repository that keeps its installed tree out of Git has to get it into
+    the worktree some other way, or its verification commands fail in a way
+    that reads as a broken worker rather than as the network policy it is.
+    """
+    (fixture_repo / "node_modules" / "left-pad").mkdir(parents=True)
+    (fixture_repo / "node_modules" / "left-pad" / "index.js").write_text(
+        "module.exports = () => {};\n", encoding="utf-8"
+    )
+    (fixture_repo / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+    run_git(fixture_repo, "add", "-A")
+    run_git(fixture_repo, "commit", "--quiet", "-m", "Ignore node_modules")
+
+    project = ProjectRepository(session).add(
+        Project(
+            name="Fixture",
+            repository_path=str(fixture_repo),
+            default_branch="main",
+            dependency_paths=["node_modules"],
+        )
+    )
+    task = TaskRepository(session).add(
+        Task(project_id=project.id, external_task_id="TS-020", title="Fix the answer")
+    )
+    TaskRepository(session).transition(task.id, TaskStatus.READY)
+    created = create_run(session, task.id)
+
+    workspace = prepare_workspace(session, created.id, settings=git_settings)
+
+    assert (workspace.path / "node_modules" / "left-pad" / "index.js").exists()
+    # And the copy is invisible to the candidate: it is ignored, so it is not
+    # in the diff and cannot be mistaken for something the coder wrote.
+    assert capture_diff(workspace).summary.files == ()
+
+
+def test_a_dependency_path_git_does_not_ignore_is_refused(
+    session: Session, fixture_repo: Path, git_settings: Settings
+):
+    """A tracked path is already in the worktree; copying over it would mean
+    the worker ran against something other than the commit it was given."""
+    project = ProjectRepository(session).add(
+        Project(
+            name="Fixture",
+            repository_path=str(fixture_repo),
+            default_branch="main",
+            dependency_paths=["src"],
+        )
+    )
+    task = TaskRepository(session).add(
+        Task(project_id=project.id, external_task_id="TS-021", title="Fix the answer")
+    )
+    TaskRepository(session).transition(task.id, TaskStatus.READY)
+    created = create_run(session, task.id)
+
+    with pytest.raises(ValueError, match="must be ignored by Git"):
+        prepare_workspace(session, created.id, settings=git_settings)
+
+
+@pytest.mark.parametrize("declared", ["/etc/passwd", "../outside", ""])
+def test_a_dependency_path_that_leaves_the_repository_is_refused(
+    session: Session, fixture_repo: Path, git_settings: Settings, declared: str
+):
+    project = ProjectRepository(session).add(
+        Project(
+            name="Fixture",
+            repository_path=str(fixture_repo),
+            default_branch="main",
+            dependency_paths=[declared],
+        )
+    )
+    task = TaskRepository(session).add(
+        Task(project_id=project.id, external_task_id="TS-022", title="Fix the answer")
+    )
+    TaskRepository(session).transition(task.id, TaskStatus.READY)
+    created = create_run(session, task.id)
+
+    with pytest.raises(ValueError):
+        prepare_workspace(session, created.id, settings=git_settings)

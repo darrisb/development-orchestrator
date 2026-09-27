@@ -549,6 +549,96 @@ async def test_repeated_identical_findings_escalate_before_spending_the_full_bud
     assert result.escalation.id == escalation.id
 
 
+@pytest.mark.asyncio
+async def test_a_later_correction_still_carries_the_findings_from_earlier_cycles(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    run: TaskRun,
+    loop_settings: Settings,
+):
+    """Concern 39: a coder told only the newest cycle's findings can regress an
+    earlier fix while addressing a later one, and by concern 27's rule the
+    original was already marked resolved -- so it comes back as a new finding
+    rather than as a regression, a cycle later.
+    """
+    coder = ScriptedModel(_code(WORKING), _code(REVIEWED), _code(REVIEWED))
+
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=coder,
+        reviewer=reviewer(
+            _review(
+                decision="CHANGES_REQUESTED",
+                summary="A null target is still accepted.",
+                issues=[_MISSING_GUARD],
+            ),
+            _review(
+                decision="CHANGES_REQUESTED",
+                summary="The guard is untested.",
+                issues=[_UNTESTED],
+            ),
+            _review(summary="Guarded and tested."),
+        ),
+        settings=loop_settings,
+    )
+
+    assert result.outcome is LoopOutcome.APPROVED
+    _first, second, third = coder.feedback_sent
+
+    # Cycle two's finding is the newest evidence and leads.
+    assert "The guard has no test." in third
+    # Cycle one's finding is still there, under a heading that says why.
+    assert "A null target is returned instead of being rejected." in third
+    assert "do not regress" in third
+    assert third.index("The guard has no test.") < third.index("do not regress")
+    # And the second turn was not given anything earlier, because there was
+    # nothing earlier: the history is carried, never invented.
+    assert "do not regress" not in second
+
+
+@pytest.mark.asyncio
+async def test_carrying_earlier_guidance_can_be_turned_off(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    run: TaskRun,
+    loop_settings: Settings,
+):
+    """`MAX_FEEDBACK_ISSUES` exists for a real reason -- a coder handed twenty
+    findings fixes none of them well -- so the history has a budget an operator
+    can set to zero."""
+    coder = ScriptedModel(_code(WORKING), _code(REVIEWED), _code(REVIEWED))
+
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=coder,
+        reviewer=reviewer(
+            _review(
+                decision="CHANGES_REQUESTED",
+                summary="A null target is still accepted.",
+                issues=[_MISSING_GUARD],
+            ),
+            _review(
+                decision="CHANGES_REQUESTED",
+                summary="The guard is untested.",
+                issues=[_UNTESTED],
+            ),
+            _review(summary="Guarded and tested."),
+        ),
+        settings=loop_settings.model_copy(
+            update={"fix_loop_feedback_history_limit": 0}
+        ),
+    )
+
+    assert result.outcome is LoopOutcome.APPROVED
+    third = coder.feedback_sent[2]
+    assert "The guard has no test." in third
+    assert "do not regress" not in third
+
+
 # --- the loop's bounds -------------------------------------------------------
 
 

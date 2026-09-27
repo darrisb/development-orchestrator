@@ -16,14 +16,17 @@ from apps.orchestrator.domain.completion import (
     build_completion_report,
 )
 from apps.orchestrator.domain.edits import (
+    EDIT_SIZE_HEADROOM,
     MAX_EDIT_BYTES,
     CodeChangeSet,
     EditOperation,
     MalformedChangeSet,
+    max_edit_bytes_for_context,
 )
 from apps.orchestrator.domain.enums import ScopePolicyDecision
 from apps.orchestrator.domain.git import DiffSummary, FileChange
 from apps.orchestrator.domain.scope import ScopePolicy, evaluate_scope
+from apps.orchestrator.domain.tokens import characters_for_tokens
 
 
 def _payload(**overrides) -> dict:
@@ -232,3 +235,32 @@ def test_the_report_renders_both_halves_for_the_reviewer():
 
     assert "Reported by the coder (unverified)" in text
     assert "Measured by the orchestrator" in text
+
+
+# --- the two ceilings are one number (concern 11) ----------------------------
+
+
+def test_the_edit_ceiling_is_derived_from_the_context_budget():
+    """Concern 11: `CONTEXT_MAX_ITEM_TOKENS` bounds what a file looks like on
+    the way in and the edit ceiling bounds what it may be on the way out. They
+    describe the same file at two moments, so one is computed from the other
+    through `domain.tokens`' single ratio rather than chosen separately.
+    """
+    budget = 2_000
+
+    ceiling = max_edit_bytes_for_context(budget)
+
+    assert ceiling == int(characters_for_tokens(budget) * EDIT_SIZE_HEADROOM)
+    # Larger on the way out than in, because adding a guard clause makes a file
+    # longer -- but by a stated factor, not by two orders of magnitude.
+    assert characters_for_tokens(budget) < ceiling < characters_for_tokens(budget) * 2
+
+
+def test_a_wider_context_budget_widens_the_edit_ceiling_with_it():
+    assert max_edit_bytes_for_context(4_000) == 2 * max_edit_bytes_for_context(2_000)
+
+
+def test_the_derived_ceiling_is_never_zero():
+    """A budget too small to show anything must still parse an edit rather than
+    reject every one of them for being over a ceiling of nothing."""
+    assert max_edit_bytes_for_context(0) >= 1

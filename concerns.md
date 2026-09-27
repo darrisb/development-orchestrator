@@ -8,25 +8,47 @@ phase L.
 
 Resolved entries are kept in place and marked, rather than deleted or
 renumbered: the reasoning is referenced from code comments and tests, and the
-numbers are how they are referenced. **Resolved so far: 1, 2, 3, 4, 6, 8, 9,
-10, 16, 18, 19, 23, 24, 25, 26, 27, 28, 32, 33, 34, 35, 36, 46.** The Phase J resolutions
-closed the retry and review loop; Phase K closed delivery, human response,
-runtime, transaction, and worktree lifecycle gaps around that loop.
+numbers are how they are referenced. **Resolved: 1–12, 16, 18–20, 22–29, 32–36,
+38–39, 41, 43, 46.** **Partly resolved: 30, 45** -- each says which half.
+**Open: 13, 14, 15, 17, 21, 31, 37, 40, 42, 44, 47.**
 
-Phase K joined both ends of the loop and cleared its lifecycle blockers:
-approved candidates land (25), answered escalations have explicit effects
-(32), finished worktrees are released and counted (34), runtime ceilings are
-enforced (8, 16, 24, 35), and each loop turn is committed independently of the
-graph cursor (36). Open entries below are limitations to carry into the first
-real project, not blockers to the Phase K loop.
+Every open entry is now a documented limitation rather than an unfinished fix.
+Nine of the eleven say so themselves -- 13, 14, 15, 17, 21, 31, 37, 40, 42 and
+44 either propose no fix or propose one whose cost is not worth paying until a
+real project has produced numbers -- and the other two are boundaries rather
+than defects: 47 is an operator validation gate, and what is left of 45 is a
+judgement about what deserves capturing that no rule can be written for yet.
+
+Phase J closed the retry and review loop; Phase K closed the delivery, human
+response, runtime, transaction and worktree lifecycle gaps around it: approved
+candidates land (25), answered escalations have explicit effects (32), finished
+worktrees are released and counted (34), runtime ceilings are enforced (8, 16,
+24, 35), and each loop turn is committed independently of the graph cursor (36).
 
 Phase L added the lessons system, training capture and section 35's metrics,
-which closes no numbered concern: every one of the six rules in section 32 is
-enforced structurally rather than by a fix, and the retrieval/application
-counters section 32 rule 6 asks for now exist. What phase L did instead is make
-five limitations measurable (41–45) -- each is a question the new endpoints can
-answer on a real project. Phase M also closed two scope gaps (4 and 6) and the
-Compose readiness blocker (46); its remaining empirical boundary is 47.
+which closed no numbered concern by itself: every one of the six rules in
+section 32 is enforced structurally rather than by a fix, and the
+retrieval/application counters section 32 rule 6 asks for now exist. What phase
+L did instead was make five limitations measurable (41–45).
+
+Phase M closed the rest. Two scope gaps (4 and 6) and the Compose readiness
+blocker (46) went first, then the policy-configuration group that concerns 5, 22
+and 29 had each found in a different place -- a pattern list that is right for
+most projects and wrong for some, with no way for the wrong ones to say so. The
+answer is the same in all three: the manifest carries the exception, in the safe
+direction, beside `protected_paths`.
+
+The rest of the phase M pass was an audit of the fixes themselves, and it is
+worth saying what that found, because "implemented" and "working" turned out to
+be different claims. The per-project overrides, the dependency pre-population,
+the convergence guard, the feedback history, the provisional outcome file and
+the retention and ranking rules were all written without tests. Testing them
+found two real defects -- a `.gitignore` directory entry that the dependency
+check could not match (12) and two import patterns that read nonsense as import
+targets (30) -- and established that concern 20's danger had already been
+removed by something written for another reason (the candidate-patch restore),
+which in turn removed concern 29's cause. Both are now pinned by tests, because
+a property that holds by accident is a property that stops holding.
 
 ## 1. A clipped file plus whole-file edits can destroy code — **resolved**
 
@@ -123,16 +145,21 @@ reported destination and `original_path`, applying protected-path, allowance,
 inspection-only, and sensitive-category checks to the source as well. A rename
 from `.env` to an allowed ordinary path is now a blocking scope violation.
 
-## 5. Sensitive-path patterns will produce false escalations
+## 5. Sensitive-path patterns will produce false escalations — **resolved**
 
-`SENSITIVE_PATTERNS[SECURITY]` includes `**/*token*.*` and `**/*session*.*`,
+`SENSITIVE_PATTERNS[SECURITY]` included `**/*token*.*` and `**/*session*.*`,
 which match ordinary files such as `src/tokenizer.ts` or
 `src/sessionStore.ts`. An undeclared match is `REQUIRE_REVIEW`, which halts a
 run waiting for a human. A guard that escalates routine work gets switched off.
 
-*Fix:* make the sensitive categories configurable per project (the manifest
-already carries `protected_paths`, so it is the natural place), and narrow the
-built-in defaults to directory-shaped patterns.
+*Resolved* at both ends the fix named. `SENSITIVE_PATTERNS[SECURITY]` is
+directory-shaped -- `**/tokens/**`, `**/sessions/**` -- so `src/tokenizer.ts`
+and `src/sessionStore.ts` match nothing, and a project whose layout still
+collides declares `sensitive_path_exceptions` in its manifest beside
+`protected_paths`. An exception removes a path from *every* category rather
+than one: a project saying "this directory is not what it looks like" means it
+of the whole guard, and a per-category exception would be a list nobody could
+reason about.
 
 ## 6. A declared bare filename widens the allowance — **resolved**
 
@@ -149,7 +176,7 @@ repository-relative path, with directories and globs as the only widening.
 matching. A bare `config.ts` allowance now names only the root file; a directory
 or an explicit glob such as `src/**` is required to authorize descendants.
 
-## 7. A plan is validated but never enforced
+## 7. A plan is validated but never enforced — **resolved**
 
 The plan is checked against the task's scope before coding, and the approved
 plan is sent back with the coding request — but nothing compares the edits that
@@ -157,9 +184,12 @@ arrive against the plan that was approved. A coder can have a two-file plan
 approved and then write three different (allowed) files.
 `deviationsFromPlan` is self-reported and therefore not evidence.
 
-*Fix:* add a plan-versus-edits comparison to the completion report's *measured*
-half. It should probably be `REQUIRE_REVIEW`, not `BLOCK`: a coder that found a
-better route while staying inside the allowance has not done anything unsafe.
+*Resolved.* `CompletionReport.planned_paths` and `unplanned_paths` compare the
+edits that arrived against the plan that was approved, in the report's measured
+half, and the comparison reaches the reviewer twice: as a discrepancy in the
+review package and as a pending human-review reason. `REQUIRE_REVIEW`, not
+`BLOCK`, as the fix suggested -- a coder that found a better route while
+staying inside its allowance is looked at, not rolled back.
 
 ## 8. `max_runtime_minutes` is not enforced anywhere — **resolved**
 
@@ -212,14 +242,22 @@ One thing stayed as it was, deliberately. The `artifacts` table keys on
 recent attempt's file while every attempt's file survives on disk. That is the
 same rule the coding artifacts already follow.
 
-## 11. `CONTEXT_MAX_ITEM_TOKENS` and `MAX_EDIT_BYTES` are unrelated numbers
+## 11. `CONTEXT_MAX_ITEM_TOKENS` and `MAX_EDIT_BYTES` are unrelated numbers — **resolved**
 
 One bounds what a file looks like on the way in (2000 tokens), the other what
 it may be on the way out (512 KB). They describe the same file at two moments
 and can disagree by two orders of magnitude. See concern 1; they should be
 derived from one another.
 
-## 12. A worker with no network cannot install anything
+*Resolved.* `domain.edits.max_edit_bytes_for_context` computes the output
+ceiling from `CONTEXT_MAX_ITEM_TOKENS` through `domain.tokens`' single ratio,
+times an explicit `EDIT_SIZE_HEADROOM` -- a rewritten file may be larger than
+the one the budget could show, because adding a guard clause makes a file
+longer, but by a stated factor rather than by two orders of magnitude. The bare
+`* 4` that stood in for the derivation is gone: it was the same drift in
+miniature, since `CHARS_PER_TOKEN` is 3.5 and nothing tied the two together.
+
+## 12. A worker with no network cannot install anything — **resolved**
 
 `WORKER_NETWORK=none` is the default, because section 11 asks for a restricted
 network and a verification command that can reach the internet can also
@@ -231,9 +269,19 @@ For a project with a committed lockfile and installed `node_modules` this is
 fine. For a fresh clone it is not, and the failure will read as a broken worker
 rather than as a policy.
 
-*Fix:* either pre-populate dependencies when the worktree is created (a phase C
-concern), or add an explicit per-project "install step runs with a network"
-allowance that is visible in the manifest rather than a global switch.
+*Resolved* by the first of the two, which keeps the network policy absolute: a
+project declares `dependency_paths` in its manifest and `prepare_workspace`
+copies them into each new worktree. The copy is refused unless Git ignores the
+path -- a tracked path is already in the worktree, and copying over it would
+mean the worker ran against something other than the commit it was given -- and
+refused for any path that leaves the repository.
+
+Closing this found one defect worth naming: a directory-only `.gitignore` entry
+(`node_modules/`, which is how everyone writes it) does not match the bare name
+`node_modules` when the path is absent from the worktree, which it always is at
+that point, because Git cannot tell an absent path is a directory. The natural
+manifest entry was therefore refused with a message about Git not ignoring a
+path Git does ignore. The check now asks with the form that matches.
 
 ## 13. A worktree alone is not a usable Git checkout
 
@@ -345,7 +393,7 @@ Still a warning rather than a refusal: a project may legitimately be imported
 before its build is wired up, and refusing would make the orchestrator harder
 to adopt than it needs to be.
 
-## 20. A build that writes into the worktree fails the diff-policy check
+## 20. A build that writes into the worktree fails the diff-policy check — **resolved**
 
 Section 17's diff-policy check runs *after* the commands, which is the point:
 a `dist/` created during `npm run compile` is in the worktree whether or not
@@ -359,9 +407,18 @@ Most projects gitignore their build output and are unaffected —
 `git add --all` respects `.gitignore`, so those files never reach the diff.
 The ones that do not will look broken in a confusing way.
 
-*Fix:* capture the worktree's state before the commands and diff the two, so
-"what the build wrote" is a known set rather than an inference; or let a
-project declare `generated_paths` that the post-command check ignores.
+*Resolved*, and by neither of the two the entry proposed: what protects the
+candidate is that `_run_command_categories` resets the worktree and reapplies
+the *measured* candidate patch in a `finally` block, before `DIFF_POLICY`
+looks. The commands' side effects are discarded rather than classified, so
+there is nothing for the guard to mistake for the coder's work and no pattern
+list to get right. `DIFF_POLICY` is then also the check that would notice if
+the restore had not worked, which is the better reason for it to run twice.
+
+Worth knowing about the shape of the evidence: `dist/` is in
+`GENERATED_PATTERNS` and `src/version.py` is not, and a build writing either
+one leaves a passing candidate. A test pins the second case, because a pass
+there is the only one that distinguishes the restore from the pattern list.
 
 ## 21. Secret scanning is a text heuristic, and reads only added lines
 
@@ -376,7 +433,7 @@ behaviour and still means the run record says "a human should read the rest".
 *Read the result as "nothing obvious", never as "no secrets".* Real secret
 scanning is a dedicated tool in the project's `verification.security` commands.
 
-## 22. The generated-file patterns have no per-project override
+## 22. The generated-file patterns have no per-project override — **resolved**
 
 `domain.security.GENERATED_PATTERNS` blocks `vendor/`, `dist/`, `build/`,
 `target/` and friends. A Go project that vendors its dependencies, or any
@@ -386,8 +443,11 @@ configuration. This is concern 5's problem in a second place: a pattern list
 that is right for most projects is wrong for some, and only the wrong ones
 find out.
 
-*Fix:* read the exceptions from the manifest, the same way `protected_paths`
-already is.
+*Resolved* exactly that way: `generated_path_exceptions` travels manifest ->
+project -> verification pipeline -> `scan_candidate`. A Go repository that
+vendors its dependencies declares `vendor/**` and passes. The ordering matters
+and is tested: the forbidden-file check runs *ahead* of the generated-path
+check, so a declared generated path is still not a place to put a private key.
 
 ## 23. A failing candidate is left in `VERIFYING` — **resolved**
 
@@ -500,11 +560,11 @@ longer matched the issue in the database.
 this host from inside a container, but it is also exactly how a container reaches
 a proxy it does not control, so allowing it is an operator's explicit choice.
 
-## 29. The section 37 gate will fire on builds that touch a lockfile
+## 29. The section 37 gate will fire on builds that touch a lockfile — **resolved**
 
 Concerns 20 and 37-policy meet here. A build that runs a package manager
-writes `package-lock.json` into the worktree; the post-command diff check sees
-it (concern 20), and `LOCKFILE` and `DEPENDENCY_MANIFEST` are both in
+writes `package-lock.json` into the worktree; the post-command diff check would
+have seen it (concern 20), and `LOCKFILE` and `DEPENDENCY_MANIFEST` are both in
 `APPROVAL_GATED_CATEGORIES` because section 37 lists "major dependency
 upgrades". So a task that changed no dependency can still land on a human's
 desk because its build refreshed a lockfile.
@@ -514,12 +574,20 @@ guard cannot tell a patch bump from a major one. But on a real project this
 will be the most common escalation, and it is the one most likely to train an
 operator to approve without looking.
 
-*Fix:* section 37 says projects can extend the policy, and the inverse is
-what is needed here — a per-project way to narrow it, sitting beside
-`protected_paths` in the manifest. Failing that, gate a lockfile change only
-when the manifest beside it also changed.
+*Resolved* twice over, from both directions this entry was worried about.
 
-## 30. Supporting-source selection only understands some languages
+The cause is gone: concern 20's restore means a build that refreshes
+`package-lock.json` never puts it in the diff at all, so the escalation this
+entry predicted would be the most common one does not arise. What is left is a
+task that really does change a lockfile, which is what the gate is for.
+
+And the inverse the fix asked for exists: `approval_gated_categories` on the
+manifest narrows the policy per project, the same way `protected_paths`
+extends it. It is opt-in in the safe direction -- omitted means the
+conservative default, and the default still gates a declared lockfile change,
+because the guard cannot tell a patch bump from a major one.
+
+## 30. Supporting-source selection only understands some languages — **partly resolved**
 
 `_supporting_sources` includes what a changed file imports, resolved with
 `domain.relevance.extract_import_targets` — which reads ES-module, CommonJS
@@ -531,9 +599,25 @@ It also resolves one level deep and never includes *callers*: a change to a
 function's signature is reviewed without the code that calls it, so "this
 breaks its caller" is a finding the reviewer is structurally unable to make.
 
-*Fix:* the caller problem wants an index the orchestrator does not have
-(section 43's V2 "repository-wide symbol index"). The language gap is
-smaller: per-profile import patterns beside the worker profiles.
+*The language gap is resolved.* `extract_import_targets` reads Java and Kotlin
+`import a.b.C;` and Go imports as well as ES-module, CommonJS and Python, so a
+Java or Go repository is no longer reviewed with the diff and nothing around
+it.
+
+Closing it found two defects in the patterns themselves. Java's
+`import static org.junit.Assert.assertEquals;` also matched Python's bare-import
+pattern and yielded the keyword `static` as a target; and Go's specifier
+pattern matched any line whose content began with a quoted string, so
+`"name": "thing",` in a JSON fixture was read as an import. Neither could
+resolve to a file, so neither was visible -- which is the point: a selector
+that quietly considers nonsense is a selector nobody notices is wrong. Go
+specifiers are now read only from a real `import` statement or inside a
+parenthesised import block.
+
+*The caller half remains open*, and is a V2 item rather than a fix: a change to
+a function's signature is still reviewed without the code that calls it, so
+"this breaks its caller" is a finding the reviewer is structurally unable to
+make. That wants section 43's repository-wide symbol index.
 
 ## 31. Confidence is a self-reported number treated as a measurement
 
@@ -688,7 +772,7 @@ rather than worth changing: if these turn out to be common on a real project,
 the interesting signal is the pattern across runs (section 32's lessons), not the
 individual tree.
 
-## 38. An unfixable task spends its whole budget before saying so
+## 38. An unfixable task spends its whole budget before saying so — **resolved**
 
 The loop is correct and expensive. A task the coder cannot fix costs three coding
 attempts, three context builds, three workers and up to three reviews before it
@@ -700,12 +784,15 @@ identical, or three reviews raising the same finding with the same requirement
 id, mean the coder is not converging and the fourth attempt will not either.
 `unreraised_issues` already computes the identity that would detect it.
 
-*Fix:* a convergence check between turns — if the new review's blocking findings
-are the same set as the previous cycle's, escalate immediately instead of
-spending the remaining budget. It should be a setting, because "the same finding
-twice" is also what a coder that is half-way through a fix looks like.
+*Resolved.* `_reviews_are_stagnant` compares consecutive reviews' blocking
+findings by the same fingerprint `unreraised_issues` uses for closing, and an
+unchanged non-empty set escalates rather than spending the rest of the budget.
+It is a setting -- `FIX_LOOP_STAGNANT_REVIEW_LIMIT`, default 2, zero disables
+it -- because "the same finding twice" is also what a coder half-way through a
+fix looks like. An empty set never counts: repeated approvals have their own
+route and repeated human-only decisions have their own policy.
 
-## 39. The coder is only told the last cycle's findings
+## 39. The coder is only told the last cycle's findings — **resolved**
 
 `ReviewRouting.feedback` is built from the review that just happened, so a third
 attempt is given cycle 2's findings and not cycle 1's. The open findings from
@@ -717,11 +804,12 @@ only thing that catches it is the next review re-raising the original — which
 costs a cycle, and by concern 27's rule the original was already marked resolved,
 so it comes back as a new finding rather than as a regression.
 
-*Fix:* carry the still-open findings into the correction prompt alongside the new
-ones, under a heading that distinguishes them ("also still open, do not
-regress"). The reason it was not done here is that `MAX_FEEDBACK_ISSUES` exists
-for a real reason — a coder handed twenty findings fixes none of them well — so
-this needs a budget of its own rather than a concatenation.
+*Resolved with the budget the fix said it needed.* `_correction_feedback`
+appends earlier distinct correction messages under "Earlier correction guidance
+— do not regress these fixes", newest evidence first, bounded by
+`FIX_LOOP_FEEDBACK_HISTORY_LIMIT` (default 3, zero disables it). It carries
+earlier *guidance* rather than concatenating earlier findings, which keeps
+`MAX_FEEDBACK_ISSUES` meaning what it means for each cycle's own findings.
 
 ## 40. Two unlocated findings in one category are treated as one finding
 
@@ -741,7 +829,7 @@ enough to matter. The reviewer prompt asks for a file and a requirement id, and
 the honest measurement is how often it declines to give them — which is a
 question for section 35's model evaluation, not a guess to encode now.
 
-## 41. Nothing is written for a run that is still open, so a crash leaves no account of it
+## 41. Nothing is written for a run that is still open, so a crash leaves no account of it — **resolved**
 
 `outcome.json` is written when a run *settles* -- accepted, failed or escalated.
 A run that is in flight when the process dies, or one abandoned mid-flight
@@ -753,11 +841,12 @@ root the way a settled run does.
 answered -- what was the system doing when it stopped. `inspect_incomplete_runs`
 can say a run is resumable; it cannot say what that run had concluded so far.
 
-*Fix:* write a provisional `outcome.json` on each turn boundary with
-`outcome: "in_progress"`, rewritten when the run settles. The cost is a write
-per turn on a path that is already writing several artifacts per turn, and the
-reason it was not done in phase L is that it doubles writes on the hot path for
-a file whose whole value is being readable *after* the fact.
+*Resolved as described.* The fix loop calls `record_outcome(..., outcome=
+"in_progress")` at durable turn boundaries and a terminal call replaces the
+file in place with `accepted`, `rejected` or `escalated`. One location, one
+schema, one file -- so a reader handles a crashed run and a settled run the
+same way, and post-crash inspection does not have to know which it is looking
+at. The extra write is on a path already writing several artifacts a turn.
 
 ## 42. A lesson's usefulness is measured against a counter it also increments
 
@@ -783,7 +872,7 @@ would have to judge whether the lesson's subject was actually addressed. That is
 a real attribution problem, not a metric, and phase M is the first point at
 which there are enough runs to tell whether it is worth building.
 
-## 43. Training examples accumulate faster than anything consumes them
+## 43. Training examples accumulate faster than anything consumes them — **resolved**
 
 Every accepted run is copied into `data/training/` with its artifacts and
 manifest. Nothing selects, prunes or expires them, so the directory grows with
@@ -795,10 +884,16 @@ explicit that not every accepted example should be trained on, and phase L
 implements the capture half and the visibility of the backlog; the acting half
 is phase M's.
 
-*Fix:* a retention policy (age or count based) plus the selection step, both in
-phase M. A GC is deliberately not written now: deleting captured evidence
-before anything has selected from it is the one irreversible mistake available
-here, and an unreferenced directory is a recoverable problem.
+*Resolved*, count-based and deliberately narrow. Capture enforces
+`TRAINING_MAX_CAPTURED_PER_PROJECT` (default 500) by excluding the
+lowest-ranked *uncurated* examples -- the same ranking concern 45's queue uses,
+so what retention drops is the material a curator would have reached last.
+Three properties make this safe enough to run automatically: a human decision
+outranks the ceiling, because retention only ever looks at `CAPTURED`; the
+exclusion is recorded with its reason rather than performed silently; and only
+the duplicate copy under `data/training/` is deleted, never the run directory
+that is the authoritative record. `curate_training_example` is the selection
+step the entry asked for.
 
 ## 44. Lesson extraction is tuned on fixtures, not on observed reviewer output
 
@@ -821,7 +916,7 @@ rejection rate means the phrasing is wrong. That is answerable from section 35's
 endpoints on a real project, and it should be looked at before the extraction
 rules are changed.
 
-## 45. A run's outcome is decided by the run's status, not by whether it was useful
+## 45. A run's outcome is decided by the run's status, not by whether it was useful — **partly resolved**
 
 `capture_training_example` accepts any `SUCCEEDED` run. A task that passed
 because its requirement was trivial, or because the reviewer approved a diff
@@ -830,15 +925,24 @@ solved something hard.
 
 *Why it matters:* section 34 warns against training on every accepted example
 partly for this reason, and the curation step is the intended answer -- but the
-queue as it stands is ordered by recency, so the examples most likely to be
-selected first are the most recent ones rather than the most instructive.
+queue was ordered by recency, so the examples most likely to be selected first
+were the most recent ones rather than the most instructive.
 
-*Fix:* a signal to rank the curation queue by -- diff size against the task's
-own limit, whether any review cycle ran at all, and how many attempts it took.
-All three are already recorded, so this is a query over existing data rather
-than new instrumentation. It belongs with the selection step in phase M, not
-before it: until something selects, ranking the queue is a preference rather
-than a mechanism.
+*The queue is ranked*, now that something selects from it.
+`ranked_training_queue` orders uncurated examples by review cycles and attempts
+beyond the first, so a run that took three attempts and two review cycles is
+offered ahead of a trivial first-attempt pass, and an example already curated
+is not in the queue at all. Diff size against the task's own limit is not in
+the signal yet: it is recorded, but it is the one of the three that is as
+easily read as "this task was bigger" as "this run was instructive".
+
+*What remains open is the underlying question*, which ranking does not answer:
+`capture_training_example` still accepts any `SUCCEEDED` run, so a task that
+passed because its requirement was trivial is captured on the same terms as one
+that solved something hard. Ranking changes what a curator sees first; it does
+not make the capture decision selective, and section 34's warning is about the
+capture decision. That stays an operator's judgement until real runs say what a
+selective rule would have to look like.
 
 ## 46. Compose could report ready with no application schema — **resolved**
 

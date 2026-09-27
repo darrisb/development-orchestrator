@@ -311,3 +311,62 @@ def test_a_path_that_leaves_the_repository_is_refused_not_normalised(path: str):
 @pytest.mark.parametrize("path", ["src/navigation.ts", "a.ts", "deep/nested/path.ts"])
 def test_an_ordinary_relative_path_is_accepted(path: str):
     assert is_within_repository(path) is True
+
+
+# ------------------------------------------- per-project sensitive categories
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["src/tokenizer.ts", "src/sessionStore.ts", "src/authorHeader.ts"],
+)
+def test_a_file_whose_name_merely_contains_a_sensitive_word_is_not_categorised(
+    path: str,
+):
+    """Concern 5: the built-in defaults are directory-shaped, not name-shaped.
+
+    ``**/*token*.*`` would have matched every one of these, and an undeclared
+    match is ``REQUIRE_REVIEW`` -- a guard that halts routine work waiting for a
+    human is a guard an operator switches off.
+    """
+    assert categorise_path(path) == ()
+
+
+@pytest.mark.parametrize(
+    ("path", "category"),
+    [
+        ("src/auth/login.ts", SensitiveCategory.SECURITY),
+        ("src/sessions/store.ts", SensitiveCategory.SECURITY),
+        ("src/billing/invoice.ts", SensitiveCategory.PAYMENT),
+    ],
+)
+def test_a_directory_named_for_a_sensitive_area_is_still_categorised(
+    path: str, category: SensitiveCategory
+):
+    assert category in categorise_path(path)
+
+
+def test_a_project_exception_removes_a_path_from_every_sensitive_category():
+    """Concern 5: a project whose layout collides with the defaults can say so."""
+    assert SensitiveCategory.SECURITY in categorise_path("src/auth/login.ts")
+    assert categorise_path("src/auth/login.ts", exceptions=("src/auth/**",)) == ()
+
+
+def test_the_scope_guard_reads_sensitive_exceptions_off_the_project(task: Task):
+    """The exception has to reach the guard, not merely exist on the manifest."""
+    project = Project(
+        name="TraceStack",
+        repository_path="/workspace/tracestack",
+        sensitive_path_exceptions=["src/auth/**"],
+    )
+    guarded = evaluate_scope(_summary(_change("src/auth/login.ts")), ScopePolicy.for_task(task))
+    relaxed = evaluate_scope(
+        _summary(_change("src/auth/login.ts")), ScopePolicy.for_task(task, project)
+    )
+
+    assert any(
+        finding.kind is ScopeFindingKind.SENSITIVE_CATEGORY for finding in guarded.findings
+    )
+    assert not any(
+        finding.kind is ScopeFindingKind.SENSITIVE_CATEGORY for finding in relaxed.findings
+    )

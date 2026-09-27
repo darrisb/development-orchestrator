@@ -173,7 +173,12 @@ def _prepopulate_dependencies(
         if not source.exists():
             raise ValueError(f"Declared dependency path does not exist: {declared!r}")
         normalized = relative.as_posix()
-        if not worktree_git.is_ignored(normalized):
+        # A directory-only `.gitignore` entry (`node_modules/`) does not match
+        # the bare name when the path is absent from the worktree, which it
+        # always is at this point: Git cannot tell an absent path is a
+        # directory. The source is on disk, so ask with the form that matches.
+        candidates = (normalized, f"{normalized}/") if source.is_dir() else (normalized,)
+        if not any(worktree_git.is_ignored(form) for form in candidates):
             raise ValueError(
                 f"Dependency path {declared!r} must be ignored by Git before it "
                 "can be copied into a task worktree"

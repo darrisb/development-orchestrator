@@ -52,6 +52,7 @@ from apps.orchestrator.domain.enums import (
 from apps.orchestrator.domain.models import Project, Task, TaskLimits, TaskRun
 from apps.orchestrator.domain.redaction import PLACEHOLDER
 from apps.orchestrator.domain.review_package import REVIEW_PACKAGE_ARTIFACT
+from apps.orchestrator.domain.scope import SensitiveCategory
 from apps.orchestrator.providers import (
     ConnectionReport,
     ModelRequest,
@@ -446,6 +447,82 @@ async def test_an_approval_touching_a_high_risk_area_is_not_accepted_automatical
 
 
 @pytest.mark.asyncio
+async def test_a_project_can_narrow_which_sensitive_categories_gate_acceptance(
+    session: Session,
+    project: Project,
+    task_factory,
+    git_settings: Settings,
+):
+    """Concern 29: section 37 lets a project extend the policy, and a project
+    whose build refreshes a lockfile needs the inverse -- a way to narrow it.
+    The default is the conservative one, so the narrowing has to be declared.
+    """
+    ProjectRepository(session).update_fields(
+        project.id, approval_gated_categories=[SensitiveCategory.SECURITY.value]
+    )
+    task = task_factory(
+        external_task_id="TS-011",
+        title="Pin the navigation dependency",
+        files_to_modify=["package-lock.json"],
+    )
+    created = create_run(session, task.id)
+    workspace = prepare_workspace(session, created.id, settings=git_settings)
+    tasks = TaskRepository(session)
+    for status in (TaskStatus.CODING, TaskStatus.VERIFYING, TaskStatus.REVIEW_PENDING):
+        tasks.transition(task.id, status)
+    (workspace.path / "package-lock.json").write_text(
+        '{"name": "tracestack", "lockfileVersion": 3}\n', encoding="utf-8"
+    )
+
+    outcome = await run_review(
+        session,
+        workspace,
+        provider=reviewer(_review_answer(taskId="TS-011", confidence=1.0)),
+        settings=git_settings,
+    )
+
+    assert outcome.approved
+    assert _status(session, task) is TaskStatus.APPROVED
+
+
+@pytest.mark.asyncio
+async def test_a_lockfile_change_gates_acceptance_by_default(
+    session: Session,
+    task_factory,
+    git_settings: Settings,
+):
+    """The other half of concern 29: narrowing is opt-in, not the default.
+
+    The guard cannot tell a patch bump from a major one, so a lockfile a task
+    declared still lands on a human's desk unless the project says otherwise.
+    """
+    task = task_factory(
+        external_task_id="TS-012",
+        title="Pin the navigation dependency",
+        files_to_modify=["package-lock.json"],
+    )
+    created = create_run(session, task.id)
+    workspace = prepare_workspace(session, created.id, settings=git_settings)
+    tasks = TaskRepository(session)
+    for status in (TaskStatus.CODING, TaskStatus.VERIFYING, TaskStatus.REVIEW_PENDING):
+        tasks.transition(task.id, status)
+    (workspace.path / "package-lock.json").write_text(
+        '{"name": "tracestack", "lockfileVersion": 3}\n', encoding="utf-8"
+    )
+
+    outcome = await run_review(
+        session,
+        workspace,
+        provider=reviewer(_review_answer(taskId="TS-012", confidence=1.0)),
+        settings=git_settings,
+    )
+
+    assert outcome.routing.needs_human
+    assert any("lockfile" in reason for reason in outcome.routing.human_review_reasons)
+    assert _status(session, task) is TaskStatus.HUMAN_REVIEW
+
+
+@pytest.mark.asyncio
 async def test_the_last_review_cycle_escalates_rather_than_looping(
     session: Session,
     workspace: TaskWorkspace,
@@ -613,6 +690,70 @@ async def test_the_reviewer_is_told_what_is_a_fact_and_what_is_a_claim(
     assert "Restored the selection and added a test." in prompt
     assert "claims the test tests/nav.test.ts" in prompt  # the measured discrepancy
     assert "These are claims, not facts." in prompt
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_that_left_its_approved_plan_is_not_accepted_automatically(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    git_settings: Settings,
+):
+    """Concern 7: the plan was checked against the task's scope before coding
+    and sent back with the coding request, and nothing compared the edits that
+    arrived against the plan that was approved. `deviationsFromPlan` is
+    self-reported and therefore not evidence; `unplanned_paths` is measured.
+
+    A human decides rather than a rollback, because a coder that found a better
+    route while staying inside its allowance has not done anything unsafe.
+    """
+    outcome = await run_review(
+        session,
+        workspace,
+        provider=reviewer(_review_answer(confidence=1.0)),
+        completion_report=CompletionReport(
+            external_task_id="TS-004",
+            attempt=1,
+            applied_paths=("src/navigation.ts",),
+            planned=True,
+            planned_paths=("src/widgets/tree.ts",),
+        ),
+        settings=git_settings,
+    )
+
+    assert outcome.routing.needs_human
+    assert any(
+        "outside its approved plan" in reason
+        for reason in outcome.routing.human_review_reasons
+    )
+    assert _status(session, task) is TaskStatus.HUMAN_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_that_kept_to_its_plan_is_accepted(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    git_settings: Settings,
+):
+    """The other direction, which is the one that matters: a comparison that
+    escalated every planned run would be turned off."""
+    outcome = await run_review(
+        session,
+        workspace,
+        provider=reviewer(_review_answer(confidence=1.0)),
+        completion_report=CompletionReport(
+            external_task_id="TS-004",
+            attempt=1,
+            applied_paths=("src/navigation.ts",),
+            planned=True,
+            planned_paths=("src/navigation.ts",),
+        ),
+        settings=git_settings,
+    )
+
+    assert outcome.approved
+    assert _status(session, task) is TaskStatus.APPROVED
 
 
 @pytest.mark.asyncio

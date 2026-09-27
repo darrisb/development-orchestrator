@@ -28,13 +28,35 @@ from enum import StrEnum
 
 from .relevance import normalise_path
 from .scope import is_within_repository
+from .tokens import characters_for_tokens
 
 #: Bumped when the edit contract changes (section 34 attribution).
 EDIT_SCHEMA_VERSION = "code-edits/1"
 
-#: Ceiling on one file's new content. A model that returns a megabyte for one
-#: file has either pasted the wrong thing or is generating, not editing.
+#: Ceiling on one file's new content when nothing derives one. A model that
+#: returns a megabyte for one file has either pasted the wrong thing or is
+#: generating, not editing. Callers that know the context budget should derive
+#: the ceiling from it with ``max_edit_bytes_for_context`` instead.
 MAX_EDIT_BYTES = 8_000
+
+#: How much larger a rewritten file may be than the version the context budget
+#: was able to show (concern 11). Some headroom is necessary -- adding a guard
+#: clause makes a file longer -- but the two numbers describe the same file at
+#: two moments, so the ceiling on the way out is derived from the ceiling on the
+#: way in rather than chosen independently. Two independent numbers can disagree
+#: by orders of magnitude, and the failure that follows is a file clipped on the
+#: way in and rewritten in full on the way out: see concern 1.
+EDIT_SIZE_HEADROOM = 1.25
+
+
+def max_edit_bytes_for_context(max_item_tokens: int) -> int:
+    """The output ceiling implied by an input ceiling of ``max_item_tokens``.
+
+    Shares ``domain.tokens``' one ratio, so the estimate that decided a file was
+    too large to show is the estimate that decides how large its replacement may
+    be.
+    """
+    return max(1, int(characters_for_tokens(max_item_tokens) * EDIT_SIZE_HEADROOM))
 
 
 class EditOperation(StrEnum):
@@ -251,9 +273,11 @@ def _strings(value: object) -> tuple[str, ...]:
 __all__ = [
     "EDIT_SCHEMA",
     "EDIT_SCHEMA_VERSION",
+    "EDIT_SIZE_HEADROOM",
     "MAX_EDIT_BYTES",
     "CodeChangeSet",
     "EditOperation",
     "FileEdit",
     "MalformedChangeSet",
+    "max_edit_bytes_for_context",
 ]

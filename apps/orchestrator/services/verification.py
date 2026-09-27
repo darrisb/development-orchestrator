@@ -23,9 +23,17 @@ Four properties are worth knowing before reading the code.
   (section 17), carrying the command and its real output.
 * **The scope guard runs before a worker is started, and again afterwards.**
   Before, because a candidate that already broke its allowance should not be
-  given a container. Afterwards, because a build writes files -- a `dist/`
-  that appeared during `npm run compile` is in the worktree whether or not
-  the coder put it there, and `DIFF_POLICY` is the check that sees it.
+  given a container. Afterwards because a command can write into the worktree
+  -- a `dist/` that appeared during `npm run compile`, a refreshed lockfile --
+  and the candidate that goes to a reviewer must be the one that was measured.
+  What makes that true is the restore in ``_run_command_categories``: the
+  worktree is reset and the measured candidate patch reapplied before
+  ``DIFF_POLICY`` looks, so the commands' side effects are discarded rather
+  than classified. `DIFF_POLICY` is therefore also the check that would notice
+  if the restore had not worked. This is concern 20: a project whose build
+  writes output that is not in `.gitignore` would otherwise have every
+  otherwise-passing candidate turned into a `SCOPE_VIOLATION` whose real fix
+  is a `.gitignore` entry, routed to `ROLLBACK` without the coder being told.
 * **A skipped category is recorded, not assumed.** A project with no lint
   command has not passed lint. The row says ``SKIPPED`` and the report counts
   it as neither a pass nor a failure.

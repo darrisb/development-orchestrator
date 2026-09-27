@@ -111,14 +111,21 @@ _IMPORT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"""(?:^|\s)(?:import|export)\s[^;\n]*?from\s+['"]([^'"]+)['"]"""),
     re.compile(r"""(?:^|\s)import\s+['"]([^'"]+)['"]"""),
     re.compile(r"""require\(\s*['"]([^'"]+)['"]\s*\)"""),
-    # Python: from a.b import c / import a.b
+    # Python: from a.b import c / import a.b. ``static`` is excluded because
+    # Java's ``import static a.b.C;`` otherwise yields the keyword as a target.
     re.compile(r"""(?m)^\s*from\s+([.\w]+)\s+import\s"""),
-    re.compile(r"""(?m)^\s*import\s+([.\w]+)"""),
+    re.compile(r"""(?m)^\s*import\s+(?!static\b)([.\w]+)"""),
     # Java/Kotlin: import com.example.navigation.Tree;
     re.compile(r"""(?m)^\s*import\s+(?:static\s+)?([\w.]+)\s*;"""),
-    # Go: import "example/project/pkg" and entries in import (...).
-    re.compile(r'''(?m)^\s*(?:import\s+)?(?:[\w.]+\s+)?"([^"]+)"'''),
 )
+
+#: Go on its own, because a bare quoted string is not evidence of an import:
+#: ``"name": "thing",`` in a JSON fixture and a string in a list literal both
+#: look like one. A specifier counts only inside a real import statement or a
+#: parenthesised import block, which means tracking where the block ends.
+_GO_SINGLE_IMPORT = re.compile(r'''(?m)^\s*import\s+(?:[\w.]+\s+)?"([^"]+)"''')
+_GO_IMPORT_BLOCK_START = re.compile(r"(?m)^\s*import\s*\($")
+_GO_BLOCK_ENTRY = re.compile(r'''^\s*(?:[\w.]+\s+)?"([^"]+)"''')
 
 
 def split_identifier(token: str) -> list[str]:
@@ -307,7 +314,29 @@ def extract_import_targets(source: str) -> list[str]:
     for pattern in _IMPORT_PATTERNS:
         for match in pattern.finditer(source):
             seen.setdefault(match.group(1).strip(), None)
+    for target in _go_import_targets(source):
+        seen.setdefault(target, None)
     return list(seen)
+
+
+def _go_import_targets(source: str) -> list[str]:
+    """Go import specifiers, read only from where Go puts them."""
+    targets: list[str] = []
+    for match in _GO_SINGLE_IMPORT.finditer(source):
+        targets.append(match.group(1).strip())
+    lines = source.splitlines()
+    inside = False
+    for line in lines:
+        if not inside:
+            inside = _GO_IMPORT_BLOCK_START.match(line) is not None
+            continue
+        if line.strip().startswith(")"):
+            inside = False
+            continue
+        entry = _GO_BLOCK_ENTRY.match(line)
+        if entry is not None:
+            targets.append(entry.group(1).strip())
+    return targets
 
 
 def resolve_import(specifier: str, *, from_path: str, known_paths: Sequence[str]) -> str | None:

@@ -9,6 +9,7 @@ mocked filesystem cannot demonstrate, so these run against a real store.
 from __future__ import annotations
 
 import json
+from itertools import count
 from pathlib import Path
 
 import pytest
@@ -443,3 +444,146 @@ def test_the_run_directory_is_where_a_person_would_look(
     training.capture_accepted_run(session, accepted.id, settings=git_settings)
 
     assert (git_settings.training_dir / external / "outcome.json").exists()
+
+
+# --- a run that has not settled yet (concern 41) ------------------------------
+
+
+def test_a_run_still_in_flight_can_be_given_a_provisional_outcome(
+    session: Session, task: Task, git_settings: Settings
+):
+    """Concern 41: the run you most want to read about is the one that stopped.
+
+    A crash leaves reviews and artifacts under the run directory and nothing at
+    its root summarising them, so a provisional file is written at turn
+    boundaries under the same name and schema a settled run uses.
+    """
+    run = TaskRunRepository(session).add(
+        TaskRun(task_id=task.id, run_number=1, status=RunStatus.RUNNING)
+    )
+
+    payload = training.record_outcome(
+        session, run.id, outcome="in_progress", settings=git_settings
+    )
+
+    written = json.loads(_outcome_path(session, run, git_settings).read_text("utf-8"))
+    assert written["outcome"] == "in_progress"
+    assert payload["external_task_id"] == "TS-001"
+    # Same schema as a settled run's, so one reader handles both.
+    assert {"attempts", "review_cycles", "failure_reason"} <= written.keys()
+
+
+def test_settling_replaces_the_provisional_outcome_in_place(
+    session: Session, task: Task, git_settings: Settings
+):
+    """One location and one schema: the terminal write overwrites, never adds."""
+    run = TaskRunRepository(session).add(
+        TaskRun(task_id=task.id, run_number=1, status=RunStatus.RUNNING)
+    )
+    training.record_outcome(session, run.id, outcome="in_progress", settings=git_settings)
+    TaskRunRepository(session).finish(run.id, RunStatus.SUCCEEDED)
+
+    training.record_outcome(session, run.id, outcome="accepted", settings=git_settings)
+
+    path = _outcome_path(session, run, git_settings)
+    assert json.loads(path.read_text("utf-8"))["outcome"] == "accepted"
+    assert sorted(p.name for p in path.parent.glob("outcome*.json")) == ["outcome.json"]
+
+
+# --- curation order and retention (concerns 43 and 45) -----------------------
+
+
+_run_numbers = count(1)
+
+
+def _captured(
+    session: Session, task: Task, git_settings: Settings, *, attempts: int, cycles: int
+):
+    """A captured example whose run cost ``attempts`` and ``cycles``."""
+    run = TaskRunRepository(session).add(
+        TaskRun(
+            task_id=task.id,
+            run_number=next(_run_numbers),
+            attempt_number=attempts,
+            status=RunStatus.SUCCEEDED,
+        )
+    )
+    example = training.capture_training_example(session, run.id, settings=git_settings)
+    return TrainingExampleRepository(session).update_fields(
+        example.id, attempts=attempts, review_cycles=cycles
+    )
+
+
+def test_the_curation_queue_is_ranked_by_instructiveness_not_recency(
+    session: Session, project: Project, task: Task, git_settings: Settings
+):
+    """Concern 45: a run that took three attempts and a review cycle taught
+    something; a trivial first-attempt pass did not. Ordering the queue by
+    arrival meant the least instructive examples were curated first."""
+    trivial = _captured(session, task, git_settings, attempts=1, cycles=0)
+    hard = _captured(session, task, git_settings, attempts=3, cycles=2)
+    middling = _captured(session, task, git_settings, attempts=2, cycles=0)
+
+    ranked = training.ranked_training_queue(session, project.id)
+
+    assert [item.id for item in ranked] == [hard.id, middling.id, trivial.id]
+
+
+def test_only_uncurated_examples_are_in_the_queue(
+    session: Session, project: Project, task: Task, git_settings: Settings
+):
+    """A decision already taken is not a decision waiting to be taken."""
+    pending = _captured(session, task, git_settings, attempts=1, cycles=0)
+    decided = _captured(session, task, git_settings, attempts=3, cycles=2)
+    training.curate_training_example(
+        session, decided.id, status=TrainingStatus.SELECTED
+    )
+
+    assert [item.id for item in training.ranked_training_queue(session, project.id)] == [
+        pending.id
+    ]
+
+
+def test_capture_retention_excludes_the_least_instructive_uncurated_examples(
+    session: Session, project: Project, task: Task, git_settings: Settings
+):
+    """Concern 43: training copies accumulated with nothing pruning them.
+
+    Retention acts on the same ranking the queue uses, so what it drops is the
+    material a curator would have reached last.
+    """
+    settings = git_settings.model_copy(update={"training_max_captured_per_project": 2})
+    hard = _captured(session, task, settings, attempts=3, cycles=2)
+    middling = _captured(session, task, settings, attempts=2, cycles=0)
+    trivial = _captured(session, task, settings, attempts=1, cycles=0)
+
+    # The third capture is what takes the project over its ceiling.
+    _captured(session, task, settings, attempts=3, cycles=3)
+
+    statuses = {
+        item.id: item.status
+        for item in TrainingExampleRepository(session).list_for_project(project.id)
+    }
+    assert statuses[trivial.id] is TrainingStatus.EXCLUDED
+    assert statuses[hard.id] is TrainingStatus.CAPTURED
+    excluded = TrainingExampleRepository(session).get(trivial.id)
+    assert excluded.exclusion_reason is not None
+    # And the run's own directory is untouched: only the duplicate copy goes.
+    assert middling.artifact_path
+
+
+def test_retention_never_deletes_a_curated_example(
+    session: Session, project: Project, task: Task, git_settings: Settings
+):
+    """A human decision outranks a ceiling: retention only sees `CAPTURED`."""
+    settings = git_settings.model_copy(update={"training_max_captured_per_project": 1})
+    selected = _captured(session, task, settings, attempts=1, cycles=0)
+    training.curate_training_example(
+        session, selected.id, status=TrainingStatus.SELECTED
+    )
+
+    _captured(session, task, settings, attempts=3, cycles=3)
+
+    assert TrainingExampleRepository(session).get(selected.id).status is (
+        TrainingStatus.SELECTED
+    )

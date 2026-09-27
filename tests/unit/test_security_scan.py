@@ -213,3 +213,51 @@ def test_a_placeholder_value_is_not_a_leak():
     )
 
     assert assessment.decision is ScopePolicyDecision.ALLOW
+
+
+# --------------------------------------------- per-project generated patterns
+
+
+def test_a_vendored_dependency_tree_is_blocked_by_default():
+    """The default is right for most repositories: commit source, not output."""
+    assessment = scan_candidate("", summary(changed("vendor/github.com/x/y.go")))
+
+    assert assessment.decision is ScopePolicyDecision.BLOCK
+    assert assessment.findings[0].kind is SecurityFindingKind.GENERATED_ARTIFACT
+
+
+def test_a_project_that_deliberately_versions_its_build_output_can_say_so():
+    """Concern 22: a Go project that vendors its dependencies had no way to
+    pass verification while the pattern list was a module constant."""
+    assessment = scan_candidate(
+        "",
+        summary(changed("vendor/github.com/x/y.go")),
+        generated_path_exceptions=("vendor/**",),
+    )
+
+    assert assessment.decision is ScopePolicyDecision.ALLOW
+    assert assessment.findings == ()
+
+
+def test_an_exception_does_not_widen_to_other_generated_paths():
+    """Declaring `vendor/` says nothing about `dist/`."""
+    assessment = scan_candidate(
+        "",
+        summary(changed("dist/bundle.js")),
+        generated_path_exceptions=("vendor/**",),
+    )
+
+    assert assessment.decision is ScopePolicyDecision.BLOCK
+
+
+def test_an_exception_never_excuses_credential_material():
+    """A declared generated path is still not a place to put a private key:
+    the forbidden-file check is ordered ahead of the generated-path check."""
+    assessment = scan_candidate(
+        "",
+        summary(changed("vendor/config/service-account.json")),
+        generated_path_exceptions=("vendor/**",),
+    )
+
+    assert assessment.decision is ScopePolicyDecision.BLOCK
+    assert assessment.findings[0].kind is SecurityFindingKind.FORBIDDEN_FILE

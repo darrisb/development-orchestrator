@@ -117,6 +117,11 @@ def project_repo(tmp_path: Path) -> Path:
         "pathlib.Path('dist').mkdir(exist_ok=True)\n"
         "pathlib.Path('dist/bundle.js').write_text('console.log(1)\\n')\n"
     )
+    # The same thing at a path no pattern list would recognise as build output.
+    (repo / "tools" / "stamp.py").write_text(
+        "import pathlib\n"
+        "pathlib.Path('src/version.py').write_text('BUILD = 7\\n')\n"
+    )
     run_git(repo, "init", "--initial-branch=main", "--quiet")
     run_git(repo, "add", "-A")
     run_git(repo, "commit", "--quiet", "-m", "Initial commit")
@@ -504,6 +509,36 @@ def test_files_a_build_generated_are_removed_after_the_commands_run(
     assert report.failure_reason is None
     assert report.step_for(VerificationType.BUILD).passed
     assert not (workspace.path / "dist" / "bundle.js").exists()
+    assert [change.path for change in capture_diff(workspace).summary.files] == [
+        "src/nav.py"
+    ]
+
+
+def test_a_build_that_writes_an_unrecognisable_path_still_does_not_fail_the_candidate(
+    session: Session,
+    project: Project,
+    workspace: TaskWorkspace,
+    verification_settings: Settings,
+):
+    """Concern 20: what protects the candidate is the restore, not a pattern
+    list. `dist/` is in `GENERATED_PATTERNS`; `src/version.py` is not, and a
+    check that classified the build's leavings rather than discarding them
+    would turn this passing candidate into a `SCOPE_VIOLATION` whose real fix
+    is a `.gitignore` entry -- routed to `ROLLBACK`, so the coder is not even
+    told.
+    """
+    ProjectRepository(session).update_fields(
+        project.id,
+        verification_profile={"build": [f"{PYTHON} tools/stamp.py"]},
+    )
+    candidate(workspace, "def navigate(target):\n    return target.strip()\n")
+
+    report = verify(session, workspace, verification_settings)
+
+    assert report.passed
+    assert report.failure_reason is None
+    assert report.step_for(VerificationType.DIFF_POLICY).passed
+    assert not (workspace.path / "src" / "version.py").exists()
     assert [change.path for change in capture_diff(workspace).summary.files] == [
         "src/nav.py"
     ]

@@ -13,3 +13,4 @@ data/training/*
 !workspace/.gitkeep
 *.db
 *.sqlite3
+*:Zone.Identifier

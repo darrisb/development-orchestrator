@@ -119,6 +119,32 @@ restart. The exercise uses scripted coder/reviewer responses so failures are
 repeatable; it validates orchestration and safety, not the quality of whatever
 local models an operator configures (concern 47).
 
+Phase M also closed the concerns that a first real project would have hit, and
+they turned out to be one concern in three places: a built-in pattern list that
+is right for most repositories and wrong for some, with no way for the wrong
+ones to say so. A project now declares `sensitive_path_exceptions`,
+`generated_path_exceptions` and `approval_gated_categories` in its manifest
+beside `protected_paths` (concerns 5, 22, 29), and the built-in sensitive
+patterns are directory-shaped, so `src/tokenizer.ts` is no longer treated as
+credential material. Alongside those: the approved plan is compared against the
+edits that arrived (7), the edit ceiling is derived from the context budget
+rather than chosen separately (11), `dependency_paths` gets an installed tree
+into a networkless worker (12), Java and Go imports are understood when
+selecting supporting sources (30), a loop whose reviews stop changing escalates
+instead of spending the rest of its budget (38), later corrections carry the
+earlier ones they must not regress (39), a run that has not settled still has an
+`outcome.json` to read after a crash (41), and the training capture queue is
+ranked and bounded (43, 45).
+
+That pass was an audit as much as a set of fixes, and what it found is the
+reason it is worth mentioning: several of these had been implemented without
+tests. Testing them found a `.gitignore` directory entry the dependency check
+could not match, and two import patterns reading nonsense as import targets.
+It also found that concern 20's danger had already been removed by the
+candidate-patch restore -- written for a different reason -- which in turn
+removed concern 29's cause. Both properties are now pinned by tests, because a
+property that holds by accident is a property that stops holding.
+
 ## Layout
 
 | Path | Contents |
@@ -533,9 +559,12 @@ scope validation  →  build  →  lint  →  targeted tests  →  security  →
   its write allowance does not get a container.
 - **The pipeline stops at the first failing category.** A candidate that does
   not compile has nothing useful to say about its own tests.
-- **Diff policy runs last, after the commands.** A `dist/` that appeared during
-  the build is in the worktree whether or not the coder wrote it, and the first
-  scope check could not have seen it (concern 20).
+- **Diff policy runs last, after the commands** -- over the *restored*
+  candidate. A `dist/` that appeared during the build is in the worktree
+  whether or not the coder wrote it, so the worktree is reset and the measured
+  candidate patch reapplied before the check looks. The commands' side effects
+  are discarded rather than classified, which is why a project whose build
+  writes output that is not in `.gitignore` still passes (concern 20).
 - **A category with no command is `SKIPPED`, never `PASSED`.** A project with no
   lint step has not passed lint, and the row says so.
 - **`passed` and `verified` are different claims.** `passed` means nothing that
@@ -959,8 +988,10 @@ comes from each managed repository's `build.tasks.yaml`. See `.env.example`.
 
 Three defaults are deliberate and should stay that way until the loop is proven:
 `GIT_PUSH_ENABLED=false`, `WORKER_BACKEND=docker` and `WORKER_NETWORK=none`.
-The last one means a verification command cannot install dependencies -- the
-repository must already have them (concern 12).
+The last one means a verification command cannot install dependencies. A
+project that keeps its installed tree out of Git declares `dependency_paths` in
+its manifest and each new worktree gets a copy, so the network policy stays
+absolute rather than becoming a switch someone turns off (concern 12).
 
 `CONTEXT_MAX_TOKENS=0` is a third: leaving the budget derived from the served
 window means raising `LOCAL_MODEL_CONTEXT_WINDOW` for a bigger endpoint is one
