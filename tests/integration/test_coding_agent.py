@@ -654,19 +654,24 @@ async def test_a_clipped_writable_file_refuses_the_attempt_before_any_model_call
     task_factory,
     tmp_path: Path,
 ):
-    """Concern 1, closed. The context builder clips a long file to the per-item
-    budget; the edit contract asks for the complete new contents of every file
-    the coder changes. For a writable file it has only seen the start of, those
-    two cannot both be met -- it would return the part it read and the rest
-    would land in the diff as a deletion.
+    """Concern 1, closed, and still closed after concerns 55 and 56.
 
-    So the attempt is refused, and it is refused *before* a model is asked: no
-    feedback the coder could act on would change the outcome, which is why this
-    escalates rather than retrying."""
+    The edit contract asks for the complete new contents of every file the coder
+    changes. For a writable file it has only seen the start of, that cannot be
+    met -- it would return the part it read and the rest would land in the diff
+    as a deletion. So the attempt is refused, and refused *before* a model is
+    asked: no feedback the coder could act on would change the outcome.
+
+    What changed with concern 56 is when this arises. A writable file is now
+    exempt from the per-item cap, so reaching this guard takes a *total* budget
+    that cannot hold the file -- which is the only case where the refusal was
+    ever the right answer. The guard itself is untouched, and is the defence in
+    depth behind the budgeting: if the reservation is ever wrong, an incomplete
+    writable file still never reaches a model."""
     long_file = repository / "src" / "navigation.ts"
     long_file.write_text(
-        "// a file larger than the per-item context budget\n"
-        + "".join(f"export const value{index} = {index};\n" for index in range(400)),
+        "// a file larger than the whole context budget\n"
+        + "".join(f"export const value{index} = {index};\n" for index in range(4_000)),
         encoding="utf-8",
     )
     run_git(repository, "add", "-A")
@@ -677,6 +682,9 @@ async def test_a_clipped_writable_file_refuses_the_attempt_before_any_model_call
         artifact_root=tmp_path / "data",
         worktree_root=tmp_path / "worktrees",
         context_max_item_tokens=50,
+        # No room for the complete file, so it cannot be supplied whole and
+        # cannot be asked for whole either.
+        context_max_tokens=3_000,
     )
     task = task_factory()
     created = create_run(session, task.id)
@@ -691,7 +699,9 @@ async def test_a_clipped_writable_file_refuses_the_attempt_before_any_model_call
     assert attempt.failure_reason is FailureReason.HUMAN_DECISION_REQUIRED
     assert coder.requests == []
     assert "src/navigation.ts" in attempt.feedback
-    assert "CONTEXT_MAX_ITEM_TOKENS" in attempt.feedback
+    # The remedy named is the one that would actually work: the per-item cap no
+    # longer applies to a writable file, so raising it would change nothing.
+    assert "CONTEXT_MAX_TOKENS" in attempt.feedback
     # Nothing was written, so there is nothing to undo.
     assert attempt.changed_paths == ()
     assert ModelRunRepository(session).list_for_run(created.id) == []
@@ -730,3 +740,173 @@ async def test_a_clipped_file_the_task_only_reads_does_not_refuse_the_attempt(
 
     assert attempt.failure_reason is not FailureReason.HUMAN_DECISION_REQUIRED
     assert attempt.succeeded
+
+
+@pytest.mark.asyncio
+async def test_a_writable_file_over_the_per_item_cap_is_coded_not_refused(
+    session: Session,
+    repository: Path,
+    task_factory,
+    tmp_path: Path,
+):
+    """Concern 56. The same file that used to refuse the attempt is now coded.
+
+    This is the TS-106 shape: a writable file past CONTEXT_MAX_ITEM_TOKENS with
+    most of the total budget unspent. Before, the per-item cap clipped it and
+    the guard above refused -- a task that was entirely possible became
+    impossible because an earlier task in the chain had made the file longer.
+    Now the complete file is supplied, and the coder is asked.
+    """
+    long_file = repository / "src" / "navigation.ts"
+    body = "// grown by the tasks before this one\n" + "".join(
+        f"export const value{index} = {index};\n" for index in range(400)
+    )
+    long_file.write_text(body, encoding="utf-8")
+    run_git(repository, "add", "-A")
+    run_git(repository, "commit", "--quiet", "-m", "TS-002: grow navigation.ts")
+
+    settings = Settings(
+        _env_file=None,
+        artifact_root=tmp_path / "data",
+        worktree_root=tmp_path / "worktrees",
+        context_max_item_tokens=50,
+    )
+    # Replacing a 400-line file is a large diff by construction; the size
+    # ceiling is not what this test is about.
+    task = task_factory(
+        complexity=Complexity.LOW,
+        limits=TaskLimits(max_files_changed=3, max_diff_lines=2_000),
+    )
+    created = create_run(session, task.id)
+    workspace = prepare_workspace(session, created.id, settings=settings)
+    coder = ScriptedCoder(_code_answer())
+
+    attempt = await run_coding_attempt(
+        session, workspace, provider=coder, settings=settings
+    )
+
+    assert attempt.succeeded
+    assert attempt.failure_reason is not FailureReason.HUMAN_DECISION_REQUIRED
+    # The point of the exemption: the coder saw every line it was asked to
+    # replace, so "complete new contents" is a question it can answer.
+    assert len(coder.requests) == 1
+    context = coder.requests[0].context or ""
+    assert body in context
+    # Only the writable file is exempt: the section for it carries no marker,
+    # while the supporting files this tiny per-item cap clips still do.
+    section = context.split("## src/navigation.ts (declared: may modify)")[1]
+    assert "truncated by orchestrator" not in section.split("\n## ")[0]
+    assert "truncated by orchestrator" in context
+
+
+# --- writable files that never arrive at all (concern 58) --------------------
+#
+# Concern 56 made a writable file exempt from the per-item cap. That closed the
+# case where the file was clipped, and left the case where it was never a
+# candidate: over CONTEXT_MAX_FILE_BYTES, binary, or filtered out of selection.
+# Those leave no truncated item behind, so a guard that reasons from truncation
+# sees nothing and the coder is asked to replace a file it has never read.
+
+
+@pytest.mark.asyncio
+async def test_a_writable_file_over_the_byte_cap_refuses_the_attempt(
+    session: Session,
+    repository: Path,
+    task_factory,
+    tmp_path: Path,
+):
+    """The file is not clipped here -- it is absent. Nothing in the package
+    says so on its own, which is the whole point of recording it."""
+    oversized = repository / "src" / "navigation.ts"
+    oversized.write_text(
+        "".join(f"export const value{index} = {index};\n" for index in range(2_000)),
+        encoding="utf-8",
+    )
+    run_git(repository, "add", "-A")
+    run_git(repository, "commit", "--quiet", "-m", "TS-002: grow navigation.ts past the cap")
+
+    settings = Settings(
+        _env_file=None,
+        artifact_root=tmp_path / "data",
+        worktree_root=tmp_path / "worktrees",
+        context_max_file_bytes=1_024,
+    )
+    task = task_factory()
+    created = create_run(session, task.id)
+    workspace = prepare_workspace(session, created.id, settings=settings)
+    coder = ScriptedCoder()  # no answers: being asked at all would fail here
+
+    attempt = await run_coding_attempt(
+        session, workspace, provider=coder, settings=settings
+    )
+
+    assert not attempt.succeeded
+    assert attempt.failure_reason is FailureReason.HUMAN_DECISION_REQUIRED
+    # Requirement: the model is not called when the required source is missing.
+    assert coder.requests == []
+    assert ModelRunRepository(session).list_for_run(created.id) == []
+    assert "src/navigation.ts" in attempt.feedback
+    assert "CONTEXT_MAX_FILE_BYTES" in attempt.feedback
+    assert attempt.changed_paths == ()
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_file_the_task_only_reads_is_still_just_omitted(
+    session: Session,
+    repository: Path,
+    task_factory,
+    tmp_path: Path,
+):
+    """Requirement: ordinary exclusion policy is unchanged for everything the
+    coder is not going to reproduce."""
+    oversized = repository / "src" / "widgets" / "tree.ts"
+    oversized.write_text(
+        "".join(f"export interface Node{index} {{ id: string; }}\n" for index in range(2_000)),
+        encoding="utf-8",
+    )
+    run_git(repository, "add", "-A")
+    run_git(repository, "commit", "--quiet", "-m", "TS-002: grow tree.ts past the cap")
+
+    settings = Settings(
+        _env_file=None,
+        artifact_root=tmp_path / "data",
+        worktree_root=tmp_path / "worktrees",
+        context_max_file_bytes=1_024,
+    )
+    task = task_factory(complexity=Complexity.LOW)
+    created = create_run(session, task.id)
+    workspace = prepare_workspace(session, created.id, settings=settings)
+
+    attempt = await run_coding_attempt(
+        session, workspace, provider=ScriptedCoder(_code_answer()), settings=settings
+    )
+
+    assert attempt.succeeded
+    assert attempt.failure_reason is not FailureReason.HUMAN_DECISION_REQUIRED
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_writable_file_still_proceeds(
+    session: Session,
+    repository: Path,
+    task_factory,
+    tmp_path: Path,
+):
+    """The guard has to stay quiet on the ordinary case, or it is just a brake."""
+    settings = Settings(
+        _env_file=None,
+        artifact_root=tmp_path / "data",
+        worktree_root=tmp_path / "worktrees",
+    )
+    task = task_factory(complexity=Complexity.LOW)
+    created = create_run(session, task.id)
+    workspace = prepare_workspace(session, created.id, settings=settings)
+    coder = ScriptedCoder(_code_answer())
+
+    attempt = await run_coding_attempt(
+        session, workspace, provider=coder, settings=settings
+    )
+
+    assert attempt.succeeded
+    assert len(coder.requests) == 1
+    assert "src/navigation.ts" in attempt.changed_paths

@@ -215,27 +215,32 @@ async def run_coding_attempt(
         coder_model_id=coder.id,
     )
 
-    # Section 15 clips any single context item to the per-item budget, and the
-    # edit contract asks for the *complete new contents* of every file the
-    # coder changes. For a writable file the coder has only seen the start of,
-    # those two demands cannot both be met: it will invent or drop the part it
-    # could not read, and the result is a large deletion in the diff rather
-    # than an error. Refused here, before a model is asked, because no feedback
-    # the coder could act on would change the outcome (concern 1).
-    clipped = _clipped_writable_paths(built, policy)
-    if clipped:
+    # The edit contract asks for the *complete new contents* of every file the
+    # coder changes, so a writable file it has not seen whole cannot be asked
+    # for: it will invent or drop the part it could not read, and the result is
+    # a large deletion in the diff rather than an error. The package records,
+    # per writable file, whether its complete contents reached the coder --
+    # clipping is only one of the ways they might not have. Refused here,
+    # before a model is asked, because no feedback the coder could act on would
+    # change the outcome (concerns 1 and 58).
+    incomplete = _incomplete_writable_sources(built, policy)
+    if incomplete:
         return _failed(
             session, run, task, project, built, provider,
             FailureReason.HUMAN_DECISION_REQUIRED,
             feedback=(
                 "This attempt was refused before it started. The task may write "
-                + ", ".join(clipped)
-                + ", and the context budget could only show the coder part of "
-                + ("each of those files" if len(clipped) > 1 else "that file")
-                + ". Asking for the complete new contents of a file it has not "
-                "fully read would destroy the part it could not see. Raise "
-                "CONTEXT_MAX_ITEM_TOKENS, or split the task so each attempt "
-                "writes a smaller file."
+                + ("these files" if len(incomplete) > 1 else "this file")
+                + ", and the coder was not given the complete current contents "
+                "of "
+                + ("each of them" if len(incomplete) > 1 else "it")
+                + ":\n"
+                + "\n".join(f"- {path}: {reason}" for path, reason in incomplete)
+                + "\nAsking for the complete new contents of a file it has not "
+                "fully read would destroy the part it could not see. Raise the "
+                "context budget (CONTEXT_MAX_TOKENS, or CONTEXT_MAX_FILE_BYTES "
+                "for a file that was skipped outright), or split the task so "
+                "each attempt writes a smaller file."
             ),
             plan=None, assessment=None, duration_ms=0, usage=TokenUsage(), sink=sink,
         )
@@ -505,10 +510,21 @@ def _refused_plan_attempt(
 # -------------------------------------------------------------------- refusal
 
 
-def _clipped_writable_paths(
+def _incomplete_writable_sources(
     built: ContextBuildResult, policy: ScopePolicy
-) -> tuple[str, ...]:
-    """Files the coder may rewrite but was shown only part of (concern 1).
+) -> tuple[tuple[str, str], ...]:
+    """Files the coder may rewrite but was not shown whole (concerns 1 and 58).
+
+    Two sources, and the first is the load-bearing one. The package states, per
+    existing writable file, whether its complete original contents are in it --
+    a fact recorded while the package was built. The second is the original
+    check over ``truncated_paths``, kept as defence in depth: if the record is
+    ever wrong or missing, a visibly clipped writable file still refuses.
+
+    Reasoning from truncation alone was not enough. A file larger than
+    ``CONTEXT_MAX_FILE_BYTES``, a binary one, or one excluded from selection
+    never becomes an item at all, so there is no truncated path to notice and
+    the coder would be asked to replace a file it had never seen.
 
     Only files inside a *declared* allowance. A task that declared none is not
     checked, and that is a known gap rather than an oversight: with no
@@ -520,11 +536,18 @@ def _clipped_writable_paths(
     """
     if not policy.has_allowance:
         return ()
-    return tuple(
-        path
-        for path in built.package.truncated_paths
-        if policy.is_allowed(path) and not policy.is_inspect_only(path)
-    )
+
+    def writable(path: str) -> bool:
+        return policy.is_allowed(path) and not policy.is_inspect_only(path)
+
+    reasons: dict[str, str] = {}
+    for source in built.package.incomplete_required:
+        if writable(source.path):
+            reasons[source.path] = source.reason or "was not supplied whole"
+    for path in built.package.truncated_paths:
+        if writable(path):
+            reasons.setdefault(path, "only part of it fitted in the context budget")
+    return tuple(sorted(reasons.items()))
 
 
 # ------------------------------------------------------------------- judging

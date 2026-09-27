@@ -511,3 +511,142 @@ def test_a_directory_that_is_not_a_repository_still_builds(
 
     assert "src/navigation.ts" in result.package.paths
     assert result.package.manifest()["source_commit"] is None
+
+
+# --- writable files must arrive whole (concerns 55 and 56) -------------------
+
+
+def test_a_declared_writable_file_larger_than_the_per_item_cap_arrives_whole(
+    task: Task, context_repo: Path, git_settings: Settings
+):
+    """The TS-106 case, at the size that produced it.
+
+    The cumulative TraceStack run grew src/test/navigation-stack.test.ts from
+    2985 bytes at the baseline to 8110 after TS-105. At 8110 bytes the file
+    estimated 2034 tokens against CONTEXT_MAX_ITEM_TOKENS=2000, so TS-106 was
+    shown 242 of its 276 lines and refused before a model was called -- with
+    twelve thousand tokens of the total budget unused.
+    """
+    writable = context_repo / "src" / "navigation.ts"
+    body = writable.read_text(encoding="utf-8")
+    body += "".join(
+        f"export function helper{index}(): number {{ return {index}; }}\n"
+        for index in range(220)
+    )
+    writable.write_text(body, encoding="utf-8")
+    assert len(body.encode()) > 8_000
+    run_git(context_repo, "add", "-A")
+    run_git(context_repo, "commit", "--quiet", "-m", "TS-105: grow navigation.ts")
+
+    package = _package(task, context_repo, git_settings)
+
+    included = next(item for item in package.items if item.path == "src/navigation.ts")
+    assert included.estimated_tokens > git_settings.context_max_item_tokens
+    assert not included.truncated
+    assert included.content == body
+    assert package.metadata["required_complete"]["honoured"] is True
+    assert package.metadata["required_complete"]["paths"] == ["src/navigation.ts"]
+    # The file the task may only read is not exempted by association.
+    inspected = next(item for item in package.items if item.path == "src/widgets/tree.ts")
+    assert inspected.requires_complete is False
+    assert package.estimated_tokens <= package.budget.max_tokens
+
+
+def test_a_writable_file_that_cannot_fit_is_still_clipped_and_recorded(
+    task: Task, context_repo: Path, tmp_path: Path
+):
+    """Requirement 5. A total budget too small for the complete file leaves the
+    old behaviour in place: clipped, marked, and refused downstream."""
+    writable = context_repo / "src" / "navigation.ts"
+    writable.write_text(
+        "".join(f"export const value{index} = {index};\n" for index in range(4_000)),
+        encoding="utf-8",
+    )
+    run_git(context_repo, "add", "-A")
+    run_git(context_repo, "commit", "--quiet", "-m", "TS-105: grow navigation.ts hugely")
+    settings = Settings(
+        _env_file=None,
+        artifact_root=tmp_path / "data",
+        worktree_root=tmp_path / "worktrees",
+        context_max_tokens=3_000,
+    )
+
+    package = _package(task, context_repo, settings)
+
+    included = next(item for item in package.items if item.path == "src/navigation.ts")
+    assert included.truncated
+    assert included.requires_complete
+    assert package.metadata["required_complete"]["honoured"] is False
+    assert any(
+        "raise CONTEXT_MAX_TOKENS" in warning for warning in package.metadata["warnings"]
+    )
+    assert package.estimated_tokens <= package.budget.max_tokens
+
+
+def test_a_writable_file_over_the_byte_cap_is_recorded_as_incomplete(
+    task: Task, context_repo: Path, tmp_path: Path
+):
+    """Concern 58. Over CONTEXT_MAX_FILE_BYTES the file is not clipped, it is
+    never read at all -- so there is no truncated item to notice, and the
+    package has to say so itself."""
+    writable = context_repo / "src" / "navigation.ts"
+    writable.write_text(
+        "".join(f"export const value{index} = {index};\n" for index in range(2_000)),
+        encoding="utf-8",
+    )
+    run_git(context_repo, "add", "-A")
+    run_git(context_repo, "commit", "--quiet", "-m", "TS-105: grow navigation.ts past the cap")
+    settings = Settings(
+        _env_file=None,
+        artifact_root=tmp_path / "data",
+        worktree_root=tmp_path / "worktrees",
+        context_max_file_bytes=1_024,
+    )
+
+    package = _package(task, context_repo, settings)
+
+    assert "src/navigation.ts" not in package.paths
+    assert package.truncated_paths == ()
+    incomplete = package.incomplete_required
+    assert [source.path for source in incomplete] == ["src/navigation.ts"]
+    assert "CONTEXT_MAX_FILE_BYTES" in (incomplete[0].reason or "")
+
+
+def test_a_writable_file_that_is_binary_is_recorded_as_incomplete(
+    session: Session, project: Project, context_repo: Path, git_settings: Settings
+):
+    """Any exclusion path, not a list of the ones known today: a binary file is
+    refused by the reader long before the budget is consulted."""
+    blob = context_repo / "src" / "blob.ts"
+    blob.write_bytes(b"export const x = 1;\n\x00\x00binary\n")
+    run_git(context_repo, "add", "-A")
+    run_git(context_repo, "commit", "--quiet", "-m", "TS-105: add a binary-looking source")
+    task = TaskRepository(session).add(
+        Task(
+            project_id=project.id,
+            external_task_id="TS-006",
+            title="Rewrite the blob",
+            instructions="Replace the contents of the blob module.",
+            files_to_modify=["src/blob.ts"],
+        )
+    )
+
+    package = _package(task, context_repo, git_settings)
+
+    assert [source.path for source in package.incomplete_required] == ["src/blob.ts"]
+    assert package.incomplete_required[0].reason == "binary content"
+
+
+def test_a_writable_file_that_is_read_whole_is_recorded_complete(
+    task: Task, context_repo: Path, git_settings: Settings
+):
+    package = _package(task, context_repo, git_settings)
+
+    sources = {source.path: source for source in package.required_sources}
+    assert sources["src/navigation.ts"].complete is True
+    assert sources["src/navigation.ts"].reason is None
+    assert package.incomplete_required == ()
+    # A file the task only reads is not a required source at all.
+    assert "src/widgets/tree.ts" not in sources
+    # And a file the task will create has nothing to supply.
+    assert "src/navigationTree.ts" not in sources

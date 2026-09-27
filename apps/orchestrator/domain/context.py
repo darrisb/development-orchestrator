@@ -120,6 +120,13 @@ class ContextItem:
     #: stored in ``content``, so clipping can never eat the closing fence and
     #: leave the rest of the package inside a code block.
     language: str | None = None
+    #: This file may be *replaced* by the coder, and the edit contract asks for
+    #: a file's complete new contents. Showing part of it and then asking for
+    #: all of it is how a fix silently deletes the rest, so an item marked here
+    #: is exempt from ``max_item_tokens`` and is charged against the total
+    #: budget in full. It is set from the task's own write allowance, before
+    #: budgeting, never inferred from size or content (concerns 55 and 56).
+    requires_complete: bool = False
 
     @property
     def estimated_tokens(self) -> int:
@@ -170,6 +177,7 @@ class ContextItem:
             truncated=True,
             shown_lines=len(kept),
             language=self.language,
+            requires_complete=self.requires_complete,
         )
 
     def manifest_entry(self) -> dict[str, object]:
@@ -185,7 +193,33 @@ class ContextItem:
             "truncated": self.truncated,
             "shown_lines": self.shown_lines,
             "estimated_tokens": self.estimated_tokens,
+            "requires_complete": self.requires_complete,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class RequiredSource:
+    """Whether one file the task may replace reached the coder whole.
+
+    The coding agent's guard reads this rather than inferring safety from
+    ``truncated_paths``. The two are not the same question: a file can fail to
+    arrive whole by being clipped, by being dropped for the budget, by being
+    larger than ``CONTEXT_MAX_FILE_BYTES``, by being binary, or by never having
+    been a selection candidate at all. Only the first of those leaves a
+    truncated item behind; the rest leave nothing, and nothing is exactly what
+    an inference from truncation cannot see (concern 58).
+
+    Attributes:
+        complete: the file's full original contents are in the package.
+        reason: why they are not, for a human and for the refusal message.
+    """
+
+    path: str
+    complete: bool
+    reason: str | None = None
+
+    def manifest_entry(self) -> dict[str, object]:
+        return {"path": self.path, "complete": self.complete, "reason": self.reason}
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +251,9 @@ class ContextPackage:
     budget: ContextBudget
     dropped: tuple[DroppedItem, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=dict)
+    #: One entry per *existing* file the task may replace, complete or not.
+    #: A file the task will create has no entry: there is nothing to supply.
+    required_sources: tuple[RequiredSource, ...] = ()
 
     @property
     def estimated_tokens(self) -> int:
@@ -233,6 +270,14 @@ class ContextPackage:
     @property
     def truncated_paths(self) -> tuple[str, ...]:
         return tuple(item.path or item.label for item in self.items if item.truncated)
+
+    @property
+    def incomplete_required(self) -> tuple[RequiredSource, ...]:
+        """Files the task may replace that did not arrive whole.
+
+        Non-empty means a whole-file replacement cannot safely be asked for.
+        """
+        return tuple(source for source in self.required_sources if not source.complete)
 
     @property
     def complete(self) -> bool:
@@ -262,6 +307,7 @@ class ContextPackage:
             "budget": self.budget.describe(),
             "items": [item.manifest_entry() for item in self.items],
             "dropped": [item.manifest_entry() for item in self.dropped],
+            "required_sources": [source.manifest_entry() for source in self.required_sources],
             **dict(self.metadata),
         }
 
@@ -271,47 +317,194 @@ def assemble(
     budget: ContextBudget,
     *,
     metadata: Mapping[str, object] | None = None,
+    required_paths: Mapping[str, str | None] | None = None,
 ) -> ContextPackage:
     """Fill ``budget`` with the highest-priority candidates that fit.
 
-    Strictly greedy in priority order, with no backfilling of a smaller
-    lower-priority item once something has been dropped. Backfilling would
-    make the package depend on file sizes in a way that is hard to predict and
-    harder to explain, and section 15's ranking exists precisely so that the
-    answer to "why is this here and not that?" is "it ranks higher".
+    Two passes, because two kinds of item are not interchangeable.
+
+    A file the task may *replace* has to be shown whole: the edit contract asks
+    for a file's complete new contents, so a coder shown the first 242 lines of
+    276 and asked to rewrite it will delete the 34 it never saw. Those items
+    carry ``requires_complete`` and are settled first -- exempt from
+    ``max_item_tokens``, charged in full against ``max_tokens``. Everything
+    else is supporting material and competes for what is left, which is what
+    makes requirement 4 hold: supporting context is sacrificed before writable
+    source is truncated, rather than the other way round.
+
+    ``required_paths`` names every *existing* file the task may replace, mapped
+    to the reason it could not be read where there is one. It is what makes the
+    completeness record a fact about the package rather than an inference from
+    it: a file that never became a candidate leaves no item and no drop, so
+    only the caller can say that it should have been there (concern 58).
+
+    The second pass is strictly greedy in priority order, with no backfilling
+    of a smaller lower-priority item once something has been dropped.
+    Backfilling would make the package depend on file sizes in a way that is
+    hard to predict and harder to explain, and section 15's ranking exists
+    precisely so that the answer to "why is this here and not that?" is "it
+    ranks higher".
+
+    When the required items cannot fit -- alongside the task specification,
+    which is never displaced -- the reservation is abandoned wholesale rather
+    than honoured in part. The package is then built exactly as it was before
+    this pass existed: the writable file is clipped, marked ``truncated``, and
+    the coding agent's own guard refuses the attempt before a model is asked.
+    Half a reservation would be the one outcome worse than either, because it
+    looks like the file was supplied whole.
     """
     ordered = sorted(_deduplicate(candidates), key=lambda item: item.sort_key)
-    accepted: list[ContextItem] = []
+
+    # The task specification is charged at its clipped cost because that is
+    # what the greedy pass below will spend on it; reserving around anything
+    # larger would leave the budget unable to hold the item it is reserving for.
+    task_cost = sum(
+        item.clipped(budget.max_item_tokens).estimated_tokens
+        for item in ordered
+        if item.priority is ContextPriority.TASK_INSTRUCTIONS
+    )
+    required = [item for item in ordered if item.requires_complete]
+    reserved = sum(item.estimated_tokens for item in required)
+    honoured = bool(required) and reserved + task_cost <= budget.max_tokens
+    if not honoured:
+        required, reserved = [], 0
+
+    required_ids = {id(item) for item in required}
+    accepted: list[ContextItem] = list(required)
     dropped: list[DroppedItem] = []
     used_tokens = 0
-    used_files = 0
+    # Required files are never dropped for ``max_files``, but they do occupy
+    # slots: the cap is a statement about how many files a coder can hold at
+    # once, and a file it must rewrite counts most of all.
+    used_files = sum(1 for item in required if item.is_file)
     exhausted = False
+    ceiling = budget.max_tokens - reserved
 
     for candidate in ordered:
+        if id(candidate) in required_ids:
+            continue
         item = candidate.clipped(budget.max_item_tokens)
         if item.is_file and used_files >= budget.max_files:
             dropped.append(_drop(item, f"max_files={budget.max_files} reached"))
             continue
         cost = item.estimated_tokens
-        if exhausted or used_tokens + cost > budget.max_tokens:
+        if exhausted or used_tokens + cost > ceiling:
             # The first rank-1 item is the task itself; a budget that cannot
             # hold it is a misconfiguration, not a selection outcome.
             if item.priority is ContextPriority.TASK_INSTRUCTIONS and not accepted:
                 raise ContextBudgetTooSmall(cost, budget.max_tokens)
             exhausted = True
-            dropped.append(_drop(item, f"max_tokens={budget.max_tokens} reached"))
+            dropped.append(
+                _drop(item, f"max_tokens={budget.max_tokens} reached")
+                if not reserved
+                else _drop(
+                    item,
+                    f"max_tokens={budget.max_tokens} reached, of which {reserved} "
+                    "are reserved for files the task may replace",
+                )
+            )
             continue
         accepted.append(item)
         used_tokens += cost
         if item.is_file:
             used_files += 1
 
+    items = tuple(sorted(accepted, key=lambda item: item.sort_key))
     return ContextPackage(
-        items=tuple(accepted),
+        items=items,
         budget=budget,
         dropped=tuple(dropped),
-        metadata=dict(metadata or {}),
+        metadata=_with_reservation_record(metadata, ordered, reserved, honoured=honoured),
+        required_sources=_required_sources(items, dropped, required_paths),
     )
+
+
+def _required_sources(
+    items: Sequence[ContextItem],
+    dropped: Sequence[DroppedItem],
+    required_paths: Mapping[str, str | None] | None,
+) -> tuple[RequiredSource, ...]:
+    """One verdict per file the task may replace, from what is in the package.
+
+    Deliberately decided by looking at the assembled package rather than by
+    listing the ways a file can go missing. New exclusion paths get added to a
+    context builder over time; "is its complete text in here?" keeps answering
+    correctly when they do.
+    """
+    if not required_paths:
+        return ()
+    included = {item.path: item for item in items if item.path is not None}
+    discarded = {item.path: item for item in dropped if item.path is not None}
+    sources: list[RequiredSource] = []
+    for path in sorted(required_paths):
+        item = included.get(path)
+        if item is not None and not item.truncated:
+            sources.append(RequiredSource(path=path, complete=True))
+            continue
+        if item is not None:
+            sources.append(
+                RequiredSource(
+                    path=path,
+                    complete=False,
+                    reason=(
+                        f"shown {item.shown_lines} of {item.source_lines} lines: "
+                        "the context budget could not hold it whole"
+                    ),
+                )
+            )
+            continue
+        dropped_item = discarded.get(path)
+        if dropped_item is not None:
+            sources.append(
+                RequiredSource(path=path, complete=False, reason=dropped_item.reason)
+            )
+            continue
+        sources.append(
+            RequiredSource(
+                path=path,
+                complete=False,
+                reason=required_paths[path] or "not included in the context package",
+            )
+        )
+    return tuple(sources)
+
+
+def _with_reservation_record(
+    metadata: Mapping[str, object] | None,
+    ordered: Sequence[ContextItem],
+    reserved: int,
+    *,
+    honoured: bool,
+) -> dict[str, object]:
+    """Record what was held back and why, for ``context-manifest.json``.
+
+    A reservation that could not be honoured is the interesting case and the
+    one an operator has to be able to see without reading the run's prompt, so
+    it is stated in the manifest *and* pushed onto the package's warnings.
+    """
+    required = [item for item in ordered if item.requires_complete]
+    record: dict[str, object] = {
+        "paths": sorted(item.path or item.label for item in required),
+        "reserved_tokens": reserved,
+        "honoured": honoured,
+    }
+    result = dict(metadata or {})
+    if required and not honoured:
+        record["reason"] = (
+            "the files the task may replace do not fit in the context budget "
+            "alongside the task specification; they are clipped as before and "
+            "the attempt will be refused rather than sent incomplete"
+        )
+        warnings = list(result.get("warnings") or ())
+        warnings.append(
+            "context budget cannot hold the complete contents of "
+            + ", ".join(sorted(item.path or item.label for item in required))
+            + "; raise CONTEXT_MAX_TOKENS or the served context window, or "
+            "split the task"
+        )
+        result["warnings"] = warnings
+    result["required_complete"] = record
+    return result
 
 
 class ContextBudgetTooSmall(ValueError):

@@ -285,7 +285,12 @@ def build_context_package(
             "name": project.name,
             "external_project_id": project.external_project_id,
         }
-    return assemble(items, budget or budget_from_settings(config), metadata=metadata)
+    return assemble(
+        items,
+        budget or budget_from_settings(config),
+        metadata=metadata,
+        required_paths=_required_source_paths(task, declared, reader),
+    )
 
 
 # --------------------------------------------------------------- item builders
@@ -318,12 +323,16 @@ def _declared_items(
     """
     items: list[ContextItem] = []
     for path in declared.existing:
-        purpose = "may modify" if path in declared.writable else "to inspect"
+        writable = path in declared.writable
+        purpose = "may modify" if writable else "to inspect"
         item = reader.file_item(
             path,
             priority=ContextPriority.DECLARED_FILE,
             reason=f"declared by task {task.external_task_id} ({purpose})",
             label_suffix=f"declared: {purpose}",
+            # A file the task may replace must be shown whole or not asked for:
+            # the edit contract wants its complete new contents (concern 55).
+            requires_complete=writable,
         )
         if item is not None:
             items.append(item)
@@ -601,6 +610,29 @@ def _declared_paths(task: Task, reader: RepositoryReader) -> _DeclaredPaths:
     )
 
 
+def _required_source_paths(
+    task: Task, declared: _DeclaredPaths, reader: RepositoryReader
+) -> dict[str, str | None]:
+    """Existing files the task may replace, mapped to why they cannot be read.
+
+    ``declared.existing`` is not enough on its own. It is built from
+    ``reader.paths``, which has already dropped anything excluded or
+    non-textual, so a writable file that exists but was never a selection
+    candidate looks exactly like a file the task is going to create. Asking the
+    filesystem directly is what separates "there is nothing to supply" from
+    "there is something and it did not arrive" (concern 58).
+    """
+    required: dict[str, str | None] = {}
+    for declaration in task.files_to_modify:
+        for path in _expand(declaration, reader) or [normalise_path(declaration)]:
+            target = reader.resolve(path)
+            if target is None or not target.is_file():
+                continue
+            reader.text_of(path)
+            required[path] = reader.exclusions.get(path)
+    return required
+
+
 def _expand(declared: str, reader: RepositoryReader) -> list[str]:
     path = normalise_path(declared)
     if set(path) & _GLOB_CHARACTERS:
@@ -644,6 +676,10 @@ class RepositoryReader:
         self.settings = settings
         self.git = git
         self.warnings: list[str] = []
+        #: Why a path that exists could not be read, by path. A warning is for
+        #: an operator reading the manifest; this is for the code that has to
+        #: decide whether a file the coder may replace actually arrived.
+        self.exclusions: dict[str, str] = {}
         self._cache: dict[str, str | None] = {}
         self.paths: tuple[str, ...] = self._list_paths()
 
@@ -686,19 +722,23 @@ class RepositoryReader:
         target = self.resolve(path)
         if target is None:
             self.warnings.append(f"refused to read outside the repository: {path}")
+            self.exclusions[path] = "resolves outside the repository"
             return None
         if not target.is_file():
             return None
         size = target.stat().st_size
         if size > self.settings.context_max_file_bytes:
-            self.warnings.append(
-                f"skipped {path}: {size} bytes exceeds CONTEXT_MAX_FILE_BYTES="
+            reason = (
+                f"{size} bytes exceeds CONTEXT_MAX_FILE_BYTES="
                 f"{self.settings.context_max_file_bytes}"
             )
+            self.warnings.append(f"skipped {path}: {reason}")
+            self.exclusions[path] = reason
             return None
         data = target.read_bytes()
         if b"\x00" in data:
             self.warnings.append(f"skipped {path}: binary content")
+            self.exclusions[path] = "binary content"
             return None
         return data.decode("utf-8", errors="replace")
 
@@ -709,6 +749,7 @@ class RepositoryReader:
         priority: ContextPriority,
         reason: str,
         label_suffix: str | None = None,
+        requires_complete: bool = False,
     ) -> ContextItem | None:
         """A context item for ``path``, or ``None`` if it could not be read."""
         text = self.text_of(path)
@@ -725,6 +766,7 @@ class RepositoryReader:
             source_bytes=len(data),
             source_lines=text.count("\n") + (0 if text.endswith("\n") else 1),
             language=language_for(path),
+            requires_complete=requires_complete,
         )
 
 

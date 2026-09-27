@@ -32,6 +32,17 @@ class Settings(BaseSettings):
     database_url: str = Field(
         default="postgresql+psycopg://orchestrator:orchestrator@localhost:5432/orchestrator"
     )
+    #: How long a statement may wait for a row lock before failing (concern 57).
+    #: A run competes for its own rows with nothing but another run of itself,
+    #: so a wait this long is contention that will not clear on its own. Zero
+    #: restores PostgreSQL's default of waiting forever, which is what produced
+    #: an orchestrator that could not answer its own health check.
+    db_lock_timeout_seconds: float = Field(default=30.0, ge=0.0)
+    #: How long a connection may sit inside an open transaction doing nothing
+    #: before the server ends it. This is what bounds the *holder*: a request
+    #: whose client went away leaves a live connection holding row locks, and
+    #: before this only a restart released them.
+    db_idle_in_transaction_timeout_seconds: float = Field(default=300.0, ge=0.0)
     artifact_root: Path = Field(default=Path("./data"))
 
     default_local_model_base_url: str = Field(default="http://192.168.0.126:8080/v1")

@@ -1466,3 +1466,309 @@ Worth recording as well: the four new enum values needed no migration, because
 enum. That is the sort of thing the column-comparison test in
 `tests/integration/test_migrations.py` would have caught for free if it had been
 otherwise, which is the argument for having that test at all.
+
+## 55. A file the task may replace became unreadable as the chain grew — **resolved**
+
+Found by the clean cumulative TraceStack run: ten synthetic tasks, no injected
+faults, the same Qwen at the same 32768, run until the orchestrator asked for a
+human. TS-101 through TS-105 were accepted and integrated on first pass in about
+twelve minutes. TS-106 was refused before a model was called at all.
+
+The refusal itself was right. The edit contract asks for the *complete new
+contents* of every file the coder changes, and the context builder had shown it
+242 of the 276 lines of `src/test/navigation-stack.test.ts`. Asking a model to
+reproduce a file it has seen five sixths of does not produce five sixths of a
+file; it produces a whole file with the last sixth deleted, and that deletion
+arrives as an ordinary-looking diff. The guard in `agents/coding_agent.py`
+caught exactly that and escalated `HUMAN_DECISION_REQUIRED`.
+
+What was wrong was the state it was catching. From `RUN-20260927-000016`:
+
+* `source_bytes` 8110, `source_lines` 276, `shown_lines` 242, `truncated` true.
+* `estimated_tokens` 2034 against `CONTEXT_MAX_ITEM_TOKENS=2000`.
+* The whole package: 2041 tokens of a 14745-token budget.
+
+The task was refused for want of 34 tokens with twelve thousand unspent.
+
+*Why it matters:* the per-item cap was being asked a question it cannot answer.
+A cap on supporting context is a sound idea — the head of a file you are only
+reading is usually the useful part. A cap on a file the coder must hand back
+whole is not a budget decision at all; it is the difference between a task that
+works and a task that cannot be attempted. The two were the same number.
+
+*Resolved* by making writability a property of a context item rather than
+something only the agent downstream knows. `ContextItem.requires_complete` is
+set in the builder's declared-file pass, from the task's own `files_to_modify`
+allowance, before any budgeting happens. `domain.context.assemble` then settles
+those items first: exempt from `max_item_tokens`, charged against `max_tokens`
+in full, and taken off the top so that supporting context competes for what is
+left. A file the task may only read is untouched by this and is still clipped,
+which is what clipping is for.
+
+The reservation is refused whole or not at all. If the required files cannot fit
+alongside the task specification, the reservation is abandoned and the package
+is built exactly as it was before — clipped, marked `truncated`, and refused by
+the same guard, with the reason in the manifest and a warning naming the files.
+A partly honoured reservation would be worse than either outcome, because it
+looks like the file arrived whole.
+
+Replayed against the real file at the integration tip `a2e40f2`: 2334 tokens,
+truncated at 242 of 276 lines before, complete after, package 2347 of 14745.
+
+The tests are in `tests/unit/test_context_budget.py` (seven, covering the 8110-
+byte case, supporting context sacrificed first, several writable files ordered
+deterministically, the impossible case still clipping, the total budget never
+exceeded, large read-only files still clipped, and the manifest record) and in
+`tests/integration/test_context_builder.py` and
+`tests/integration/test_coding_agent.py`. Five of the seven unit tests fail
+against the old assembly pass with the new field present, which is the check
+that they describe the behaviour rather than decorate it.
+
+`tests/integration/test_coding_agent.py` keeps both sides: the file that used to
+be refused is now coded, and a file too large for the *total* budget is still
+refused before any model call. The guard was not weakened. It is now the defence
+in depth behind the budgeting rather than the thing that fires first.
+
+## 56. The context budget had one cap for two different kinds of input — **resolved**
+
+The general form of concern 55, and the reason the fix is not a larger number.
+
+`CONTEXT_MAX_ITEM_TOKENS` was applied to every item alike: an interface the
+coder glances at, a configuration file, a recent commit, and a file it is about
+to rewrite from scratch. Only the last of those has a correctness requirement
+attached to its completeness. Raising the cap would have moved the cliff without
+removing it — the test file grows with every task that touches it, so any fixed
+number is a task count, and the run would have stopped at TS-108 instead of
+TS-106.
+
+Measured over the clean run, on `src/test/navigation-stack.test.ts`:
+
+```
+06a0697  baseline   2985 bytes
+6d5de16  TS-101     4044
+613f311  TS-102     4621
+02b3342  TS-103     5162
+f6eaa23  TS-104     5628
+a2e40f2  TS-105     8110   <- crosses the cap
+```
+
+*Why it matters:* this is a property of cumulative development, not of these ten
+tasks. Each accepted task makes the next one harder, silently, until the ceiling
+arrives and nothing works. Five runs in a row looked perfect. The sixth had no
+useful failure mode available to it — the model was never asked, so there was
+nothing to review, nothing to fix and nothing to learn from. A pipeline that
+degrades with its own success cannot be judged by a short run, which is the
+argument for running all ten rather than stopping at three or five.
+
+*Resolved* by the same change: the budget now distinguishes required complete
+writable inputs from supporting context, and only the second kind is clipped.
+The total budget is unchanged and is never exceeded — `CONTEXT_MAX_TOKENS`,
+`CONTEXT_WINDOW_SHARE`, the served 32768 window and the model are all as they
+were. Requirement, not optimisation: nothing here may make a package larger than
+the operator configured.
+
+What the manifest now carries, so this is legible without re-reading a prompt:
+`requires_complete` on every item, and a `required_complete` block giving the
+paths, the tokens reserved, whether the reservation was honoured, and the reason
+when it was not.
+
+One gap was left open here because it is a different trigger and not what these
+two concerns describe: a writable file larger than `CONTEXT_MAX_FILE_BYTES`
+(262144) is not clipped but omitted entirely, with only a warning. It is then
+absent rather than truncated, so the guard — which looked at truncated paths —
+did not see it, and the coder could be asked to write a file it was never shown
+at all. That is the same invariant with a worse failure mode. It is concern 58,
+and it is now closed.
+
+## 57. An abandoned HTTP client can park the whole orchestrator — **resolved**
+
+Found while setting the clean run up, before it started. `GET /health` hung, and
+had hung for twenty-three minutes with no log line after the last one.
+
+The evidence, from `pg_stat_activity`:
+
+```
+33305 | idle in transaction | Client | ClientRead         | 00:27:37 | SELECT projects...
+28269 | idle in transaction | Client | ClientRead         | 00:27:36 | SELECT task_runs...
+33701 | idle in transaction | Client | ClientRead         | 00:26:50 | SELECT projects...
+33702 | active              | Lock   | transactionid      | 00:26:49 | UPDATE task_runs SET external_run_id=$1 WHERE task_runs.id = $2
+```
+
+**Reproduced before anything was changed.** Two real connections to a real
+PostgreSQL: one writes a `task_runs` row and then issues a `SELECT`, leaving the
+transaction open; the second issues the same `UPDATE`. The second waited
+indefinitely, and `pg_stat_activity` showed the identical signature, including
+the misleading part — `idle in transaction / ClientRead` with a `SELECT` as the
+holder's visible query.
+
+**Which lock.** A PostgreSQL row-level write lock on one `task_runs` row.
+Nothing application-level: there is no advisory lock, no `SELECT ... FOR UPDATE`
+and no lock table anywhere in the codebase. `wait_event = transactionid` means
+the waiter is queued behind another transaction's completion, not behind a named
+lock object.
+
+**Who held it, and the thing that made the diagnosis slow.** `pg_stat_activity`
+reports a session's *last* statement, not the statement that took its locks. All
+three holders showed a `SELECT`, so the table appeared to say that reads were
+blocking a write, which is impossible. The lock came from an earlier `UPDATE` in
+the same still-open transaction.
+
+**Live, stale or contending.** Stale, on a *live* connection — the case that
+neither of the other two covers. The driver process had died, but the
+orchestrator's own backend connection was alive and idle inside a transaction.
+Process death was never the failing case: PostgreSQL rolls back a backend whose
+client is gone, which is pinned by
+`test_a_holder_whose_process_dies_releases_the_row`. What leaked was an
+orphaned `Session` inside a live uvicorn process, and those are not created by
+`get_db` — the workflow runner makes its own sessions, and a request task
+cancelled mid-`await` never reaches the code that would close them.
+
+**Why the acquisition had no bound.** `lock_timeout` and
+`idle_in_transaction_session_timeout` both default to `0` in PostgreSQL, meaning
+wait forever, and `create_db_engine` set neither. There was no application-level
+acquisition timeout either. So the bound on every lock wait in the orchestrator
+was the lifetime of whatever held it.
+
+**What controlled release.** The holding transaction's lifetime, which was the
+lifetime of the Python `Session` object, which nothing bounded. In practice:
+process exit. A restart cleared it, which is the wrong thing to have to
+discover.
+
+**Whether retry can recover.** Yes, and that is what makes a bounded failure
+safe here rather than merely faster. A waiter that times out holds nothing and
+has written nothing, so there is no second owner to reconcile; and concern 52's
+recovery reconstructs a run's state from durable records, so a run that fails
+this way is resumed rather than restarted.
+
+*Why it mattered:* the orchestrator's claim is that a run's state is durable and
+its progress visible. Here it was neither — no event, no log, no failed request,
+and a health endpoint that could not answer because it was in the same queue.
+
+*Resolved* with two per-connection settings, applied at connect time in
+`db/session.py`, because a lock wait can happen on any write in a run and
+enumerating them would leave every new write unbounded until someone remembered.
+
+* `lock_timeout` (`DB_LOCK_TIMEOUT_SECONDS`, default 30s) bounds the **waiter**.
+  A statement blocked on a row lock now fails with SQLSTATE `55P03` instead of
+  waiting for a transaction that may never end.
+* `idle_in_transaction_session_timeout`
+  (`DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS`, default 300s) bounds the
+  **holder**, which is the root cause rather than the symptom. An abandoned
+  request leaves a live connection idle in a transaction; the server now ends
+  it, and its locks go with it.
+
+Neither weakens mutual exclusion and neither bypasses a lock. A lock that is
+available is still taken, and still held for the whole transaction; what changed
+is that waiting for one is no longer unbounded. `test_the_holder_keeps_its_
+protection_while_it_is_active` is the test that says so: a transaction that
+keeps working past both timeouts is not interrupted.
+
+A bound that reports `OperationalError` would be a bound and not a diagnosis, so
+SQLSTATE `55P03` is translated once, at the engine, into `LockWaitTimeout` —
+matched on SQLSTATE rather than message text, which is localised. It maps to
+HTTP 503 rather than 409: the request was valid and the contention is usually
+transient. Its failure class is `RESOURCE_UNAVAILABLE`, whose existing policy is
+`PAUSE` — a durable, visible stop rather than silence.
+
+The tests are in `tests/integration/test_db_locking.py`, against a real server
+in a scratch database that is created and dropped there, contending on a real
+`task_runs` row with the incident's own statement. They cover the timeouts being
+set on every connection, an uncontended write still succeeding, contention
+failing in bounded time with a named and diagnosable error, the holder keeping
+its protection while active, release letting the next writer through, the
+abandoned transaction being ended by the server, a killed child process
+releasing the row, and a retry after a timeout not producing a second owner.
+They skip only when no PostgreSQL server is reachable; every other failure is
+raised rather than swallowed, so a broken test cannot pass as a missing
+environment.
+
+Reverting the two settings fails
+`test_a_contended_write_fails_in_bounded_time_and_says_why` on "the second
+writer waited without a bound" — and then the pytest process itself cannot exit,
+which is concern 57 in miniature and the most direct demonstration of it
+available.
+
+## 58. A writable file could go missing rather than arrive short — **resolved**
+
+Noted while closing concerns 55 and 56 and left open there deliberately; this is
+it on its own terms.
+
+Concern 55 made a file the task may replace exempt from the per-item cap, and
+the coding agent's guard stayed where it was, reading `truncated_paths`. That
+pairing is sound only while "the coder did not see all of this file" and "there
+is a clipped item in the package" mean the same thing. They do not.
+
+`RepositoryReader` refuses a file larger than `CONTEXT_MAX_FILE_BYTES`, and it
+refuses one with a NUL byte in it, and `_list_paths` never offers a path that
+`is_excluded` or that is not textual. Each of those refusals produces *no item*:
+no content, no truncation marker, no `DroppedItem`. A file the task declared as
+writable and that exists in the checkout could therefore be absent from the
+package entirely, and the guard would see an untruncated package and let the
+attempt run. The coder would then be asked for the complete new contents of a
+file it had never read -- the same failure concern 1 was written about, arrived
+at from the opposite direction and with nothing at all to notice it by.
+
+There is a second path to the same place, and it is the one that shows why the
+fix could not be a longer list of exclusions. `_declared_paths` is built from
+`reader.paths`, which has already dropped the excluded and the non-textual, so
+such a file does not even reach `declared.existing`: it lands in `missing`,
+which is the same classification as a file the task is going to *create*. "There
+is nothing to supply" and "there is something and it never arrived" were the
+same state.
+
+*Why it matters:* the consequence is a silent deletion, not an error. A
+whole-file replacement of a file the model never saw is a valid-looking diff
+that removes everything that was there. Verification may well pass it if the
+deleted part had no test, and the reviewer sees a diff, not an absence.
+
+*Resolved* by recording completeness instead of inferring it.
+
+* `domain.context.RequiredSource` -- one entry per *existing* file the task may
+  replace, saying whether its complete original contents are in the package and,
+  when they are not, why. Carried on `ContextPackage.required_sources` and
+  written to `context-manifest.json`.
+* The verdict is computed from the assembled package: a required path is
+  complete when its item is present and not truncated, and incomplete
+  otherwise -- clipped, dropped, or never a candidate. That phrasing is the
+  point. A context builder acquires new exclusion paths over time, and "is its
+  complete text in here?" keeps answering correctly when it does, where a list
+  of known exclusions would have to be extended each time and would fail
+  silently when it was not.
+* Which paths are *required* is asked of the filesystem rather than of
+  `reader.paths`, through `_required_source_paths`. A writable declaration that
+  resolves to a real file is a required source even when selection would never
+  have offered it, which is what separates it from a file the task will create.
+* `RepositoryReader.exclusions` records why a path that exists could not be
+  read, so the refusal can name the limit that caused it rather than say only
+  that something is missing.
+* The guard, now `_incomplete_writable_sources`, reads that record first and
+  keeps the original `truncated_paths` check behind it. Two sources for one
+  decision is deliberate: if the record is ever wrong or absent, a visibly
+  clipped writable file still refuses.
+
+The invariant the guard now enforces: for every existing file the coder is
+permitted to replace, the complete original contents were supplied, whatever the
+reason they might not have been.
+
+`CONTEXT_MAX_FILE_BYTES` is unchanged at 262144, as are the model, the served
+window, the budget shares and the worker policy. A file too large to read is
+still too large to read; what changed is that the run now stops instead of
+proceeding without it.
+
+The refusal message changed with it. It names each file and the specific reason
+-- the byte cap, the budget, the line counts -- and no longer recommends raising
+`CONTEXT_MAX_ITEM_TOKENS`, which after concern 56 would have done nothing for a
+writable file.
+
+The tests are in `tests/integration/test_coding_agent.py` (an oversized writable
+file refuses the attempt with no model call and no `model_runs` row; an
+oversized file the task only *reads* is still simply omitted and the attempt
+proceeds; an ordinary writable file still proceeds), in
+`tests/integration/test_context_builder.py` (the byte cap and a binary file are
+both recorded incomplete, and a file read whole is recorded complete, while a
+file the task will create is not a required source at all) and in
+`tests/unit/test_context_budget.py` (a required path that never became an item,
+one dropped for the budget, one with no stated reason, and the manifest entry).
+Restoring the truncation-only guard fails the oversized-writable test with the
+coder having been asked for an answer, which is the check that it describes the
+behaviour rather than decorating it.

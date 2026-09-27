@@ -12,12 +12,19 @@ from fastapi.responses import JSONResponse
 
 from ..domain.errors import InvalidStateTransition, LimitExceeded, ManifestError
 from ..providers.errors import ModelProviderError, ProviderNotConfigured
-from ..services.errors import EntityConflict, EntityNotFound, NotInCapturableState
+from ..services.errors import (
+    EntityConflict,
+    EntityNotFound,
+    LockWaitTimeout,
+    NotInCapturableState,
+)
 
 #: Error type -> HTTP status. 422 for a bad manifest: the file is a request
 #: payload the caller can fix, not a server fault. Provider failures are 5xx
 #: because the caller did nothing wrong: the model endpoint is missing (503)
-#: or answered badly (502).
+#: or answered badly (502). A lock wait that timed out is 503 as well: the
+#: request was valid and the contention is usually transient, so a caller may
+#: retry it -- which is also why it is not 409.
 _STATUS_BY_ERROR: tuple[tuple[type[Exception], int], ...] = (
     (EntityNotFound, status.HTTP_404_NOT_FOUND),
     (EntityConflict, status.HTTP_409_CONFLICT),
@@ -25,6 +32,7 @@ _STATUS_BY_ERROR: tuple[tuple[type[Exception], int], ...] = (
     (LimitExceeded, status.HTTP_409_CONFLICT),
     (NotInCapturableState, status.HTTP_409_CONFLICT),
     (ManifestError, status.HTTP_422_UNPROCESSABLE_CONTENT),
+    (LockWaitTimeout, status.HTTP_503_SERVICE_UNAVAILABLE),
     (ProviderNotConfigured, status.HTTP_503_SERVICE_UNAVAILABLE),
     (ModelProviderError, status.HTTP_502_BAD_GATEWAY),
 )

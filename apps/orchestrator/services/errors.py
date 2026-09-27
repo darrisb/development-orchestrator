@@ -31,3 +31,15 @@ class NotInCapturableState(ServiceError):
     ``ValueError`` because a caller -- an HTTP handler in particular -- has to be
     able to recognise it and answer 409 instead of letting it surface as a 500.
     """
+
+
+class LockWaitTimeout(ServiceError):
+    """A statement gave up waiting for a database lock (concern 57).
+
+    Infrastructure contention rather than anything about the request: the rows
+    are held by another transaction that has not ended. Distinct from
+    :class:`EntityConflict`, which is a conflict with a record's content or
+    state and will still be there on a retry -- this one usually will not,
+    which is why it classifies as ``RESOURCE_UNAVAILABLE`` and why a run that
+    meets it can be resumed rather than restarted.
+    """
