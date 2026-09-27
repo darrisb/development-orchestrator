@@ -166,6 +166,8 @@ class TaskRunRow(UUIDPrimaryKey, Base):
     artifact_path: Mapped[str | None] = mapped_column(String(1024))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    active_runtime_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    active_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     task: Mapped[TaskRow] = relationship(back_populates="runs")
     verifications: Mapped[list[VerificationRunRow]] = relationship(

@@ -79,16 +79,27 @@ class WorkflowOutcome(StrEnum):
 # ------------------------------------------------------------------ deadlines
 
 
-def run_deadline(started_at: datetime, limits: TaskLimits) -> datetime:
-    """When the run must stop starting new work (section 23, concern 35).
+def run_deadline(
+    active_started_at: datetime,
+    limits: TaskLimits,
+    *,
+    consumed_runtime_ms: int = 0,
+) -> datetime:
+    """Deadline for this active invocation's remaining cumulative run budget.
 
-    Measured from the run's own ``started_at`` rather than from the moment the
-    workflow was invoked: a run that is resumed after a pause has already spent
-    the time it spent, and restarting the clock would let a task with a
-    30-minute budget occupy a worker all day in 30-minute instalments.
+    ``started_at`` on a task-run is audit identity: it says when the durable row
+    was created.  It is intentionally not accepted here.  Callers supply the
+    current active boundary and the durable amount already consumed, so queue,
+    workspace-preparation, pause and escalation time cannot spend the budget.
     """
-    reference = started_at if started_at.tzinfo else started_at.replace(tzinfo=UTC)
-    return reference + timedelta(minutes=max(1, limits.max_runtime_minutes))
+    reference = (
+        active_started_at
+        if active_started_at.tzinfo
+        else active_started_at.replace(tzinfo=UTC)
+    )
+    configured_ms = max(1, limits.max_runtime_minutes) * 60_000
+    remaining_ms = max(0, configured_ms - max(0, consumed_runtime_ms))
+    return reference + timedelta(milliseconds=remaining_ms)
 
 
 def deadline_exceeded(deadline: datetime, *, now: datetime | None = None) -> bool:

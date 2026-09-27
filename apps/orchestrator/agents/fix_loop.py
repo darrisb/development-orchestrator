@@ -93,6 +93,7 @@ from ..repositories import (
     TaskRunRepository,
 )
 from ..services import artifact_store
+from ..services.runtime import RuntimeBudget, configured_runtime_ms
 from ..services.verification import verify_candidate
 from ..services.workspace import TaskWorkspace, load_run_context, rollback_workspace
 from .coding_agent import CodingAttempt, run_coding_attempt
@@ -241,6 +242,9 @@ class FixLoopResult:
     cycles_used: int = 0
     #: The state this run was resumed from, when it was resumed.
     recovery: RecoveredLoopState | None = None
+    configured_runtime_ms: int | None = None
+    consumed_runtime_ms: int | None = None
+    remaining_runtime_ms: int | None = None
 
     @property
     def approved(self) -> bool:
@@ -267,6 +271,11 @@ class FixLoopResult:
             "failure_reason": self.failure_reason.value if self.failure_reason else None,
             "attempts_used": self.attempts_used,
             "cycles_used": self.cycles_used,
+            "runtime": {
+                "configured_ms": self.configured_runtime_ms,
+                "consumed_ms": self.consumed_runtime_ms,
+                "remaining_ms": self.remaining_runtime_ms,
+            },
             "rolled_back": self.rolled_back,
             "escalation_id": str(self.escalation.id) if self.escalation else None,
             "recovery": self.recovery.describe() if self.recovery else None,
@@ -286,6 +295,8 @@ async def run_fix_loop(
     max_attempts: int | None = None,
     initial_feedback: str | None = None,
     deadline: datetime | None = None,
+    worker_deadline: datetime | None = None,
+    runtime_budget: RuntimeBudget | None = None,
     checkpoint_turn: Callable[[], None] | None = None,
 ) -> FixLoopResult:
     """Code, verify and review the task in ``workspace`` until it settles.
@@ -358,14 +369,16 @@ async def run_fix_loop(
     # reviewer is resumed inside the same cycle instead of being charged for
     # a review that never happened.
     cycles_used = recovered.reviews_completed
-    started_at = run.started_at or datetime.now(UTC)
-    if started_at.tzinfo is None:
-        started_at = started_at.replace(tzinfo=UTC)
-    effective_deadline = min(
-        deadline or run_deadline(started_at, task.limits),
-        run_deadline(started_at, task.limits),
-        started_at + timedelta(seconds=config.worker_timeout_seconds),
+    invocation_started_at = datetime.now(UTC)
+    runtime_deadline = deadline or run_deadline(
+        invocation_started_at,
+        task.limits,
+        consumed_runtime_ms=run.active_runtime_ms,
     )
+    invocation_worker_deadline = worker_deadline or (
+        invocation_started_at + timedelta(seconds=config.worker_timeout_seconds)
+    )
+    effective_deadline = min(runtime_deadline, invocation_worker_deadline)
 
     def settle(**kwargs: object) -> FixLoopResult:
         """Settle the loop with the durable counts, not this process's view."""
@@ -384,6 +397,7 @@ async def run_fix_loop(
             attempts_used=attempts_used,
             cycles_used=cycles_used,
             recovered=recovered,
+            runtime_budget=runtime_budget,
         )
 
     if first > ceiling:
@@ -401,9 +415,14 @@ async def run_fix_loop(
 
     for number in range(first, ceiling + 1):
         if deadline_exceeded(effective_deadline):
+            runtime_exhausted = effective_deadline == runtime_deadline
             return settle(
                 outcome=LoopOutcome.ESCALATED,
-                reason=FailureReason.RETRY_EXHAUSTED,
+                reason=(
+                    FailureReason.RUNTIME_EXHAUSTED
+                    if runtime_exhausted
+                    else FailureReason.WORKER_FAILURE
+                ),
             )
         # The attempt number is advanced before the attempt, not after it:
         # everything the attempt writes is filed under it, so a run that dies
@@ -790,6 +809,7 @@ def _settle(
     attempts_used: int | None = None,
     cycles_used: int | None = None,
     recovered: RecoveredLoopState | None = None,
+    runtime_budget: RuntimeBudget | None = None,
 ) -> FixLoopResult:
     """Close the loop: the worktree, the run row, the task, the artifact.
 
@@ -833,6 +853,20 @@ def _settle(
         if cycles_used is not None
         else sum(1 for iteration in iterations if iteration.review is not None)
     )
+    configured_ms = (
+        runtime_budget.configured_ms
+        if runtime_budget is not None
+        else configured_runtime_ms(task.limits)
+    )
+    if reason is FailureReason.RUNTIME_EXHAUSTED:
+        consumed_ms = configured_ms
+        remaining_ms = 0
+    elif runtime_budget is not None:
+        consumed_ms = runtime_budget.consumed_ms
+        remaining_ms = runtime_budget.remaining_ms
+    else:
+        consumed_ms = max(0, run.active_runtime_ms)
+        remaining_ms = max(0, configured_ms - consumed_ms)
     if outcome is LoopOutcome.ESCALATED and escalation is None:
         escalation = _escalate(
             session, run, task, project, iterations,
@@ -841,6 +875,10 @@ def _settle(
             config=config,
             attempts_used=attempts,
             recovered=recovered,
+            cycles_used=cycles,
+            configured_runtime_ms=configured_ms,
+            consumed_runtime_ms=consumed_ms,
+            remaining_runtime_ms=remaining_ms,
         )
     _transition(session, task, status)
 
@@ -856,6 +894,9 @@ def _settle(
         attempts_used=attempts,
         cycles_used=cycles,
         recovery=recovered,
+        configured_runtime_ms=configured_ms,
+        consumed_runtime_ms=consumed_ms,
+        remaining_runtime_ms=remaining_ms,
     )
     stored = artifact_store.write_json(
         session, run.id, FIX_LOOP_ARTIFACT, result.describe(),
@@ -980,6 +1021,10 @@ def _escalate(
     config: Settings,
     attempts_used: int | None = None,
     recovered: RecoveredLoopState | None = None,
+    cycles_used: int = 0,
+    configured_runtime_ms: int | None = None,
+    consumed_runtime_ms: int | None = None,
+    remaining_runtime_ms: int | None = None,
 ) -> HumanEscalation:
     """Write the escalation for a run no reviewer escalated (section 24).
 
@@ -999,14 +1044,25 @@ def _escalate(
     )
     history.extend(iteration.summary() for iteration in iterations)
     options = run_escalation_options(reason)
+    if reason is FailureReason.RETRY_EXHAUSTED:
+        reason_text = (
+            f"{attempts} of the task's {task.limits.max_attempts} permitted "
+            "attempts were made and none produced a change a reviewer accepted."
+        )
+    elif reason is FailureReason.RUNTIME_EXHAUSTED:
+        reason_text = (
+            "The run consumed its active-execution runtime budget: "
+            f"configured {_duration(configured_runtime_ms)}, "
+            f"consumed {_duration(consumed_runtime_ms)}, "
+            f"remaining {_duration(remaining_runtime_ms)}. "
+            f"It stopped because runtime, not retries, was exhausted; "
+            f"{attempts} coding attempt(s) started and {cycles_used} review cycle(s) completed."
+        )
+    else:
+        reason_text = "The run reached a decision the orchestrator may not take."
     summary = render_run_escalation(
         external_task_id=task.external_task_id,
-        reason=(
-            f"{attempts} of the task's {task.limits.max_attempts} permitted "
-            f"attempts were made and none produced a change a reviewer accepted."
-            if reason is FailureReason.RETRY_EXHAUSTED
-            else "The run reached a decision the orchestrator may not take."
-        ),
+        reason=reason_text,
         requirement=task.instructions or task.title,
         blocker=_blocker(last),
         attempts=history,
@@ -1037,6 +1093,14 @@ def _escalate(
             "attempts_used": attempts,
             "blocker": _blocker(last),
             "recovered_attempts": len(recovered.turns) if recovered else 0,
+            "configured_runtime_ms": configured_runtime_ms,
+            "consumed_active_runtime_ms": consumed_runtime_ms,
+            "remaining_runtime_ms": remaining_runtime_ms,
+            "review_cycles_used": cycles_used,
+            "budget_exhausted": (
+                "runtime" if reason is FailureReason.RUNTIME_EXHAUSTED else "retry"
+                if reason is FailureReason.RETRY_EXHAUSTED else None
+            ),
         },
     )
     logger.warning(
@@ -1049,6 +1113,12 @@ def _escalate(
         recovered_attempts=len(recovered.turns) if recovered else 0,
     )
     return escalation
+
+
+def _duration(milliseconds: int | None) -> str:
+    """Compact, exact runtime evidence for an operator-facing escalation."""
+    value = max(0, milliseconds or 0)
+    return f"{value} ms ({value / 60_000:.3f} min)"
 
 
 def _blocker(iteration: FixIteration | None) -> str:

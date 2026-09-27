@@ -8,11 +8,13 @@ from apps.orchestrator.domain.models import TaskLimits
 from apps.orchestrator.domain.workflow import deadline_exceeded, effect_of, run_deadline
 
 
-def test_runtime_deadline_uses_the_persisted_start_and_accepts_sqlite_datetimes():
+def test_runtime_deadline_uses_active_start_remaining_budget_and_accepts_sqlite_datetimes():
     started = datetime(2026, 9, 26, 12, 0)  # SQLite commonly restores this naive.
-    deadline = run_deadline(started, TaskLimits(max_runtime_minutes=7))
+    deadline = run_deadline(
+        started, TaskLimits(max_runtime_minutes=7), consumed_runtime_ms=120_000
+    )
 
-    assert deadline == datetime(2026, 9, 26, 12, 7, tzinfo=UTC)
+    assert deadline == datetime(2026, 9, 26, 12, 5, tzinfo=UTC)
     assert not deadline_exceeded(deadline, now=deadline - timedelta(seconds=1))
     assert deadline_exceeded(deadline, now=deadline)
 

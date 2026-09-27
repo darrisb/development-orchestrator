@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from apps.orchestrator.domain.git import INTEGRATION_WORKTREE_DIR
 from apps.orchestrator.domain.models import Project, Task
 from apps.orchestrator.domain.verification import VerificationProfile
 from apps.orchestrator.repositories import ProjectRepository, TaskRepository, TaskRunRepository
+from apps.orchestrator.services.runs import create_run
 from apps.orchestrator.workflow import WorkflowRunner
 from tests.conftest import run_git
 from tests.integration.test_fix_loop import WORKING, ScriptedModel, _code, _review, reviewer
@@ -75,7 +77,15 @@ async def test_approved_candidate_is_committed_completed_and_checkpointed(tmp_pa
         reviewer=reviewer(_review(taskId="TS-001")),
         settings=settings,
     )
-    state = await runner.run_task(task.id)
+    # Reproduce TS-106's essential shape without sleeping: the durable run row
+    # can be much older than its first active execution and still gets the full
+    # active-runtime budget.
+    with factory.begin() as session:
+        run = create_run(session, task.id)
+        TaskRunRepository(session).update_fields(
+            run.id, started_at=datetime.now(UTC) - timedelta(hours=2)
+        )
+    state = await runner.run(run.id)
 
     assert state["outcome"] == "COMPLETED"
     assert state["commit_sha"]
@@ -86,6 +96,8 @@ async def test_approved_candidate_is_committed_completed_and_checkpointed(tmp_pa
         checkpoints = session.scalar(select(func.count()).select_from(WorkflowCheckpointRow))
     assert stored is not None and stored.status is TaskStatus.COMPLETE
     assert len(runs) == 1 and runs[0].candidate_commit == state["commit_sha"]
+    assert runs[0].active_runtime_ms > 0
+    assert runs[0].active_started_at is None
     assert checkpoints and checkpoints > 1
     # The task's own worktree is gone (concern 34). What remains under
     # WORKTREE_ROOT is the project's integration worktree (concern 51), which

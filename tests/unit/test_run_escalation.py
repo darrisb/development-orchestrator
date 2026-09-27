@@ -69,6 +69,7 @@ def test_a_rolled_back_candidate_says_so():
 def test_the_options_are_choices_not_a_question():
     for reason in (
         FailureReason.RETRY_EXHAUSTED,
+        FailureReason.RUNTIME_EXHAUSTED,
         FailureReason.SCOPE_VIOLATION,
         FailureReason.HUMAN_DECISION_REQUIRED,
     ):

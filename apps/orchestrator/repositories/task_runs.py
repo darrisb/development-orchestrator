@@ -34,6 +34,8 @@ class TaskRunRepository(Repository[TaskRunRow, TaskRun]):
             artifact_path=row.artifact_path,
             started_at=row.started_at,
             completed_at=row.completed_at,
+            active_runtime_ms=row.active_runtime_ms,
+            active_started_at=row.active_started_at,
         )
 
     def next_run_number(self, task_id: UUID) -> int:
@@ -62,6 +64,8 @@ class TaskRunRepository(Repository[TaskRunRow, TaskRun]):
             artifact_path=run.artifact_path,
             started_at=run.started_at,
             completed_at=run.completed_at,
+            active_runtime_ms=run.active_runtime_ms,
+            active_started_at=run.active_started_at,
         )
         self.session.add(row)
         self.session.flush()

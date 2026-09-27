@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -344,6 +345,60 @@ def _events(session: Session, run: TaskRun) -> list[RunEventType]:
 
 def _artifact(settings: Settings, path: str) -> str:
     return (settings.artifact_root / path).read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_runtime_exhaustion_is_not_retry_exhaustion_and_reports_evidence(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    run: TaskRun,
+    loop_settings: Settings,
+):
+    coder = ScriptedModel()
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=coder,
+        reviewer=reviewer(),
+        settings=loop_settings,
+        deadline=datetime.now(UTC) - timedelta(seconds=1),
+    )
+
+    assert result.failure_reason is FailureReason.RUNTIME_EXHAUSTED
+    assert result.attempts_used == 0
+    assert result.cycles_used == 0
+    assert result.iterations == ()
+    assert coder.requests == []
+    assert result.remaining_runtime_ms == 0
+    assert result.escalation is not None
+    assert "runtime, not retries, was exhausted" in result.escalation.summary
+    assert "0 coding attempt(s)" in result.escalation.summary
+    assert "0 of the task's" not in result.escalation.summary
+
+
+@pytest.mark.asyncio
+async def test_worker_invocation_timeout_is_not_model_or_run_runtime_exhaustion(
+    session: Session,
+    workspace: TaskWorkspace,
+    run: TaskRun,
+    loop_settings: Settings,
+):
+    coder = ScriptedModel()
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=coder,
+        reviewer=reviewer(),
+        settings=loop_settings,
+        deadline=datetime.now(UTC) + timedelta(minutes=1),
+        worker_deadline=datetime.now(UTC) - timedelta(seconds=1),
+    )
+
+    assert result.failure_reason is FailureReason.WORKER_FAILURE
+    assert result.failure_reason is not FailureReason.MODEL_TIMEOUT
+    assert result.failure_reason is not FailureReason.RUNTIME_EXHAUSTED
+    assert coder.requests == []
 
 
 # --- the exit condition, clause one ------------------------------------------

@@ -223,6 +223,24 @@ def run_escalation_options(reason: FailureReason) -> tuple[EscalationOption, ...
     that exhausted its attempts never produced a candidate a reviewer would
     take, and one that broke its scope has had the candidate rolled back.
     """
+    if reason is FailureReason.RUNTIME_EXHAUSTED:
+        return (
+            EscalationOption(
+                "A",
+                EscalationIntent.RETRY_TASK,
+                "Start a new run with a fresh runtime budget; the exhausted run remains unchanged.",
+            ),
+            EscalationOption(
+                "B",
+                EscalationIntent.COMPLETED_BY_HAND,
+                "Complete the remaining work by hand and mark the task complete.",
+            ),
+            EscalationOption(
+                "C",
+                EscalationIntent.ABANDON_TASK,
+                "Abandon the task and preserve the exhausted run's evidence.",
+            ),
+        )
     if reason is FailureReason.RETRY_EXHAUSTED:
         return (
             EscalationOption(

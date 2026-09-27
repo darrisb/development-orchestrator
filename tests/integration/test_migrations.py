@@ -17,16 +17,14 @@ from apps.orchestrator.db.session import create_db_engine
 from apps.orchestrator.domain.enums import (
     Complexity,
     ModelRole,
-    RunStatus,
     TaskStatus,
     WorkerProfile,
 )
-from apps.orchestrator.domain.models import Model, Project, Task, TaskLimits, TaskRun
+from apps.orchestrator.domain.models import Model, Project, Task, TaskLimits
 from apps.orchestrator.repositories import (
     ModelRepository,
     ProjectRepository,
     TaskRepository,
-    TaskRunRepository,
 )
 
 pytestmark = pytest.mark.integration
@@ -83,6 +81,18 @@ def test_upgrade_head_matches_the_mapped_task_columns(alembic_config):
         engine.dispose()
 
 
+def test_upgrade_head_matches_the_mapped_task_run_columns(alembic_config):
+    config, url = alembic_config
+    command.upgrade(config, "head")
+    engine = create_db_engine(url)
+    try:
+        columns = {column["name"] for column in inspect(engine).get_columns("task_runs")}
+        assert columns == set(Base.metadata.tables["task_runs"].columns.keys())
+        assert {"active_runtime_ms", "active_started_at"} <= columns
+    finally:
+        engine.dispose()
+
+
 def test_upgrade_head_matches_the_mapped_project_columns(alembic_config):
     """The verification profile (section 18) is a column, not only a mapping."""
     config, url = alembic_config
@@ -131,7 +141,9 @@ def test_a_recorded_call_survives_the_audit_columns_revision(alembic_config):
     rather than by recreating an empty table beside them.
     """
     config, url = alembic_config
-    previous = ScriptDirectory.from_config(config).get_revision("head").down_revision
+    previous = ScriptDirectory.from_config(config).get_revision(
+        "b7c41d90e2a5"
+    ).down_revision
     command.upgrade(config, previous)
     engine = create_db_engine(url)
     try:
@@ -155,8 +167,13 @@ def test_a_recorded_call_survives_the_audit_columns_revision(alembic_config):
                          limits=TaskLimits(max_files_changed=3, max_diff_lines=200))
                 )
                 tasks.transition(task.id, TaskStatus.READY)
-                TaskRunRepository(session).add(
-                    TaskRun(task_id=task.id, run_number=1, status=RunStatus.RUNNING)
+                session.execute(
+                    text(
+                        "INSERT INTO task_runs "
+                        "(id, task_id, run_number, attempt_number, review_cycle, status) "
+                        "VALUES (:id, :task_id, 1, 1, 0, 'RUNNING')"
+                    ),
+                    {"id": uuid.uuid4().hex, "task_id": task.id.hex},
                 )
                 ModelRepository(session).add(
                     Model(provider="openai-compatible", model_name="coder-test",
@@ -177,6 +194,40 @@ def test_a_recorded_call_survives_the_audit_columns_revision(alembic_config):
                      " FROM model_runs")
             ).one()
         assert row == ("CODE", "SUCCEEDED", 12, None, None, None), row
+    finally:
+        engine.dispose()
+
+
+def test_populated_task_runs_gain_conservative_runtime_accounting(alembic_config):
+    """Historical wall time is not fabricated as active execution time."""
+    config, url = alembic_config
+    command.upgrade(config, "b7c41d90e2a5")
+    engine = create_db_engine(url)
+    try:
+        with engine.connect() as connection:
+            factory = sessionmaker(bind=connection, expire_on_commit=False)
+            with factory.begin() as session:
+                project = ProjectRepository(session).add(
+                    Project(name="runtime", repository_path="/tmp/runtime")
+                )
+                task = TaskRepository(session).add(
+                    Task(project_id=project.id, external_task_id="T-1", title="runtime")
+                )
+                session.execute(
+                    text(
+                        "INSERT INTO task_runs "
+                        "(id, task_id, run_number, attempt_number, review_cycle, "
+                        "status, started_at) "
+                        "VALUES (:id, :task_id, 1, 1, 0, 'RUNNING', CURRENT_TIMESTAMP)"
+                    ),
+                    {"id": uuid.uuid4().hex, "task_id": task.id.hex},
+                )
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            row = connection.execute(
+                text("SELECT active_runtime_ms, active_started_at FROM task_runs")
+            ).one()
+        assert row == (0, None)
     finally:
         engine.dispose()
 

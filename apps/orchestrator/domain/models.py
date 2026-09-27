@@ -150,6 +150,8 @@ class TaskRun:
     id: UUID = field(default_factory=_new_id)
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    active_runtime_ms: int = 0
+    active_started_at: datetime | None = None
 
 
 @dataclass(slots=True)

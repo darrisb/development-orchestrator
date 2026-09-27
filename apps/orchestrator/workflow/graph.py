@@ -18,7 +18,7 @@ from ..agents.fix_loop import LoopOutcome, run_fix_loop
 from ..config.settings import Settings, get_settings
 from ..domain.enums import EscalationStatus, ModelRole, RunStatus, TaskStatus
 from ..domain.escalation import EscalationIntent
-from ..domain.workflow import WorkflowOutcome, WorkflowPhase, run_deadline
+from ..domain.workflow import WorkflowOutcome, WorkflowPhase
 from ..providers import ModelProvider, build_provider, build_review_provider
 from ..providers.review import ReviewProvider
 from ..repositories import (
@@ -31,6 +31,7 @@ from ..services.delivery import deliver_candidate
 from ..services.errors import EntityConflict, EntityNotFound
 from ..services.model_providers import resolve_for_role
 from ..services.runs import create_run
+from ..services.runtime import begin_active_runtime, end_active_runtime
 from ..services.scheduler import Selection, select_next_task
 from ..services.workspace import attach_workspace, load_run_context, prepare_workspace
 from ..services.worktrees import release_for_run
@@ -240,11 +241,9 @@ class WorkflowRunner:
             pause = PauseRequestRepository(session).in_force_for_task(
                 project.id, task.id
             )
-            deadline = run_deadline(run.started_at or datetime.now().astimezone(), task.limits)
             return {
                 "phase": WorkflowPhase.LOADING.value,
                 "task_status": task.status.value,
-                "deadline": deadline.isoformat(),
                 "pause_request_id": str(pause.id) if pause else "",
             }
 
@@ -308,6 +307,15 @@ class WorkflowRunner:
             if task.status is TaskStatus.FAILED:
                 return {"loop_outcome": LoopOutcome.FAILED.value}
             workspace = attach_workspace(session, run.id, settings=self.settings)
+            budget = begin_active_runtime(
+                session,
+                run.id,
+                task.limits,
+                worker_timeout_seconds=self.settings.worker_timeout_seconds,
+            )
+            # This boundary must survive a provider failure, transaction
+            # rollback, or process death.  All loop work happens after it.
+            session.commit()
             result = await run_fix_loop(
                 session,
                 workspace,
@@ -315,8 +323,16 @@ class WorkflowRunner:
                 reviewer=self.reviewer,
                 settings=self.settings,
                 initial_feedback=self._human_feedback(session, task.id, run.started_at),
-                deadline=datetime.fromisoformat(state["deadline"]),
+                deadline=budget.runtime_deadline,
+                worker_deadline=budget.worker_deadline,
+                runtime_budget=budget,
                 checkpoint_turn=session.commit,
+            )
+            end_active_runtime(
+                session,
+                run.id,
+                task.limits,
+                worker_timeout_seconds=self.settings.worker_timeout_seconds,
             )
             session.commit()
             return {
@@ -327,6 +343,17 @@ class WorkflowRunner:
             }
         except Exception:
             session.rollback()
+            try:
+                run, task, _ = load_run_context(session, UUID(state["run_id"]))
+                end_active_runtime(
+                    session,
+                    run.id,
+                    task.limits,
+                    worker_timeout_seconds=self.settings.worker_timeout_seconds,
+                )
+                session.commit()
+            except Exception:
+                session.rollback()
             raise
         finally:
             session.close()

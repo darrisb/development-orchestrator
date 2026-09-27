@@ -26,6 +26,8 @@ class TaskRunResponse(BaseModel):
     failure_reason: str | None
     started_at: datetime | None
     completed_at: datetime | None
+    active_runtime_ms: int
+    active_started_at: datetime | None
 
     @classmethod
     def from_domain(cls, run: TaskRun) -> TaskRunResponse:
@@ -46,6 +48,8 @@ class TaskRunResponse(BaseModel):
             failure_reason=run.failure_reason,
             started_at=run.started_at,
             completed_at=run.completed_at,
+            active_runtime_ms=run.active_runtime_ms,
+            active_started_at=run.active_started_at,
         )
 
 

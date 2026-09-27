@@ -1890,3 +1890,93 @@ assumed task-uniqueness.
 Restoring task-scoped naming fails seven tests, the retry test among them, with
 `BranchAlreadyExists: Branch agent/TS-001-fix-the-answer already exists` at
 `git_service.py:352` — the same error, at the same line, as the TS-106 incident.
+
+## 60. Run lifetime was charged as active runtime and deadline expiry was called retry exhaustion — **resolved**
+
+Found while stopping the synthetic TraceStack campaign after TS-106 run 2.
+The live record is intentionally unchanged: `RUN-20260927-000017`, escalation
+`85411efc`, task state, timestamps, Git refs and integration state remain the
+historical evidence, and TS-106 was not retried.
+
+**Exact incident.** Run 2 was created at `16:24:01.855662`; its workspace was
+successfully created at `17:29:50.033053`. With
+`max_runtime_minutes = 30`, the implementation derived `16:54:01.855662` from
+row creation. Concern 59's earlier workspace-preparation failure left the run
+durable while its repair was made, but no coding work happened in that wait.
+When the fix loop was finally entered, its deadline was already 35m48s in the
+past. It returned before attempt 1 with `attempts_used = 0`, `cycles_used = 0`,
+`iterations = []`, `recovery.next_attempt = 1` and `model_runs = 0`. The only
+events were `TASK_SELECTED 16:24:01.860218`, `WORKSPACE_CREATED
+17:29:50.033053`, `HUMAN_REVIEW_REQUIRED 17:29:50.090897` and
+`OUTCOME_RECORDED 17:29:50.103286`; there was no `CODING_STARTED` or
+`FIX_STARTED`. `agent/integration` remained `a2e40f2`.
+
+**Root cause.** `task_runs.started_at` is row/audit creation time, but
+`run_deadline(started_at, limits)` treated it as accumulated execution time.
+The graph computed that deadline before workspace preparation and the fix loop
+again intersected it with `started_at + WORKER_TIMEOUT_SECONDS`. This did
+prevent a restart from granting a fresh budget, but only by charging every
+kind of wall-clock waiting. The same deadline branch then settled with
+`RETRY_EXHAUSTED`, even when zero of three attempts had started.
+
+**Runtime semantics.** A task run now persists `active_runtime_ms` plus nullable
+`active_started_at`. Row creation, scheduler queueing, workspace preparation
+(including failure and later recovery), project/operator pause and escalation
+wait are inactive. The workflow opens an active interval immediately before
+the fix loop and commits that boundary before model work. Coding, provider
+calls, verification, review/fix cycles and waits while that invocation owns its
+worker are active. A clean success, escalation, failure or recoverable
+exception closes the interval into the cumulative counter. Resume of the same
+run computes its deadline from its remaining counter; `RETRY_TASK` creates a
+new row with zero consumed runtime and therefore a fresh budget.
+
+**Crash/restart semantics.** An open `active_started_at` survives transaction
+rollback and process reconstruction. Recovery charges the abandoned invocation
+from that boundary, capped at its per-invocation worker safety deadline, before
+opening a new interval. Work done before a crash therefore cannot be reset by
+restarting, repeated restart/resume monotonically spends the one run budget,
+and an hour of inactivity after a dead process is not charged as an unbounded
+hour. The cap is deliberately conservative: without a high-frequency durable
+heartbeat, exact process-death time does not exist in the database. Charging
+the invocation's worker lease preserves the anti-reset invariant without a
+timer constantly writing rows.
+
+The timeout scopes are now explicit. The task-run runtime budget is cumulative;
+the worker timeout is recreated per invocation and bounds that invocation and
+an abandoned crash interval; model/provider timeout remains `MODEL_TIMEOUT`;
+verification command timeout remains local to its command; database lock and
+statement timeouts remain concurrency controls. A worker deadline does not
+masquerade as run-runtime or provider timeout.
+
+**Classification and operator behavior.** Deadline expiry caused by the
+cumulative run budget is `RUNTIME_EXHAUSTED`, with its own escalation policy.
+The fix-loop artifact, event and escalation carry configured, consumed and
+remaining runtime, actual coding attempts, actual completed review cycles, and
+state explicitly that runtime—not retry budget—stopped the run. A legitimate
+zero-attempt expiry says zero attempts without claiming “0 of 3 attempts were
+made and none produced an accepted change.” Genuine attempt/review exhaustion
+still uses `RETRY_EXHAUSTED`; provider call timeout still uses `MODEL_TIMEOUT`.
+The runtime escalation does not presume the task should be reworded or split.
+Its `RETRY_TASK` option says exactly that it creates a new run with a fresh
+budget and leaves the exhausted run unchanged.
+
+**Migration and compatibility.** Revision `e2d6b79a4f10` adds the two runtime
+columns reversibly. Populated historical rows receive zero and NULL. That is a
+conservative compatibility statement, not fabricated precision: old wall-clock
+lifetime cannot be separated into active and inactive time after the fact.
+Historical timestamps, results and rows—including the live TS-106 incident—are
+not rewritten.
+
+**Regression coverage.** `test_runtime_accounting.py` uses fixed datetimes to
+cover a first execution delayed beyond the configured budget, workspace failure
+and inactive pause, active accumulation, same-run remainder, crash recovery,
+repeated restart exhaustion, fresh budget on a new retry run, and per-invocation
+worker timeout. Fix-loop tests prove runtime-specific classification and
+evidence (including zero attempts and no model call), worker-timeout separation,
+genuine retry exhaustion, and provider `MODEL_TIMEOUT`. Migration tests cover
+from-scratch upgrade, populated upgrade, full downgrade and mapped columns.
+The existing Concern 52 crash/resume and Concern 59 retry/resume/workspace tests
+remain the process/reconstruction and identity regressions. Reintroducing a
+`started_at`-anchored deadline fails the delayed-first-execution test;
+reintroducing `RETRY_EXHAUSTED` on deadline expiry fails the classification and
+reporting test.

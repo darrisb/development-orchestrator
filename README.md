@@ -1026,8 +1026,20 @@ The limits that bound a run -- attempts, review cycles, runtime, files changed,
 and diff lines -- are **not** here. They come from each task in
 `build.tasks.yaml`, because they are properties of a task and not of an
 installation. `max_runtime_minutes` is checked before every loop turn; an
-already-running command is allowed to settle safely. `WORKER_TIMEOUT_SECONDS`
-also caps the shared verification worker across all of its commands.
+already-running command is allowed to settle safely. It is a cumulative
+**active-execution** budget for one durable run: coding, provider calls,
+verification and review consume it; queue time, workspace preparation, pauses
+and escalation wait do not. Resuming the same run receives only its remaining
+budget, while `RETRY_TASK` creates a new run with a fresh budget.
+
+The timeout layers are separate. `WORKER_TIMEOUT_SECONDS` is a per-invocation
+safety lease and caps an abandoned active interval after a crash;
+`MODEL_TIMEOUT_SECONDS` bounds one provider call; verification command timeouts
+bound their individual processes; and database lock/statement timeouts remain
+database concurrency controls. None of those replenishes or substitutes for
+the cumulative task-run runtime budget. Runtime-budget exhaustion is reported
+as `RUNTIME_EXHAUSTED`; `RETRY_EXHAUSTED` remains reserved for attempt/review
+limits, and `MODEL_TIMEOUT` remains a provider-call failure.
 
 ## Tests
 

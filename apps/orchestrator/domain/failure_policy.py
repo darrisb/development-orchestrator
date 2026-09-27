@@ -27,6 +27,7 @@ FAILURE_POLICY: dict[FailureReason, FailureAction] = {
     FailureReason.GIT_CONFLICT: FailureAction.ROLLBACK,
     # A human owns the decision.
     FailureReason.RETRY_EXHAUSTED: FailureAction.ESCALATE,
+    FailureReason.RUNTIME_EXHAUSTED: FailureAction.ESCALATE,
     FailureReason.HUMAN_DECISION_REQUIRED: FailureAction.ESCALATE,
     # Nothing automatic can resolve a blocked integration: the candidate is
     # already accepted, so retrying the task would discard reviewed work, and
