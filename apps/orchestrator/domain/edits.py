@@ -48,6 +48,17 @@ MAX_EDIT_BYTES = 8_000
 #: way in and rewritten in full on the way out: see concern 1.
 EDIT_SIZE_HEADROOM = 1.25
 
+#: Absolute growth allowance for a complete writable file (concern 62). A
+#: proportional-only allowance left medium-sized files with too little room for
+#: legitimate additions: an 8110-byte source file got only ~10137 bytes of
+#: allowance, but real model replacements were 10454-10593 bytes (~29-31%
+#: growth). The absolute term gives every complete writable file a fixed amount
+#: of growth room on top of the proportional headroom, so a small file that
+#: adds a few functions and a large file that adds a few functions both have
+#: a realistic chance of fitting. Configurable via
+#: ``CONTEXT_ABSOLUTE_GROWTH_ALLOWANCE_BYTES``.
+ABSOLUTE_GROWTH_ALLOWANCE = 2500
+
 
 def max_edit_bytes_for_context(max_item_tokens: int) -> int:
     """The output ceiling implied by an input ceiling of ``max_item_tokens``.
@@ -60,15 +71,28 @@ def max_edit_bytes_for_context(max_item_tokens: int) -> int:
 
 
 def per_path_edit_allowance(
-    source_bytes: int, *, outer_ceiling: int | None = None
+    source_bytes: int,
+    *,
+    outer_ceiling: int | None = None,
+    absolute_growth_allowance: int = ABSOLUTE_GROWTH_ALLOWANCE,
 ) -> int:
     """The output ceiling for a file whose complete source was supplied.
 
-    A bounded proportional allowance: the file the coder saw, times the
-    headroom factor, optionally capped by an outer ceiling. The floor is
-    ``MAX_EDIT_BYTES`` so a tiny file still gets the default allowance.
+    A bounded allowance with three components (concern 62):
+
+    - ``MAX_EDIT_BYTES`` floor, so a tiny file still gets the default allowance.
+    - ``source_bytes + absolute_growth_allowance``, so a medium file has room
+      for legitimate additions beyond proportional growth.
+    - ``int(source_bytes * EDIT_SIZE_HEADROOM)``, so a large file scales with
+      its size.
+
+    The largest of these three, optionally capped by an outer ceiling.
     """
-    allowance = max(MAX_EDIT_BYTES, int(source_bytes * EDIT_SIZE_HEADROOM))
+    allowance = max(
+        MAX_EDIT_BYTES,
+        source_bytes + absolute_growth_allowance,
+        int(source_bytes * EDIT_SIZE_HEADROOM),
+    )
     if outer_ceiling is not None:
         return min(allowance, outer_ceiling)
     return allowance

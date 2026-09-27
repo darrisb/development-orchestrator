@@ -134,6 +134,10 @@ class Settings(BaseSettings):
     #: A file larger than this is never read into a prompt at all. It exists
     #: so a stray minified bundle cannot be clipped to 2000 tokens of noise.
     context_max_file_bytes: int = Field(default=262_144, ge=1)
+    #: Concern 62: absolute growth allowance for a complete writable file.
+    #: Added to the source size and the proportional headroom to give medium
+    #: files room for legitimate additions beyond proportional growth.
+    context_absolute_growth_allowance_bytes: int = Field(default=2500, ge=0)
     context_max_decisions: int = Field(default=5, ge=0)
     context_max_lessons: int = Field(default=5, ge=0)
     context_recent_commits: int = Field(default=5, ge=0)

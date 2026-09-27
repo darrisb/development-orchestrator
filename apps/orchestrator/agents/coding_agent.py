@@ -277,9 +277,20 @@ async def run_coding_attempt(
         },
     )
 
+    # Concern 62: compute the per-path output allowances before the model call
+    # so they can be communicated in the prompt. The same allowances are used
+    # for enforcement after the model responds.
+    path_output_limits = _complete_writable_allowances(
+        built,
+        outer_ceiling=config.context_max_file_bytes,
+        absolute_growth_allowance=config.context_absolute_growth_allowance_bytes,
+    )
+
     request = ModelRequest(
         system_instructions=CODER_SYSTEM_PROMPT,
-        task_instructions=render_coding_instructions(task, plan),
+        task_instructions=render_coding_instructions(
+            task, plan, path_output_limits=path_output_limits
+        ),
         context=built.text,
         review_feedback=review_feedback,
         schema=StructuredSchema(name="code_edits", schema=EDIT_SCHEMA),
@@ -307,10 +318,11 @@ async def run_coding_attempt(
             max_edit_bytes=max_edit_bytes_for_context(config.context_max_item_tokens),
             # Concern 61: a complete writable file gets an output allowance
             # derived from the source the coder actually saw, not from the
-            # per-item input ceiling.
-            path_max_bytes=_complete_writable_allowances(
-                built, outer_ceiling=config.context_max_file_bytes
-            ),
+            # per-item input ceiling. Concern 62: the allowance includes an
+            # absolute growth term so medium files have room for legitimate
+            # additions beyond proportional growth. The same allowances were
+            # communicated in the prompt before the model call.
+            path_max_bytes=path_output_limits,
         )
     except MalformedChangeSet as error:
         # The endpoint answered and the JSON parsed; what came back was not a
@@ -545,15 +557,20 @@ def _refused_plan_attempt(
 
 
 def _complete_writable_allowances(
-    built: ContextBuildResult, *, outer_ceiling: int
+    built: ContextBuildResult,
+    *,
+    outer_ceiling: int,
+    absolute_growth_allowance: int,
 ) -> dict[str, int]:
-    """Per-path output ceilings for complete writable files (concern 61).
+    """Per-path output ceilings for complete writable files (concerns 61, 62).
 
     For each existing writable file that was supplied to the coder complete,
-    the output allowance is derived from the source file's actual size times
-    the headroom factor, capped at ``outer_ceiling``. New files, files not
-    supplied whole, and paths without a trustworthy complete source record
-    fall back to the default ``max_edit_bytes``.
+    the output allowance is derived from the source file's actual size with
+    three components: a floor (``MAX_EDIT_BYTES``), an absolute growth term,
+    and a proportional headroom term. The largest of these, capped at
+    ``outer_ceiling``. New files, files not supplied whole, and paths without
+    a trustworthy complete source record fall back to the default
+    ``max_edit_bytes``.
 
     The invariant: a bounded task may rewrite a complete writable file with
     reasonable growth proportional to the file it was shown, but model output
@@ -568,7 +585,9 @@ def _complete_writable_allowances(
             and item.source_bytes > 0
         ):
             allowances[item.path] = per_path_edit_allowance(
-                item.source_bytes, outer_ceiling=outer_ceiling
+                item.source_bytes,
+                outer_ceiling=outer_ceiling,
+                absolute_growth_allowance=absolute_growth_allowance,
             )
     return allowances
 

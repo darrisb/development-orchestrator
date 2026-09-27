@@ -117,8 +117,20 @@ def render_plan_instructions(task: Task) -> str:
     )
 
 
-def render_coding_instructions(task: Task, plan: CodingPlan | None = None) -> str:
-    """The coding request's instructions, with the approved plan when there is one."""
+def render_coding_instructions(
+    task: Task,
+    plan: CodingPlan | None = None,
+    *,
+    path_output_limits: dict[str, int] | None = None,
+) -> str:
+    """The coding request's instructions, with the approved plan when there is one.
+
+    When ``path_output_limits`` is provided, the effective per-path byte
+    allowance for complete writable files is communicated before the first
+    model call (concern 62). The prompt makes clear that edits use complete
+    replacement contents and that the returned complete contents must remain
+    within the stated byte limit.
+    """
     sections = [
         f"# Implement task {task.external_task_id}",
         (
@@ -128,6 +140,16 @@ def render_coding_instructions(task: Task, plan: CodingPlan | None = None) -> st
             "- Keep the change as small as the task allows; stop when the goal is met."
         ),
     ]
+    if path_output_limits:
+        limits_lines = [
+            "- The following files have byte limits on their complete replacement contents:"
+        ]
+        for path in sorted(path_output_limits):
+            limits_lines.append(f"  - `{path}`: {path_output_limits[path]} bytes")
+        limits_lines.append(
+            "  Your returned complete contents for each file must not exceed its limit."
+        )
+        sections.append("\n".join(limits_lines))
     if plan is not None:
         sections.append(
             "Your plan was reviewed and approved. Follow it, and record in "

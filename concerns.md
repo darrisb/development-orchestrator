@@ -22,7 +22,7 @@ producing four accepted candidates that would not merge together.
 Resolved entries are kept in place and marked, rather than deleted or
 renumbered: the reasoning is referenced from code comments and tests, and the
 numbers are how they are referenced. **Resolved: 1–12, 16, 18–20, 22–29, 32–36,
-38–39, 41, 43, 46, 48–56, 58–61.** **Partly resolved: 30, 45** -- each says which half.
+38–39, 41, 43, 46, 48–56, 58–62.** **Partly resolved: 30, 45** -- each says which half.
 **Open: 13, 14, 15, 17, 21, 31, 37, 40, 42, 44, 47.**
 
 Every open entry is now a documented limitation rather than an unfinished fix.
@@ -2095,3 +2095,120 @@ tests.
 FAILED / RETRY_EXHAUSTED. TS-106 remains HUMAN_REVIEW. `agent/integration`
 remains `a2e40f2`. The existing escalation remains open. TS-106 was not retried
 as part of this fix.
+
+## 62. Proportional-only growth left medium files with too little room -- **resolved**
+
+Found in `RUN-20260927-000019`, the third TS-106 run. Concern 61 had closed the
+input side (complete writable files were supplied whole) and the output side
+(per-path allowance derived from source size). But the allowance was
+proportional-only:
+
+```
+allowance = max(MAX_EDIT_BYTES, int(source_bytes * EDIT_SIZE_HEADROOM))
+```
+
+For the 8110-byte `src/test/navigation-stack.test.ts`, this gave:
+
+```
+max(8000, int(8110 * 1.25)) = max(8000, 10137) = 10137 bytes
+```
+
+The model returned three replacements: 10593, 10454, and 10586 bytes. All three
+were ~29-31% growth, not ~5% as initially characterized. All three exceeded the
+10137-byte allowance and failed closed with `INVALID_MODEL_RESPONSE` under
+Concern 61. No verification, review, candidate, or integration occurred.
+Concern 61 therefore worked correctly -- the problem was that proportional-only
+growth left medium files with too little room for legitimate additions.
+
+*Why it matters:* a task that adds a few functions to a medium file is a normal
+coding task, not a policy violation. The proportional-only allowance was
+derived from the same headroom factor that bounds the input side, but that
+factor describes *rewriting the same file with minor additions*, not *adding
+significant new content*. A medium file that grows by 2500 bytes of legitimate
+new code was refused, wasting three attempts.
+
+*Resolved* in three parts.
+
+**Part A: absolute growth allowance.** The per-path allowance now includes an
+absolute growth term on top of the proportional headroom:
+
+```
+allowance = min(
+    outer_ceiling,
+    max(
+        MAX_EDIT_BYTES,
+        source_bytes + absolute_growth_allowance,
+        int(source_bytes * EDIT_SIZE_HEADROOM)
+    )
+)
+```
+
+The default `absolute_growth_allowance` is 2500 bytes, configurable via
+`CONTEXT_ABSOLUTE_GROWTH_ALLOWANCE_BYTES`. For the 8110-byte TS-106 source:
+
+```
+max(8000, 8110 + 2500, int(8110 * 1.25)) = max(8000, 10610, 10137) = 10610 bytes
+```
+
+This is enough room for the model's ~10500-byte replacements.
+
+**Part B: upfront communication of effective limits.** Before the first coder
+attempt, the coding instructions now include the effective per-path byte
+allowance for each complete writable file:
+
+```
+- The following files have byte limits on their complete replacement contents:
+  - `src/test/navigation-stack.test.ts`: 10610 bytes
+  Your returned complete contents for each file must not exceed its limit.
+```
+
+The prompt makes clear that edits use complete replacement contents and that
+the returned complete contents must remain within the stated byte limit. The
+prompt uses the actual effective allowance calculated by the Orchestrator, not
+a duplicate of the allowance arithmetic.
+
+**Part C: configuration.** The absolute growth allowance is configurable via
+`CONTEXT_ABSOLUTE_GROWTH_ALLOWANCE_BYTES` (default 2500), documented in
+`.env.example`. No database migration is required.
+
+**What is preserved.** Concern 61's fail-closed behavior is unchanged: if the
+model nevertheless returns an edit above its effective allowance, the rejected
+parse edit is represented structurally, the coding attempt fails closed with
+`INVALID_MODEL_RESPONSE`, no partial candidate is applied, and path/actual-size/limit
+feedback is provided. The `MAX_EDIT_BYTES` floor, `EDIT_SIZE_HEADROOM`
+proportional protection, and `CONTEXT_MAX_FILE_BYTES` ultimate ceiling are all
+preserved. Required-source completeness protections are unchanged. New files
+and files without a trustworthy complete supplied source do NOT receive the
+complete-source growth allowance merely because the path is writable.
+
+**Attempt accounting.** No free retries or separate retry budget are introduced.
+The existing attempt accounting is unchanged. Communicating the deterministic
+constraint upfront is the preferred first solution; retry policy can be
+revisited only if real runs continue wasting attempts despite being told the
+limits.
+
+**The tests are in** `tests/integration/test_concern62.py` (fifteen tests plus
+discrimination checks): tiny file floor dominates; medium file absolute-growth
+component can dominate; large file proportional component can dominate;
+allowance is monotonic with source size; allowance never exceeds outer ceiling;
+new file does not receive complete-source growth allowance; incomplete/untrusted
+source does not receive complete-source growth allowance; exact TS-106 shape
+(8110-byte source) receives at least 10610-byte allowance; reasonable TS-106-sized
+replacement is accepted; output exceeding the new allowance still fails closed;
+prompt contains the effective per-path byte allowance before the first model
+call; prompt value exactly matches the enforcement value; changing the configured
+absolute-growth value changes both enforcement and communicated allowance
+consistently; `CONTEXT_MAX_FILE_BYTES` remains an effective outer ceiling;
+existing Concern 55/56/58/61 regressions remain green. Discrimination checks
+verify that removing the absolute-growth term causes the medium/TS-106
+regression to fail, removing the outer ceiling causes an outer-bound regression
+to fail, removing upfront prompt communication causes the prompt regression to
+fail, and restoring Concern 61's silent-drop behavior causes the existing
+Concern 61 discrimination test to fail.
+
+**Campaign facts preserved.** `RUN-20260927-000019` remains historical and
+unchanged. TS-106 remains HUMAN_REVIEW. Escalation
+`deb00534-4521-416b-ad0f-75e6d1266e3c` remains OPEN. `agent/integration`
+remains `a2e40f226146feb723658b5eae0c7dac3635cf7e`. TS-106 was not retried,
+TS-107 was not run, no candidate was accepted, and no model or context
+configuration was changed.

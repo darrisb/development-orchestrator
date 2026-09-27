@@ -32,7 +32,6 @@ from apps.orchestrator.agents.coding_agent import (
 )
 from apps.orchestrator.config.settings import Settings
 from apps.orchestrator.domain.edits import (
-    EDIT_SIZE_HEADROOM,
     MAX_EDIT_BYTES,
     CodeChangeSet,
     MalformedChangeSet,
@@ -470,10 +469,12 @@ def test_outer_ceiling_caps_the_per_path_allowance():
 
 
 def test_per_path_allowance_is_proportional_to_source():
-    """The allowance for a complete writable file is source_bytes * headroom."""
+    """The allowance for a complete writable file includes proportional headroom
+    and an absolute growth term (concern 62)."""
     source_bytes = 8110
     allowance = per_path_edit_allowance(source_bytes)
-    assert allowance == int(source_bytes * EDIT_SIZE_HEADROOM)
+    # With absolute growth: max(8000, 8110 + 2500, int(8110 * 1.25)) = 10610
+    assert allowance == source_bytes + 2500
     assert allowance > max_edit_bytes_for_context(2000)
 
 
@@ -621,4 +622,5 @@ def test_restoring_fixed_8750_byte_ceiling_must_fail_ts106_test():
         "The per-path allowance for a complete writable file must exceed the "
         "old fixed ceiling derived from CONTEXT_MAX_ITEM_TOKENS"
     )
-    assert new_allowance == int(ts106_source_bytes * EDIT_SIZE_HEADROOM)
+    # With absolute growth: max(8000, 8110 + 2500, int(8110 * 1.25)) = 10610
+    assert new_allowance == ts106_source_bytes + 2500
