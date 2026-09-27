@@ -44,6 +44,7 @@ from ..domain.edits import (
     CodeChangeSet,
     MalformedChangeSet,
     max_edit_bytes_for_context,
+    per_path_edit_allowance,
 )
 from ..domain.enums import (
     FailureReason,
@@ -304,6 +305,12 @@ async def run_coding_attempt(
             # Concern 11: the same number that bounded what the context builder
             # could show of a file bounds what may come back for it.
             max_edit_bytes=max_edit_bytes_for_context(config.context_max_item_tokens),
+            # Concern 61: a complete writable file gets an output allowance
+            # derived from the source the coder actually saw, not from the
+            # per-item input ceiling.
+            path_max_bytes=_complete_writable_allowances(
+                built, outer_ceiling=config.context_max_file_bytes
+            ),
         )
     except MalformedChangeSet as error:
         # The endpoint answered and the JSON parsed; what came back was not a
@@ -320,6 +327,33 @@ async def run_coding_attempt(
                 f"Your previous answer could not be applied: {error}. Return one JSON "
                 f"object with an 'edits' array, and the complete new contents of every "
                 f"file you change."
+            ),
+            plan=plan,
+            assessment=assessment,
+            duration_ms=response.duration_ms,
+            usage=response.usage,
+            sink=sink,
+        )
+
+    # Concern 61: a model-requested edit that was rejected during parsing must
+    # not disappear while the remaining edits proceed. The attempt fails closed
+    # with INVALID_MODEL_RESPONSE so the coder sees the rejected path and reason.
+    if change_set.has_parse_rejections:
+        detail = "; ".join(
+            f"{r.path or '(unknown)'}: {r.reason}" for r in change_set.rejected_parse_edits
+        )
+        return _failed(
+            session,
+            run,
+            task,
+            project,
+            built,
+            provider,
+            FailureReason.INVALID_MODEL_RESPONSE,
+            feedback=(
+                "Your previous answer contained edits that could not be applied: "
+                f"{detail}. Return the complete new contents of every file you "
+                "change, within the size limits."
             ),
             plan=plan,
             assessment=assessment,
@@ -508,6 +542,35 @@ def _refused_plan_attempt(
 
 
 # -------------------------------------------------------------------- refusal
+
+
+def _complete_writable_allowances(
+    built: ContextBuildResult, *, outer_ceiling: int
+) -> dict[str, int]:
+    """Per-path output ceilings for complete writable files (concern 61).
+
+    For each existing writable file that was supplied to the coder complete,
+    the output allowance is derived from the source file's actual size times
+    the headroom factor, capped at ``outer_ceiling``. New files, files not
+    supplied whole, and paths without a trustworthy complete source record
+    fall back to the default ``max_edit_bytes``.
+
+    The invariant: a bounded task may rewrite a complete writable file with
+    reasonable growth proportional to the file it was shown, but model output
+    remains bounded.
+    """
+    allowances: dict[str, int] = {}
+    for item in built.package.items:
+        if (
+            item.path is not None
+            and item.requires_complete
+            and not item.truncated
+            and item.source_bytes > 0
+        ):
+            allowances[item.path] = per_path_edit_allowance(
+                item.source_bytes, outer_ceiling=outer_ceiling
+            )
+    return allowances
 
 
 def _incomplete_writable_sources(

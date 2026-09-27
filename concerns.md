@@ -22,7 +22,7 @@ producing four accepted candidates that would not merge together.
 Resolved entries are kept in place and marked, rather than deleted or
 renumbered: the reasoning is referenced from code comments and tests, and the
 numbers are how they are referenced. **Resolved: 1–12, 16, 18–20, 22–29, 32–36,
-38–39, 41, 43, 46, 48–54.** **Partly resolved: 30, 45** -- each says which half.
+38–39, 41, 43, 46, 48–56, 58–61.** **Partly resolved: 30, 45** -- each says which half.
 **Open: 13, 14, 15, 17, 21, 31, 37, 40, 42, 44, 47.**
 
 Every open entry is now a documented limitation rather than an unfinished fix.
@@ -1980,3 +1980,118 @@ remain the process/reconstruction and identity regressions. Reintroducing a
 `started_at`-anchored deadline fails the delayed-first-execution test;
 reintroducing `RETRY_EXHAUSTED` on deadline expiry fails the classification and
 reporting test.
+
+## 61. A rejected model edit could disappear silently and the output ceiling was
+stale -- **resolved**
+
+Found in `RUN-20260927-000018`, the second TS-106 run. Two related defects
+proved themselves in the same coding attempt.
+
+**Defect 1: parse-level silent edit loss.** A model response containing multiple
+edits could have one edit rejected during `CodeChangeSet` parsing while other
+edits survived. The rejected edit became only a warning string and disappeared
+from `change_set.edits`. The coding attempt therefore proceeded through
+verification and review with a partial candidate -- the valid edits were written,
+the rejected one was silently omitted, and the completion report showed no sign
+that the model's response had been incomplete.
+
+The incident shape: the Orchestrator supplied the complete 8110-byte writable
+test file to the coder (concern 56 had closed the input side). The coder
+returned two edits, one valid and one whose content was past the per-file output
+ceiling. The valid edit was applied; the oversized one became a warning and
+vanished. The attempt finished, the diff was captured, the completion report was
+written, and the candidate went to verification as though the response had been
+complete.
+
+**Defect 2: stale output-size derivation.** The whole-file replacement ceiling
+was still derived from `CONTEXT_MAX_ITEM_TOKENS=2000`:
+
+```
+characters_for_tokens(2000) * 1.25 = 8750 bytes
+```
+
+Concern 56 intentionally stopped applying that per-item input ceiling to
+required complete writable files, but the output side still derived its ceiling
+from it. In TS-106 the Orchestrator supplied the complete 8110-byte writable
+test file to the coder, then rejected the coder's 10604-byte replacement as
+over the 8750-byte limit. The input and output ceilings were no longer describing
+the same file at two moments; the output ceiling was describing a file the coder
+had never been shown.
+
+*Why it matters:* the first defect is a fail-open: a partial model response
+proceeds as though it were complete, and the reviewer sees a diff without
+knowing that the model asked for more. The second defect is the same shape as
+concern 1 with the roles reversed: the input side was fixed to show the file
+whole, but the output side was still bounded by the old input ceiling, so a
+legitimate rewrite of a file the coder had actually seen was refused.
+
+*Resolved* in two parts.
+
+**Part A: fail closed on dropped requested edits.**
+`domain.edits.RejectedParseEdit` is a new dataclass recording path, operation
+and reason for every model-requested edit that could not be parsed.
+`CodeChangeSet.rejected_parse_edits` carries them structurally, not as warning
+strings. `CodeChangeSet.has_parse_rejections` is the load-bearing property: when
+it is true, the coding agent fails the attempt with `INVALID_MODEL_RESPONSE` and
+sends the rejected paths and reasons back to the coder as feedback. The attempt
+does not proceed to `apply_change_set`, diff capture, scope evaluation or
+completion report. No partial candidate is treated as successful.
+
+Informational parser warnings -- content sent with a delete, a duplicate path --
+remain warnings and do not trigger the fail-closed path. The distinction is
+between *an edit the model asked for that could not be accepted* and *an edit
+that was accepted with a note*.
+
+**Part B: bounded per-path output allowance.**
+For an existing writable file that was declared writable for the task, was
+actually supplied to the coder, and was supplied complete, the output ceiling is
+now derived from the source file's actual size:
+
+```
+allowance = max(MAX_EDIT_BYTES, int(source_bytes * EDIT_SIZE_HEADROOM))
+```
+
+capped at `CONTEXT_MAX_FILE_BYTES`. New files, files not supplied whole, and
+paths without a trustworthy complete source record fall back to the default
+`max_edit_bytes` derived from `CONTEXT_MAX_ITEM_TOKENS`. The invariant: a
+bounded task may rewrite a complete writable file with reasonable growth
+proportional to the file it was shown, but model output remains bounded.
+
+`EDIT_SCHEMA_VERSION` is now `code-edits/2`. The `describe()` output carries
+`rejected_parse_edits` alongside `warnings`.
+
+**What is preserved.** Allowed-path enforcement, protected-file enforcement,
+`max_files_changed`, diff policy, security policy, context completeness
+protections, worker isolation, verification and review requirements are all
+unchanged. The application-layer refusal semantics -- a scope violation still
+fails with `SCOPE_VIOLATION`, an edit to a non-existent file with `update` is
+still refused at application time -- are untouched. The parse layer and the
+application layer remain distinct: a parse rejection is `INVALID_MODEL_RESPONSE`
+with feedback to the coder; an application rejection is a scope or tree problem
+recorded on the completion report.
+
+**The tests are in** `tests/integration/test_concern61.py` (seventeen tests):
+multi-edit payload with one valid and one oversized edit records the rejection
+structurally; coding attempt with one valid and one rejected edit fails closed
+with `INVALID_MODEL_RESPONSE` and feedback naming the rejected path; candidate
+verification does not run after a parse rejection; the exact TS-106 shape -- an
+existing writable file larger than the old 8750-byte ceiling, supplied
+completely, with a proportionally larger replacement -- is accepted under the
+new per-path allowance; new and small files remain bounded by the default
+ceiling; grossly oversized output remains rejected even with a per-path
+allowance; the outer ceiling caps the per-path allowance; informational warnings
+(delete with content, duplicate path) are not treated as rejections;
+application-layer scope refusals still fail with `SCOPE_VIOLATION`;
+discrimination checks that restoring the silent drop or the fixed 8750-byte
+ceiling fails the new tests.
+
+Restoring the silent `if edit is None: continue` behavior fails the multi-edit
+rejection test. Restoring the stale fixed 8750-byte output behavior fails the
+TS-106 regression. The existing Concern 55/56/58 tests continue to pass, as do
+the existing edit-contract, coding-agent, context-builder and Phase M acceptance
+tests.
+
+**Campaign facts preserved.** `RUN-20260927-000018` remains historical
+FAILED / RETRY_EXHAUSTED. TS-106 remains HUMAN_REVIEW. `agent/integration`
+remains `a2e40f2`. The existing escalation remains open. TS-106 was not retried
+as part of this fix.

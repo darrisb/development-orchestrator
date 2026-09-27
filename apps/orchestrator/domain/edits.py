@@ -31,7 +31,7 @@ from .scope import is_within_repository
 from .tokens import characters_for_tokens
 
 #: Bumped when the edit contract changes (section 34 attribution).
-EDIT_SCHEMA_VERSION = "code-edits/1"
+EDIT_SCHEMA_VERSION = "code-edits/2"
 
 #: Ceiling on one file's new content when nothing derives one. A model that
 #: returns a megabyte for one file has either pasted the wrong thing or is
@@ -57,6 +57,21 @@ def max_edit_bytes_for_context(max_item_tokens: int) -> int:
     be.
     """
     return max(1, int(characters_for_tokens(max_item_tokens) * EDIT_SIZE_HEADROOM))
+
+
+def per_path_edit_allowance(
+    source_bytes: int, *, outer_ceiling: int | None = None
+) -> int:
+    """The output ceiling for a file whose complete source was supplied.
+
+    A bounded proportional allowance: the file the coder saw, times the
+    headroom factor, optionally capped by an outer ceiling. The floor is
+    ``MAX_EDIT_BYTES`` so a tiny file still gets the default allowance.
+    """
+    allowance = max(MAX_EDIT_BYTES, int(source_bytes * EDIT_SIZE_HEADROOM))
+    if outer_ceiling is not None:
+        return min(allowance, outer_ceiling)
+    return allowance
 
 
 class EditOperation(StrEnum):
@@ -128,6 +143,27 @@ class FileEdit:
 
 
 @dataclass(frozen=True, slots=True)
+class RejectedParseEdit:
+    """A model-requested edit that could not be parsed (concern 61).
+
+    Recorded structurally so the coding agent can fail closed and name the
+    rejected path and reason in feedback to the next coder attempt. A parse-level
+    rejected requested edit must not silently disappear while other edits proceed.
+    """
+
+    path: str | None
+    operation: str | None
+    reason: str
+
+    def describe(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "operation": self.operation,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CodeChangeSet:
     """A coder's complete answer: the edits, plus what it claims about them.
 
@@ -143,18 +179,36 @@ class CodeChangeSet:
     follow_ups: tuple[str, ...] = ()
     deviations_from_plan: tuple[str, ...] = ()
     #: Problems found while parsing that did not invalidate the whole answer:
-    #: a dropped edit with an unusable path, a delete carrying content.
+    #: a delete carrying content, a duplicate path.
     warnings: tuple[str, ...] = field(default=())
+    #: Model-requested edits that could not be parsed (concern 61). Non-empty
+    #: means the response is incomplete and the attempt must not proceed as
+    #: though it were.
+    rejected_parse_edits: tuple[RejectedParseEdit, ...] = field(default=())
 
     @property
     def paths(self) -> tuple[str, ...]:
         return tuple(edit.path for edit in self.edits)
 
+    @property
+    def has_parse_rejections(self) -> bool:
+        return bool(self.rejected_parse_edits)
+
     @classmethod
     def from_payload(
-        cls, payload: Mapping[str, object], *, max_edit_bytes: int = MAX_EDIT_BYTES
+        cls,
+        payload: Mapping[str, object],
+        *,
+        max_edit_bytes: int = MAX_EDIT_BYTES,
+        path_max_bytes: Mapping[str, int] | None = None,
     ) -> CodeChangeSet:
         """Read a change set out of a parsed model response.
+
+        ``path_max_bytes`` overrides ``max_edit_bytes`` for specific paths. A
+        path present in the mapping uses its own ceiling; all others fall back
+        to ``max_edit_bytes``. This is how a complete writable file supplied to
+        the coder gets an output allowance derived from its source size rather
+        than from the per-item input ceiling (concern 61).
 
         Raises:
             MalformedChangeSet: ``edits`` is missing, is not a list, or every
@@ -168,16 +222,23 @@ class CodeChangeSet:
 
         edits: list[FileEdit] = []
         warnings: list[str] = []
+        rejected: list[RejectedParseEdit] = []
         seen: set[str] = set()
+        limits = path_max_bytes or {}
         for index, entry in enumerate(raw):
-            edit, warning = _parse_edit(entry, index, max_edit_bytes=max_edit_bytes)
+            edit, warning, rejection = _parse_edit(
+                entry,
+                index,
+                max_edit_bytes=max_edit_bytes,
+                path_max_bytes=limits,
+            )
             if warning:
                 warnings.append(warning)
+            if rejection is not None:
+                rejected.append(rejection)
             if edit is None:
                 continue
             if edit.path in seen:
-                # Two edits to one path: the later one is the model's second
-                # thought and there is no way to merge them safely.
                 warnings.append(
                     f"edit {index}: {edit.path} is edited more than once; "
                     f"only the first edit was kept"
@@ -187,7 +248,12 @@ class CodeChangeSet:
             edits.append(edit)
 
         if not edits:
-            detail = "; ".join(warnings) if warnings else "the list was empty"
+            parts: list[str] = []
+            if rejected:
+                parts.extend(r.reason for r in rejected)
+            if warnings:
+                parts.extend(warnings)
+            detail = "; ".join(parts) if parts else "the list was empty"
             raise MalformedChangeSet(f"The response contains no usable edits ({detail})")
 
         summary = payload.get("summary")
@@ -199,6 +265,7 @@ class CodeChangeSet:
             follow_ups=_strings(payload.get("followUps")),
             deviations_from_plan=_strings(payload.get("deviationsFromPlan")),
             warnings=tuple(warnings),
+            rejected_parse_edits=tuple(rejected),
         )
 
     def describe(self) -> dict[str, object]:
@@ -211,55 +278,99 @@ class CodeChangeSet:
             "follow_ups": list(self.follow_ups),
             "deviations_from_plan": list(self.deviations_from_plan),
             "warnings": list(self.warnings),
+            "rejected_parse_edits": [r.describe() for r in self.rejected_parse_edits],
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _ParseOutcome:
+    edit: FileEdit | None = None
+    warning: str | None = None
+    rejection: RejectedParseEdit | None = None
+
+
 def _parse_edit(
-    entry: object, index: int, *, max_edit_bytes: int
-) -> tuple[FileEdit | None, str | None]:
-    """One entry of ``edits``, or ``None`` with the reason it was dropped."""
+    entry: object,
+    index: int,
+    *,
+    max_edit_bytes: int,
+    path_max_bytes: Mapping[str, int] | None = None,
+) -> tuple[FileEdit | None, str | None, RejectedParseEdit | None]:
+    """One entry of ``edits``.
+
+    Returns a three-part outcome: the parsed edit (or ``None``), an
+    informational warning (or ``None``), and a structural rejection (or
+    ``None``). A rejection means the model asked for this edit and it could
+    not be accepted; the caller must not let it disappear silently.
+    """
+    limits = path_max_bytes or {}
+
     if not isinstance(entry, Mapping):
-        return None, f"edit {index}: not an object"
+        return None, None, RejectedParseEdit(
+            path=None, operation=None, reason=f"edit {index}: not an object"
+        )
 
     raw_path = entry.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip():
-        return None, f"edit {index}: no path"
+        return None, None, RejectedParseEdit(
+            path=None, operation=None, reason=f"edit {index}: no path"
+        )
     if not is_within_repository(raw_path):
-        return None, (
-            f"edit {index}: path {raw_path!r} is not repository-relative "
-            f"(absolute paths, '~' and '..' are refused)"
+        return None, None, RejectedParseEdit(
+            path=raw_path,
+            operation=None,
+            reason=(
+                f"edit {index}: path {raw_path!r} is not repository-relative "
+                f"(absolute paths, '~' and '..' are refused)"
+            ),
         )
     path = normalise_path(raw_path)
 
     raw_operation = entry.get("operation")
     if not isinstance(raw_operation, str):
-        return None, f"edit {index} ({path}): no operation"
+        return None, None, RejectedParseEdit(
+            path=path, operation=None, reason=f"edit {index} ({path}): no operation"
+        )
     try:
         operation = EditOperation(raw_operation.strip().casefold())
     except ValueError:
         allowed = ", ".join(op.value for op in EditOperation)
-        return None, (
-            f"edit {index} ({path}): operation {raw_operation!r} is not one of: {allowed}"
+        return None, None, RejectedParseEdit(
+            path=path,
+            operation=raw_operation,
+            reason=(
+                f"edit {index} ({path}): operation {raw_operation!r} is not one of: {allowed}"
+            ),
         )
 
     raw_content = entry.get("content")
     content = raw_content if isinstance(raw_content, str) else None
     if operation.needs_content:
         if content is None:
-            return None, f"edit {index} ({path}): a {operation.value} needs content"
-        if len(content.encode()) > max_edit_bytes:
-            return None, (
-                f"edit {index} ({path}): content is {len(content.encode())} bytes, "
-                f"over the {max_edit_bytes}-byte limit for one file"
+            return None, None, RejectedParseEdit(
+                path=path,
+                operation=operation.value,
+                reason=f"edit {index} ({path}): a {operation.value} needs content",
             )
-        return FileEdit(path=path, operation=operation, content=content), None
+        content_bytes = len(content.encode())
+        ceiling = limits.get(path, max_edit_bytes)
+        if content_bytes > ceiling:
+            return None, None, RejectedParseEdit(
+                path=path,
+                operation=operation.value,
+                reason=(
+                    f"edit {index} ({path}): content is {content_bytes} bytes, "
+                    f"over the {ceiling}-byte limit for one file"
+                ),
+            )
+        return FileEdit(path=path, operation=operation, content=content), None, None
 
     warning = (
         f"edit {index} ({path}): content sent with a delete was ignored"
         if content
         else None
     )
-    return FileEdit(path=path, operation=operation, content=None), warning
+    return FileEdit(path=path, operation=operation, content=None), warning, None
 
 
 def _strings(value: object) -> tuple[str, ...]:
@@ -279,5 +390,7 @@ __all__ = [
     "EditOperation",
     "FileEdit",
     "MalformedChangeSet",
+    "RejectedParseEdit",
     "max_edit_bytes_for_context",
+    "per_path_edit_allowance",
 ]
