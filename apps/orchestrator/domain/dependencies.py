@@ -7,7 +7,7 @@ before import) and the scheduler (deciding what may run now) share it.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from .enums import TaskStatus
@@ -112,40 +112,83 @@ def topological_order(graph: Graph) -> list[str]:
 class ReadinessReport:
     """Which tasks may start now, and what the rest are waiting on."""
 
-    #: Dependencies all COMPLETE: eligible for READY.
+    #: Dependencies all COMPLETE *and* integrated: eligible for READY.
     ready: tuple[str, ...] = ()
-    #: task id -> dependencies that are FAILED or BLOCKED.
+    #: task id -> dependencies that cannot currently be satisfied: FAILED,
+    #: BLOCKED, or complete with output that is not in the integration baseline.
     blocked: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     #: task id -> dependencies that are simply not COMPLETE yet.
     waiting: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    #: task id -> the subset of its ``blocked`` dependencies that are complete
+    #: but whose accepted output is not in the integration baseline (concern
+    #: 51). Reported separately because the two cases read identically in
+    #: ``blocked`` and want opposite responses: a FAILED dependency is a task to
+    #: re-run, and this is a delivered task whose *integration* a person has to
+    #: resolve.
+    unintegrated: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def is_ready(self, task_id: str) -> bool:
         return task_id in self.ready
 
 
-def evaluate_readiness(graph: Graph, statuses: Mapping[str, TaskStatus]) -> ReadinessReport:
+def evaluate_readiness(
+    graph: Graph,
+    statuses: Mapping[str, TaskStatus],
+    *,
+    unintegrated: Collection[str] = (),
+) -> ReadinessReport:
     """Classify every task whose next move the dependency graph decides.
 
-    A task is ready only when all of its dependencies are ``COMPLETE``
-    (section 26). Only ``GRAPH_MANAGED_STATES`` are classified: a task that is
-    complete, in flight, failed, paused, or awaiting a human is owned by its run
-    or by an operator decision, and readiness must never quietly re-queue it.
+    A task is ready only when every dependency is ``COMPLETE`` (section 26)
+    *and* the dependency's accepted output is in the cumulative integration
+    baseline (concern 51). The second half is not a refinement of the first: a
+    candidate can pass verification and review, be delivered, mark its task
+    ``COMPLETE``, and then fail to merge or fail the cumulative gate, and in
+    that state the tree a dependent task would start from does not contain the
+    work it was told to build on. ``COMPLETE`` answers "was this task done";
+    ``unintegrated`` answers "is it in the tree", and only the two together mean
+    a dependency is satisfied.
+
+    Such a dependency is reported as unsatisfiable rather than as waiting,
+    because nothing the orchestrator does on its own will change it -- a person
+    has to resolve the integration -- and ``BLOCKED`` is the state that says so.
+    It recovers: resolving the integration clears the flag and the next
+    readiness pass promotes the dependent.
+
+    Only ``GRAPH_MANAGED_STATES`` are classified: a task that is complete, in
+    flight, failed, paused, or awaiting a human is owned by its run or by an
+    operator decision, and readiness must never quietly re-queue it.
+
+    Args:
+        unintegrated: ids of tasks whose accepted output is *not* in the
+            baseline. Passed in rather than derived, because this module is pure
+            graph logic and whether a commit is in a ref is not graph logic.
     """
+    outstanding_integration = frozenset(unintegrated)
     ready: list[str] = []
     blocked: dict[str, tuple[str, ...]] = {}
     waiting: dict[str, tuple[str, ...]] = {}
+    unintegrated_deps: dict[str, tuple[str, ...]] = {}
 
     for task_id in sorted(graph):
         if statuses.get(task_id, TaskStatus.PENDING) not in GRAPH_MANAGED_STATES:
             continue
         dependencies = graph[task_id]
+        not_in_baseline = tuple(
+            dependency
+            for dependency in dependencies
+            if dependency in outstanding_integration
+        )
         unsatisfiable = tuple(
             dependency
             for dependency in dependencies
             if statuses.get(dependency, TaskStatus.PENDING) in UNSATISFIABLE_DEPENDENCY_STATES
+            or dependency in outstanding_integration
         )
         if unsatisfiable:
             blocked[task_id] = unsatisfiable
+            if not_in_baseline:
+                unintegrated_deps[task_id] = not_in_baseline
             continue
         outstanding = tuple(
             dependency
@@ -157,4 +200,9 @@ def evaluate_readiness(graph: Graph, statuses: Mapping[str, TaskStatus]) -> Read
         else:
             ready.append(task_id)
 
-    return ReadinessReport(ready=tuple(ready), blocked=blocked, waiting=waiting)
+    return ReadinessReport(
+        ready=tuple(ready),
+        blocked=blocked,
+        waiting=waiting,
+        unintegrated=unintegrated_deps,
+    )

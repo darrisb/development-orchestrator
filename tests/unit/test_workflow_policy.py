@@ -26,3 +26,20 @@ def test_every_human_intent_has_an_explicit_effect():
     assert effect_of(EscalationIntent.RETRY_TASK).task_status is TaskStatus.READY
     assert effect_of(EscalationIntent.COMPLETED_BY_HAND).completes_task
     assert effect_of(EscalationIntent.ABANDON_TASK).task_status is TaskStatus.FAILED
+
+
+def test_retrying_an_integration_does_not_move_the_task():
+    """Concern 51's resolution authorises one thing and nothing else.
+
+    The task is already COMPLETE with a reviewed candidate, so the answer must
+    not commit anything, must not reopen the task, and must not release a
+    worktree that delivery already released. What it changes is whether the
+    baseline contains the work.
+    """
+    effect = effect_of(EscalationIntent.RETRY_INTEGRATION)
+    assert effect.retry_integration
+    assert effect.task_status is TaskStatus.COMPLETE
+    assert not effect.commit_candidate
+    assert not effect.reopens_task
+    assert not effect.feedback_to_coder
+    assert not effect.release_worktree

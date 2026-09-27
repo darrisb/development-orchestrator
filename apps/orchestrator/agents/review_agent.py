@@ -26,8 +26,9 @@ charge for it again.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
+from time import monotonic
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -71,7 +72,7 @@ from ..repositories import (
     TaskRunRepository,
 )
 from ..services import artifact_store
-from ..services.model_runs import ensure_model, record_model_call
+from ..services.model_runs import describe_error, ensure_model, record_model_call
 from ..services.review_context import MAX_REVIEW_DIFF_BYTES, build_review_package
 from ..services.workspace import (
     DiffCapture,
@@ -80,6 +81,7 @@ from ..services.workspace import (
     load_run_context,
 )
 from .review_prompts import REVIEWER_PROMPT_VERSION
+from .timing import elapsed_ms, started_at
 
 logger = get_logger(__name__)
 
@@ -145,6 +147,7 @@ async def run_review(
     package: ReviewPackage | None = None,
     settings: Settings | None = None,
     policy: HumanApprovalPolicy | None = None,
+    checkpoint_call: Callable[[], None] | None = None,
 ) -> ReviewOutcome:
     """Review the candidate in ``workspace`` and route the result.
 
@@ -156,6 +159,9 @@ async def run_review(
             to the routing, whose ``REQUIRE_REVIEW`` findings it carries.
         package: a pre-built package, for a re-review that must be judged
             against exactly what a previous cycle saw. Built here when absent.
+        checkpoint_call: committed after the model's call is recorded, including
+            before a failure is re-raised, so an unreachable reviewer is a row
+            rather than a gap.
 
     Raises:
         EntityNotFound: the run, its task or its project is missing.
@@ -212,7 +218,10 @@ async def run_review(
         },
     )
 
-    call = await _review_recorded(session, provider, built, cycle=cycle, run=run, sink=sink)
+    call = await _review_recorded(
+        session, provider, built, cycle=cycle, run=run, sink=sink,
+        checkpoint_call=checkpoint_call,
+    )
     result = call.result
     # The cycle is spent only once a reviewer has actually returned a verdict.
     # Counting it before the call would let three unreachable-reviewer retries
@@ -434,25 +443,38 @@ async def _review_recorded(
     cycle: int,
     run: TaskRun,
     sink: _ArtifactSink,
+    checkpoint_call: Callable[[], None] | None = None,
 ) -> ReviewCall:
     """Send one review, keep both artifacts, and record the call.
 
     A failure is recorded before it is re-raised, for the same reason the
-    coding agent does it: how often a reviewer is unreachable or answers
-    unusably is exactly what section 35 wants to be able to ask, and a table
-    holding only the reviews that worked cannot answer it.
+    coding agent does it, and committed for the same reason: how often a
+    reviewer is unreachable or answers unusably is exactly what section 35
+    wants to be able to ask, and a row inside a transaction that is about to
+    roll back is not a record of anything.
+
+    ``duration_ms`` is measured rather than defaulted, so a reviewer that hung
+    until its timeout is distinguishable from one that was refused instantly.
     """
     request = ReviewRequest(package=package, cycle=cycle)
+    started = monotonic()
     try:
         call = await provider.review(request)
-    except Exception:
+    except Exception as error:
         record_model_call(
             session,
             task_run_id=run.id,
             config=provider.config,
             purpose=ModelPurpose.REVIEW,
             status=RunStatus.FAILED,
+            duration_ms=elapsed_ms(started),
+            started_at=started_at(started),
+            error_detail=describe_error(error),
+            attempt=run.attempt_number,
+            review_cycle=cycle,
         )
+        if checkpoint_call is not None:
+            checkpoint_call()
         raise
     sink.text(REVIEW_PROMPT_ARTIFACT, call.prompt_text)
     sink.text(REVIEW_RESPONSE_ARTIFACT, call.raw_response)
@@ -466,7 +488,12 @@ async def _review_recorded(
         usage=call.usage,
         prompt_artifact=sink.paths.get(REVIEW_PROMPT_ARTIFACT),
         response_artifact=sink.paths.get(REVIEW_RESPONSE_ARTIFACT),
+        started_at=started_at(started),
+        attempt=run.attempt_number,
+        review_cycle=cycle,
     )
+    if checkpoint_call is not None:
+        checkpoint_call()
     return call
 
 

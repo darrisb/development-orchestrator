@@ -15,6 +15,20 @@ from enum import StrEnum
 #: treated as human-owned and never written to.
 AGENT_BRANCH_PREFIX = "agent/"
 
+#: The orchestrator's cumulative accepted state (concern 51). Under the agent
+#: prefix because it is orchestrator-owned by the same convention every task
+#: branch is, and *not* the project's own branch: the imported branch stays
+#: exactly where the operator left it, and integration never advances it.
+#:
+#: Task worktrees start from this ref rather than from the imported branch, so a
+#: task that depends on another one sees the work that other one had accepted.
+INTEGRATION_BRANCH = f"{AGENT_BRANCH_PREFIX}integration"
+
+#: Directory name of the project's integration worktree, a sibling of the task
+#: worktrees under ``WORKTREE_ROOT/<project>/``. The leading underscore keeps it
+#: out of the namespace ``worktree_dir_name`` generates for tasks.
+INTEGRATION_WORKTREE_DIR = "_integration"
+
 #: Longest slug appended to a branch name. Git allows far more; a cap keeps
 #: worktree directory names and log lines readable.
 MAX_SLUG_LENGTH = 48

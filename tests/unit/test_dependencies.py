@@ -97,3 +97,90 @@ def test_a_blocked_task_becomes_ready_again_once_dependencies_complete():
 def test_readiness_ignores_dictionary_order():
     graph = {"B": [], "A": []}
     assert evaluate_readiness(graph, {}).ready == ("A", "B")
+
+
+# ------------------------------- complete is not the same as integrated (51)
+
+
+def test_a_complete_dependency_outside_the_baseline_does_not_satisfy_anything():
+    """The invariant concern 51's second half adds.
+
+    A can pass verification and review, be delivered and be COMPLETE while its
+    accepted commit failed to merge into the cumulative baseline. B was told to
+    build on A's work; the tree it would start from does not contain it, so B is
+    not eligible -- and the reason is separated from an ordinary blockage, because
+    a person resolving an integration and a task to re-run want opposite actions.
+    """
+    graph = {"A": [], "B": ["A"]}
+    report = evaluate_readiness(
+        graph, {"A": TaskStatus.COMPLETE, "B": TaskStatus.PENDING}, unintegrated={"A"}
+    )
+    assert report.ready == ()
+    assert report.blocked == {"B": ("A",)}
+    assert report.unintegrated == {"B": ("A",)}
+
+
+def test_resolving_the_integration_makes_the_dependent_ready_again():
+    """Blocking is not permanent: the same graph, with nothing outstanding."""
+    graph = {"A": [], "B": ["A"]}
+    report = evaluate_readiness(
+        graph, {"A": TaskStatus.COMPLETE, "B": TaskStatus.BLOCKED}
+    )
+    assert report.is_ready("B")
+    assert report.unintegrated == {}
+
+
+def test_an_unintegrated_task_does_not_block_an_unrelated_chain():
+    """The blockage follows the edges and nothing else.
+
+    V1 runs one task at a time, but which one it picks must not change for tasks
+    that never depended on the blocked work: a single blocked integration is not
+    a reason to stop the project.
+    """
+    graph = {"A": [], "B": ["A"], "C": [], "D": ["C"]}
+    report = evaluate_readiness(
+        graph,
+        {
+            "A": TaskStatus.COMPLETE,
+            "B": TaskStatus.PENDING,
+            "C": TaskStatus.COMPLETE,
+            "D": TaskStatus.PENDING,
+        },
+        unintegrated={"A"},
+    )
+    assert report.ready == ("D",)
+    assert report.blocked == {"B": ("A",)}
+
+
+def test_the_blockage_carries_down_a_chain():
+    """C depends on B, which is BLOCKED because A is not in the baseline."""
+    graph = {"A": [], "B": ["A"], "C": ["B"]}
+    report = evaluate_readiness(
+        graph,
+        {
+            "A": TaskStatus.COMPLETE,
+            "B": TaskStatus.BLOCKED,
+            "C": TaskStatus.PENDING,
+        },
+        unintegrated={"A"},
+    )
+    assert report.ready == ()
+    assert report.blocked == {"B": ("A",), "C": ("B",)}
+    # C's own blockage is an ordinary unsatisfiable dependency, not an
+    # integration of its own: only B's is reported as unintegrated.
+    assert report.unintegrated == {"B": ("A",)}
+
+
+def test_a_dependency_with_nothing_to_integrate_is_satisfied():
+    """A task completed by hand produced no commit, so none can be missing.
+
+    The invariant is about a tree containing a dependency's accepted output. A
+    dependency that never produced one -- ``COMPLETED_BY_HAND`` -- is not
+    outstanding, and treating it as such would deadlock every escalation answer
+    that says a person did the work themselves.
+    """
+    graph = {"A": [], "B": ["A"]}
+    report = evaluate_readiness(
+        graph, {"A": TaskStatus.COMPLETE, "B": TaskStatus.PENDING}, unintegrated=()
+    )
+    assert report.is_ready("B")

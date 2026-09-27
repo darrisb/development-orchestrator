@@ -167,9 +167,37 @@ def test_a_low_confidence_approval_is_sent_to_a_human():
     assert any("confidence" in reason for reason in routing.human_review_reasons)
 
 
-def test_a_missing_confidence_does_not_trip_the_gate():
-    """An endpoint that does not report confidence is not a suspicious one."""
-    assert route(result(confidence=None)).approved
+def test_a_missing_confidence_trips_a_configured_gate():
+    """Concern 50: a stated requirement with no answer is not a pass.
+
+    This used to assert the opposite -- that an endpoint which does not report
+    confidence "is not a suspicious one" -- and the first real reviewer run
+    showed what that costs: a model that simply omits the field cleared a gate
+    no confidence could have cleared, silently, because an absent value is not
+    a parse error and left no warning behind.
+    """
+    routing = route(result(confidence=None))
+
+    assert routing.needs_human
+    assert any(
+        "stated no confidence" in reason for reason in routing.human_review_reasons
+    )
+
+
+def test_a_missing_confidence_is_accepted_when_no_confidence_is_required():
+    """The other direction, and the one that keeps the fix proportionate.
+
+    ``min_confidence=None`` -- which is what ``REVIEW_MIN_CONFIDENCE=0``
+    resolves to -- states no requirement, so an absent confidence constrains
+    nothing and must not escalate.
+    """
+    routing = route(
+        result(confidence=None),
+        policy=HumanApprovalPolicy(min_confidence=None),
+    )
+
+    assert routing.approved
+    assert not routing.human_review_reasons
 
 
 def test_deleting_more_files_than_policy_allows_needs_a_human():

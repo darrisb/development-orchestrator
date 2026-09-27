@@ -35,7 +35,7 @@ from ..repositories import (
     TaskRepository,
     TaskRunRepository,
 )
-from .errors import EntityNotFound
+from .errors import EntityConflict, EntityNotFound
 from .git_errors import GitError, WorktreeMissing
 from .git_service import DIFF_TRUNCATION_MARKER, GitService
 
@@ -102,17 +102,31 @@ def prepare_workspace(
 
     Raises:
         EntityNotFound: the run, its task, or its project is missing.
+        EntityConflict: a dependency's accepted work is not in the baseline this
+            worktree would be created from.
         DirtyWorktree: the managed repository has uncommitted changes.
         BranchAlreadyExists: a branch for this task and run already exists.
         WorktreePathRejected: the target path is outside ``WORKTREE_ROOT``.
     """
     config = settings or get_settings()
     run, task, project = load_run_context(session, task_run_id)
+    _assert_dependencies_integrated(session, task)
 
     repository = repository_service(project, settings=config)
     repository.ensure_clean_worktree(allow_dirty=allow_dirty)
 
-    starting_commit = repository.resolve_sha(project.default_branch)
+    # Concern 51: the cumulative accepted baseline, not the imported branch. A
+    # task that depends on another one is scheduled after it and must also see
+    # its accepted work; resolving the imported branch here is what made
+    # `depends_on` an ordering hint and nothing more. The imported branch is
+    # still where the baseline starts from on a project's first task.
+    #
+    # Imported inside the function because `services.integration` reaches the
+    # worker to verify a merged tree, and that path imports this module: a
+    # module-level import here would be a cycle. Only the read side is used.
+    from .integration import integration_baseline
+
+    starting_commit = integration_baseline(repository, project)
     branch = task_branch_name(task.external_task_id, task.title)
     directory = worktree_dir_name(task.external_task_id, run.run_number)
     path = config.worktree_root / str(project.id) / directory
@@ -156,6 +170,35 @@ def prepare_workspace(
         git=worktree_git,
         repository=repository,
     )
+
+
+def _assert_dependencies_integrated(session: Session, task: Task) -> None:
+    """Refuse to start work on a tree missing a dependency's accepted output.
+
+    The scheduler will not select such a task -- readiness reports it BLOCKED
+    (concern 51) -- so this never fires on the ordinary path. It exists because
+    the invariant belongs to the *starting commit*, and this is the function that
+    resolves one: an operator running a single task by hand, a recovery path, or
+    a future scheduler would otherwise be able to reach the defect again through
+    a door the graph does not watch.
+
+    Raises:
+        EntityConflict: a dependency is complete but not in the baseline.
+    """
+    if not task.depends_on:
+        return
+    declared = set(task.depends_on)
+    outstanding = sorted(
+        other.external_task_id
+        for other in TaskRepository(session).list_for_project(task.project_id)
+        if other.external_task_id in declared and other.unintegrated_commit is not None
+    )
+    if outstanding:
+        raise EntityConflict(
+            f"Task {task.external_task_id} depends on {', '.join(outstanding)}, "
+            "whose accepted work is not in the integration baseline; the "
+            "blocked integration has to be resolved first"
+        )
 
 
 def _prepopulate_dependencies(

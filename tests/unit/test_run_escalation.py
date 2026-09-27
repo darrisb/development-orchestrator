@@ -11,6 +11,9 @@ from __future__ import annotations
 
 from apps.orchestrator.domain.enums import FailureReason
 from apps.orchestrator.domain.escalation import (
+    EscalationIntent,
+    integration_escalation_options,
+    render_integration_escalation,
     render_run_escalation,
     run_escalation_options,
 )
@@ -94,3 +97,43 @@ def test_a_run_with_no_attempts_is_still_a_readable_escalation():
 
     assert "Attempts: none" in text
     assert "Current repository:" not in text
+
+
+def test_a_blocked_integration_offers_only_what_can_be_done_deterministically():
+    """Concern 51: one option, and it is a gate rather than a judgement.
+
+    Retrying the task would discard a reviewed candidate and failing it would
+    call delivered work failed, so neither is offered. What is offered is the
+    same merge and the same cumulative verification, run again over whatever a
+    person resolved.
+    """
+    options = integration_escalation_options()
+    assert [option.intent for option in options] == [EscalationIntent.RETRY_INTEGRATION]
+    assert options[0].key == "A"
+
+
+def test_the_integration_escalation_page_names_the_tasks_it_is_holding_up():
+    """Section 24: nobody should have to reconstruct the consequence either.
+
+    The commit, the baseline it would not join, what the verifier said and which
+    tasks are now waiting -- the last one is what an operator would otherwise
+    discover by wondering why nothing is being picked up.
+    """
+    page = render_integration_escalation(
+        external_task_id="PIPE-01",
+        branch="agent/PIPE-01-add-a-step",
+        candidate_commit="cafe1234",
+        baseline_sha="beef5678",
+        integration_branch="agent/integration",
+        blocker="the merged tree failed the project's own verification",
+        failed_commands=("pytest -q",),
+        dependents=("PIPE-02", "PIPE-07"),
+        options=integration_escalation_options(),
+    )
+    assert "TASK PIPE-01 — INTEGRATION BLOCKED" in page
+    assert "cafe1234" in page and "beef5678" in page
+    assert "pytest -q" in page
+    assert "PIPE-02" in page and "PIPE-07" in page
+    assert "re-attempt the integration" in page
+    # And it says what is true of the repository: nothing was rolled back.
+    assert "nothing has been rolled back" in page

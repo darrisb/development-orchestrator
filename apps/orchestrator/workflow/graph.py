@@ -50,6 +50,11 @@ class WorkflowState(TypedDict):
     escalation_id: NotRequired[str]
     commit_sha: NotRequired[str]
     worktree_released: NotRequired[bool]
+    #: The task completed, but its accepted work is not in the cumulative
+    #: integration baseline and a person has to resolve that (concern 51).
+    #: Reported rather than turned into a failed outcome: the task really is
+    #: complete, and what is blocked is everything that depends on it.
+    integration_blocked: NotRequired[bool]
     pause_request_id: NotRequired[str]
     resume_status: NotRequired[str]
     error: NotRequired[str]
@@ -340,13 +345,19 @@ class WorkflowRunner:
                 session, UUID(state["run_id"]), settings=self.settings
             )
             delivered = deliver_candidate(session, workspace, settings=self.settings)
-            return {
+            integration = delivered.integration
+            blocked = integration is not None and not integration.advanced
+            state_update: dict[str, object] = {
                 "phase": WorkflowPhase.DONE.value,
                 "outcome": WorkflowOutcome.COMPLETED.value,
                 "task_status": TaskStatus.COMPLETE.value,
                 "commit_sha": delivered.commit_sha,
                 "worktree_released": delivered.released,
+                "integration_blocked": blocked,
             }
+            if blocked and integration.escalation_id is not None:
+                state_update["escalation_id"] = str(integration.escalation_id)
+            return state_update
 
     def _release(self, state: WorkflowState) -> dict[str, object]:
         with self.session_factory.begin() as session:

@@ -28,6 +28,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # The orchestrator's file I/O lands in host-owned directories (./data and
+    # ./workspace), and every managed repository under ./workspace is a Git
+    # repository owned by the host user. Running as root made Git refuse all of
+    # them -- "detected dubious ownership" -- and made anything it did write
+    # root-owned in the user's own workspace. The uid is the host owner; the gid
+    # is the docker group, which is what the socket below is readable by.
+    user: "${ORCHESTRATOR_UID:-1000}:${DOCKER_GID:-1001}"
     environment:
       DATABASE_URL: postgresql+psycopg://orchestrator:orchestrator@postgres:5432/orchestrator
       ARTIFACT_ROOT: /data

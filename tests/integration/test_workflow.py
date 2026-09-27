@@ -13,6 +13,7 @@ from apps.orchestrator.db.base import Base
 from apps.orchestrator.db.models import WorkflowCheckpointRow
 from apps.orchestrator.db.session import create_db_engine
 from apps.orchestrator.domain.enums import Complexity, TaskStatus, WorkerProfile
+from apps.orchestrator.domain.git import INTEGRATION_WORKTREE_DIR
 from apps.orchestrator.domain.models import Project, Task
 from apps.orchestrator.domain.verification import VerificationProfile
 from apps.orchestrator.repositories import ProjectRepository, TaskRepository, TaskRunRepository
@@ -86,5 +87,15 @@ async def test_approved_candidate_is_committed_completed_and_checkpointed(tmp_pa
     assert stored is not None and stored.status is TaskStatus.COMPLETE
     assert len(runs) == 1 and runs[0].candidate_commit == state["commit_sha"]
     assert checkpoints and checkpoints > 1
-    assert not any(settings.worktree_root.rglob("src"))
+    # The task's own worktree is gone (concern 34). What remains under
+    # WORKTREE_ROOT is the project's integration worktree (concern 51), which
+    # belongs to no run and is deliberately kept: it holds the cumulative
+    # baseline's checkout and the dependency tree cumulative verification needs.
+    task_trees = [
+        path
+        for project_dir in settings.worktree_root.iterdir()
+        for path in project_dir.iterdir()
+        if path.is_dir() and path.name != INTEGRATION_WORKTREE_DIR
+    ]
+    assert task_trees == []
     engine.dispose()

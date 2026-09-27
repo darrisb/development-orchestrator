@@ -93,9 +93,26 @@ class Task:
     files_to_modify: list[str] = field(default_factory=list)
     files_to_create: list[str] = field(default_factory=list)
     limits: TaskLimits = field(default_factory=TaskLimits)
+    #: An accepted candidate commit of this task that is *not* in the project's
+    #: cumulative integration baseline (concern 51). ``None`` -- the normal case
+    #: -- means nothing of this task is outstanding: either it integrated, or it
+    #: produced nothing to integrate. While it is set, the task is COMPLETE and
+    #: its work is real, but the tree the next task starts from does not contain
+    #: it, so nothing that depends on this task may run.
+    unintegrated_commit: str | None = None
     id: UUID = field(default_factory=_new_id)
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+    @property
+    def is_integrated(self) -> bool:
+        """Whether this task's accepted output is in the baseline.
+
+        True for a task that never produced anything to integrate, which is the
+        honest answer: the invariant is about a tree containing a dependency's
+        work, and a dependency with no work of its own cannot be missing from it.
+        """
+        return self.unintegrated_commit is None
 
     @property
     def allowed_paths(self) -> list[str]:
@@ -315,6 +332,16 @@ class ModelRun:
     duration_ms: int | None = None
     prompt_artifact: str | None = None
     response_artifact: str | None = None
+    #: The failure, sanitized and bounded. ``None`` on a call that returned.
+    #: Present on every call that raised, including one whose turn was rolled
+    #: back: the call happened, and whether the workflow kept the rest of the
+    #: turn says nothing about that.
+    error_detail: str | None = None
+    #: Which coding attempt made this call. The turn is charged when the call is
+    #: made, so this is what a rollback must not be allowed to erase.
+    attempt: int | None = None
+    #: Which review cycle the call answered.
+    review_cycle: int | None = None
     id: UUID = field(default_factory=_new_id)
     started_at: datetime | None = None
     completed_at: datetime | None = None

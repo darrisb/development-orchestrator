@@ -110,6 +110,9 @@ class ModelRunRepository(Repository[ModelRunRow, ModelRun]):
             duration_ms=row.duration_ms,
             prompt_artifact=row.prompt_artifact,
             response_artifact=row.response_artifact,
+            error_detail=row.error_detail,
+            attempt=row.attempt,
+            review_cycle=row.review_cycle,
             started_at=row.started_at,
             completed_at=row.completed_at,
         )
@@ -126,6 +129,9 @@ class ModelRunRepository(Repository[ModelRunRow, ModelRun]):
             duration_ms=model_run.duration_ms,
             prompt_artifact=model_run.prompt_artifact,
             response_artifact=model_run.response_artifact,
+            error_detail=model_run.error_detail,
+            attempt=model_run.attempt,
+            review_cycle=model_run.review_cycle,
             started_at=model_run.started_at,
             completed_at=model_run.completed_at or datetime.now(UTC),
         )

@@ -458,6 +458,74 @@ async def test_the_approved_run_leaves_a_readable_history(
     assert events.index(RunEventType.BUILD_FAILED) < events.index(RunEventType.FIX_STARTED)
 
 
+def _outcomes_recorded(session: Session, run: TaskRun) -> list[str]:
+    """Every outcome value the run's event log recorded, in order."""
+    return [
+        str(event.payload.get("outcome"))
+        for event in RunEventRepository(session).list_for_run(run.id)
+        # StrEnum compares equal to its value; the domain model carries a str.
+        if event.event_type == RunEventType.OUTCOME_RECORDED
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_approved_run_is_never_recorded_as_rejected(
+    session: Session,
+    workspace: TaskWorkspace,
+    run: TaskRun,
+    loop_settings: Settings,
+):
+    """Concern 48: the loop must not write a terminal outcome for an approval.
+
+    An approved run has not settled when the loop ends -- its candidate is
+    uncommitted and delivery is the workflow's next step -- and the function
+    that records a settled outcome maps everything that is not an escalation to
+    "rejected". So an approval used to acquire a durable "rejected" record that
+    delivery then corrected, and a crash in between left the history asserting
+    the opposite of what happened.
+    """
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=ScriptedModel(_code(WORKING)),
+        reviewer=reviewer(_review()),
+        settings=loop_settings,
+    )
+
+    assert result.outcome is LoopOutcome.APPROVED
+    recorded = _outcomes_recorded(session, run)
+    assert "rejected" not in recorded
+    # The provisional record stands instead, which is what a run awaiting
+    # delivery actually is. Delivery replaces it with "accepted".
+    assert recorded == ["in_progress"]
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_run_is_still_recorded_as_rejected(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    run: TaskRun,
+    loop_settings: Settings,
+):
+    """The other direction: concern 48's fix must not silence a real rejection."""
+    changes = _review(
+        decision="CHANGES_REQUESTED",
+        summary="Still wrong.",
+        issues=[_MISSING_GUARD],
+    )
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=ScriptedModel(_code(WORKING), _code(WORKING), _code(WORKING)),
+        reviewer=reviewer(changes, changes, changes),
+        settings=loop_settings,
+    )
+
+    assert result.outcome is LoopOutcome.ESCALATED
+    assert "escalated" in _outcomes_recorded(session, run)
+
+
 # --- the exit condition, clause two -----------------------------------------
 
 

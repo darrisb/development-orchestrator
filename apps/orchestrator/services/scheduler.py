@@ -7,6 +7,7 @@ database always yields the same choice.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from uuid import UUID
@@ -64,16 +65,33 @@ def _sort_key(task: Task) -> tuple[int, int, str]:
 
 def evaluate_project_readiness(session: Session, project_id: UUID) -> ReadinessReport:
     """Classify the project's tasks without writing anything."""
-    tasks = TaskRepository(session).list_for_project(project_id)
+    repository = TaskRepository(session)
+    tasks = repository.list_for_project(project_id)
     graph = {task.external_task_id: tuple(task.depends_on) for task in tasks}
     statuses = {task.external_task_id: task.status for task in tasks}
-    return evaluate_readiness(graph, statuses)
+    return evaluate_readiness(
+        graph, statuses, unintegrated=_unintegrated(tasks)
+    )
+
+
+def _unintegrated(tasks: Iterable[Task]) -> frozenset[str]:
+    """Tasks whose accepted output is not in the integration baseline.
+
+    Concern 51's second half: ``COMPLETE`` says a task was done and this says
+    whether its work is in the tree the next task would start from. A dependency
+    needs both, so this set is what turns a blocked integration into a scheduling
+    fact instead of a log line.
+    """
+    return frozenset(
+        task.external_task_id for task in tasks if task.unintegrated_commit is not None
+    )
 
 
 def refresh_readiness(session: Session, project_id: UUID) -> ReadinessReport:
     """Persist the READY/BLOCKED consequences of the current dependency state.
 
-    A task whose dependencies are all ``COMPLETE`` becomes ``READY``; one whose
+    A task whose dependencies are all ``COMPLETE`` *and in the integration
+    baseline* becomes ``READY``; one whose
     dependencies cannot currently be satisfied becomes ``BLOCKED``. A task that
     was already ``READY`` but is now waiting on an incomplete dependency -- only
     possible after a manifest re-sync widened its dependencies -- is also moved
@@ -83,7 +101,11 @@ def refresh_readiness(session: Session, project_id: UUID) -> ReadinessReport:
     tasks = TaskRepository(session)
     by_id = {task.external_task_id: task for task in tasks.list_for_project(project_id)}
     graph = {task_id: tuple(task.depends_on) for task_id, task in by_id.items()}
-    report = evaluate_readiness(graph, {k: task.status for k, task in by_id.items()})
+    report = evaluate_readiness(
+        graph,
+        {k: task.status for k, task in by_id.items()},
+        unintegrated=_unintegrated(by_id.values()),
+    )
 
     for task_id in report.ready:
         task = by_id[task_id]
@@ -99,6 +121,7 @@ def refresh_readiness(session: Session, project_id: UUID) -> ReadinessReport:
                 project_id=str(project_id),
                 task=task_id,
                 blocked_by=list(unsatisfiable),
+                unintegrated_dependencies=list(report.unintegrated.get(task_id, ())),
             )
 
     # A task merely waiting its turn stays PENDING; only one already promoted to

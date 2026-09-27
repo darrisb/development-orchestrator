@@ -145,6 +145,19 @@ candidate-patch restore -- written for a different reason -- which in turn
 removed concern 29's cause. Both properties are now pinned by tests, because a
 property that holds by accident is a property that stops holding.
 
+Then the first task was driven end to end by a configured local coder and
+reviewer, against a real repository, and that found three defects the whole
+suite had not (48, 49, 50). An approved run acquired a durable `rejected`
+outcome in the window before delivery committed it, so a crash there would have
+left the history asserting the opposite of what happened. Every event in a turn
+carried the timestamp its *transaction* began -- PostgreSQL's `now()` does not
+advance inside one -- which put `TESTS_PASSED` 79 seconds before the tests ran.
+And a reviewer that simply omitted `confidence` skipped the confidence gate
+entirely, silently, because an absent value is not a parse error; that one had a
+test asserting the behaviour was correct. Worth stating plainly: two of these
+were invisible to scripted-response testing by construction, and the third was
+protected by a test. A green suite was not evidence.
+
 ## Layout
 
 | Path | Contents |

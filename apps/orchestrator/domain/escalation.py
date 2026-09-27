@@ -60,6 +60,15 @@ class EscalationIntent(StrEnum):
     COMPLETED_BY_HAND = "COMPLETED_BY_HAND"
     #: Stop working on this task. Nothing of it is delivered.
     ABANDON_TASK = "ABANDON_TASK"
+    #: Try again to put an already accepted candidate into the cumulative
+    #: integration baseline (concern 51). The one intent that changes nothing
+    #: about the task: it is already ``COMPLETE`` with a reviewed candidate on
+    #: its branch, and what failed was the merge or the verification of the
+    #: merged tree. A person resolves that -- on the task branch, or by moving
+    #: the baseline -- and this re-runs the same deterministic gate over the
+    #: result. The orchestrator never resolves a conflict itself and never asks
+    #: the coding model to.
+    RETRY_INTEGRATION = "RETRY_INTEGRATION"
 
 
 class EscalationOption(str):
@@ -270,13 +279,121 @@ def run_escalation_options(reason: FailureReason) -> tuple[EscalationOption, ...
     )
 
 
+#: What is true of the repository when an integration is blocked, and it is
+#: unlike either of the two above: nothing was rolled back and nothing is
+#: uncommitted. The candidate is committed, tagged and reviewed on its own
+#: branch; the only thing that did not happen is the baseline moving.
+INTEGRATION_PRESERVED = (
+    "The candidate is committed on {branch} at {candidate} and is tagged; "
+    "nothing has been rolled back and the task stays COMPLETE. The cumulative "
+    "baseline {integration_branch} is unchanged at {baseline}, so later tasks "
+    "still start from the last state known to work. The imported branch is "
+    "untouched, as always."
+)
+
+
+def integration_escalation_options() -> tuple[EscalationOption, ...]:
+    """The one decision a blocked integration can offer (concern 51).
+
+    Deliberately a single actionable option. The alternatives an operator has
+    are all *outside* the orchestrator -- resolve the conflict on the task
+    branch, change the baseline, or leave the dependents blocked and deal with
+    the task by hand -- and each of them ends at the same question: does the
+    accepted candidate now go into the baseline? That is a gate this system can
+    run deterministically, so it is the only thing it offers to do.
+
+    What is *not* offered is as much of the design as what is. Retrying the task
+    would throw away a reviewed candidate; failing it would mark delivered work
+    as failed; and accepting the candidate into the baseline without merging it
+    would be the orchestrator asserting something untrue about the tree. An
+    operator who wants none of this dismisses the escalation, and the dependents
+    stay blocked -- which is the safe direction.
+    """
+    return (
+        EscalationOption(
+            "A",
+            EscalationIntent.RETRY_INTEGRATION,
+            "Resolve the blockage by hand -- merge the baseline into the task "
+            "branch, or move the baseline -- and then re-attempt the "
+            "integration. The accepted candidate must remain in the history "
+            "that gets integrated; the same merge and the same cumulative "
+            "verification run again, and the baseline moves only if both pass.",
+        ),
+    )
+
+
+def render_integration_escalation(
+    *,
+    external_task_id: str,
+    branch: str,
+    candidate_commit: str,
+    baseline_sha: str,
+    integration_branch: str,
+    blocker: str,
+    conflicts: Sequence[str] = (),
+    failed_commands: Sequence[str] = (),
+    dependents: Sequence[str] = (),
+    options: Sequence[str] = (),
+) -> str:
+    """The page for a candidate that was accepted and would not integrate.
+
+    Section 24's rule again -- nobody should have to reconstruct the history --
+    but the history that matters here is not the run's attempts. It is what
+    composed and what did not: which commit is outstanding, which baseline it
+    would not join, what Git or the verifier said, and *which tasks are now
+    waiting on this*. That last list is the consequence a person would otherwise
+    discover by wondering why the orchestrator has stopped picking work up.
+    """
+    sections = [
+        f"TASK {external_task_id} — INTEGRATION BLOCKED",
+        "",
+        "Reason:",
+        "The candidate passed verification and review and was accepted, but it "
+        "could not be folded into the cumulative integration baseline. The task "
+        "is complete; the baseline is not what it would have been.",
+        "",
+        "Current blocker:",
+        blocker,
+    ]
+    if conflicts:
+        sections.extend(["", render_bullet_list("Conflicting paths", list(conflicts))])
+    if failed_commands:
+        sections.extend(
+            ["", render_bullet_list("Failing commands over the merged tree", list(failed_commands))]
+        )
+    sections.extend(
+        [
+            "",
+            render_bullet_list(
+                "Blocked until this is resolved",
+                list(dependents)
+                or ["no task depends on this one, so nothing is waiting on it"],
+            ),
+            "",
+            render_bullet_list("Options", list(options)),
+            "",
+            "Current repository:",
+            INTEGRATION_PRESERVED.format(
+                branch=branch,
+                candidate=candidate_commit,
+                integration_branch=integration_branch,
+                baseline=baseline_sha,
+            ),
+        ]
+    )
+    return "\n".join(sections)
+
+
 __all__ = [
+    "INTEGRATION_PRESERVED",
     "WORKTREE_PRESERVED",
     "WORKTREE_ROLLED_BACK",
     "EscalationIntent",
     "EscalationOption",
+    "integration_escalation_options",
     "option_for_intent",
     "option_labels",
+    "render_integration_escalation",
     "render_run_escalation",
     "run_escalation_options",
 ]

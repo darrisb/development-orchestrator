@@ -70,13 +70,19 @@ def resume_task(session: Session, task_id: UUID) -> Task:
         # it here would let the scheduler open a second run for the same task.
         return task
 
-    statuses = {
-        candidate.external_task_id: candidate.status
+    # A dependency is satisfied only when it is complete *and* its accepted work
+    # is in the integration baseline (concern 51). Resuming is one of the places
+    # a task is promoted without the scheduler's readiness pass, so it has to
+    # apply the same rule or a resume would smuggle a task past a blocked
+    # dependency.
+    satisfied = {
+        candidate.external_task_id
         for candidate in tasks.list_for_project(task.project_id)
+        if candidate.status is TaskStatus.COMPLETE and candidate.is_integrated
     }
     target = (
         TaskStatus.READY
-        if all(statuses.get(dependency) is TaskStatus.COMPLETE for dependency in task.depends_on)
+        if all(dependency in satisfied for dependency in task.depends_on)
         else TaskStatus.PENDING
     )
     return tasks.transition(task.id, target)

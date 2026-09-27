@@ -13,6 +13,7 @@ from ..domain.workflow import effect_of
 from ..repositories import EscalationRepository, TaskRepository
 from ..services.delivery import complete_by_hand, deliver_escalated_candidate
 from ..services.errors import EntityConflict, EntityNotFound
+from ..services.integration import retry_integration
 from ..services.workspace import attach_workspace
 from ..services.worktrees import release_for_run
 
@@ -64,6 +65,18 @@ def apply_escalation_answer(
         raise EntityNotFound("Task", existing.task_id)
     effect = effect_of(intent)
     run_id = existing.task_run_id
+
+    if effect.retry_integration:
+        # The task is already COMPLETE and stays so, whether this succeeds or
+        # not (concern 51). What the answer authorises is one more attempt at the
+        # cumulative gate; if it fails again, `integrate_candidate` blocks again
+        # and opens a new escalation, so the condition never disappears quietly.
+        if run_id is None:
+            raise EntityConflict(
+                "This escalation has no run, so there is no candidate to integrate"
+            )
+        retry_integration(session, run_id, settings=config)
+        return answered
 
     if effect.commit_candidate:
         if run_id is None:

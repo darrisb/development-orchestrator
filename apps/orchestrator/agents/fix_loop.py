@@ -96,6 +96,11 @@ from ..services import artifact_store
 from ..services.verification import verify_candidate
 from ..services.workspace import TaskWorkspace, load_run_context, rollback_workspace
 from .coding_agent import CodingAttempt, run_coding_attempt
+from .loop_recovery import (
+    Fingerprint,
+    RecoveredLoopState,
+    recover_loop_state,
+)
 from .review_agent import ESCALATION_ARTIFACT, ReviewOutcome, run_review
 
 logger = get_logger(__name__)
@@ -228,18 +233,18 @@ class FixLoopResult:
     #: True when the worktree was reset to the run's starting commit.
     rolled_back: bool = False
     artifacts: Mapping[str, str] = field(default_factory=dict)
+    #: Coding attempts begun, across every process this run has been in. Not
+    #: ``len(iterations)``: after a resume that counts the turns this process
+    #: made, and would report one attempt for a run that made three.
+    attempts_used: int = 0
+    #: Reviews that returned a verdict, across every process.
+    cycles_used: int = 0
+    #: The state this run was resumed from, when it was resumed.
+    recovery: RecoveredLoopState | None = None
 
     @property
     def approved(self) -> bool:
         return self.outcome is LoopOutcome.APPROVED
-
-    @property
-    def attempts_used(self) -> int:
-        return len(self.iterations)
-
-    @property
-    def cycles_used(self) -> int:
-        return sum(1 for iteration in self.iterations if iteration.review is not None)
 
     @property
     def final(self) -> FixIteration | None:
@@ -264,6 +269,7 @@ class FixLoopResult:
             "cycles_used": self.cycles_used,
             "rolled_back": self.rolled_back,
             "escalation_id": str(self.escalation.id) if self.escalation else None,
+            "recovery": self.recovery.describe() if self.recovery else None,
             "iterations": [iteration.describe() for iteration in self.iterations],
         }
 
@@ -300,6 +306,14 @@ async def run_fix_loop(
         max_attempts: lowers the task's own ``max_attempts`` for this run.
             It can only lower it: a caller must not be able to talk the loop
             into more attempts than the task's manifest allows.
+        initial_feedback: what a human asked for when the run was opened. Only
+            read when no reviewer has asked for anything: from the first
+            ``CHANGES_REQUESTED`` on, the findings in ``reviews`` are the
+            instruction, and they are the ones that are still on the record.
+        checkpoint_turn: makes the turn so far durable. Called after every
+            turn, and handed down to every model call as the checkpoint it
+            makes, so a provider failure cannot roll away the record of the
+            call that failed.
 
     Returns:
         The result. Approved means a reviewer accepted the candidate and the
@@ -315,15 +329,35 @@ async def run_fix_loop(
     config = settings or get_settings()
     run, task, project = load_run_context(session, workspace.task_run_id)
     runs = TaskRunRepository(session)
-    # Attempt numbers continue the run rather than restarting at one. A run
-    # opened at attempt 2 -- a retry of work that was already tried once --
-    # would otherwise file its first turn under the attempt it inherited and its
-    # second under the same number again, and the two would share a directory.
-    first = max(1, run.attempt_number)
+    # Where this run actually is, read from what survived. On a first
+    # invocation this is attempt 1, cycle 1 and no feedback, which is not a
+    # special case: there is no record to read. On a resume it is the attempt
+    # after the last one begun, the cycle the last one was for, and the
+    # findings of the last reviewer who asked for anything -- so a correction
+    # that was interrupted comes back as the same correction rather than as a
+    # blank first try.
+    recovered = recover_loop_state(
+        session, run, settings=config, initial_feedback=initial_feedback
+    )
+    # Attempt numbers continue the run rather than restarting at one, and they
+    # only ever move forward: a run that died mid-attempt resumes at the next
+    # number, not at the one whose directory it would otherwise overwrite.
+    first = max(1, recovered.next_attempt)
     ceiling = min(task.limits.max_attempts, max_attempts or task.limits.max_attempts)
 
     iterations: list[FixIteration] = []
-    feedback = initial_feedback
+    fingerprints: list[Fingerprint] = list(recovered.fingerprints)
+    feedback = recovered.feedback
+    # What a reader of the outcome is told. Counted from the durable records
+    # and incremented per turn, rather than measured from ``iterations``,
+    # which is empty after a resume and would report one attempt for a run
+    # that made three.
+    attempts_used = recovered.attempts_started
+    # Reviews that returned a verdict. A cycle is charged when the reviewer
+    # answers, not when the loop starts one, so a run that died waiting on a
+    # reviewer is resumed inside the same cycle instead of being charged for
+    # a review that never happened.
+    cycles_used = recovered.reviews_completed
     started_at = run.started_at or datetime.now(UTC)
     if started_at.tzinfo is None:
         started_at = started_at.replace(tzinfo=UTC)
@@ -333,40 +367,77 @@ async def run_fix_loop(
         started_at + timedelta(seconds=config.worker_timeout_seconds),
     )
 
+    def settle(**kwargs: object) -> FixLoopResult:
+        """Settle the loop with the durable counts, not this process's view."""
+        return _settle(
+            session,
+            workspace,
+            run,
+            task,
+            project,
+            iterations,
+            outcome=kwargs["outcome"],
+            config=config,
+            reason=kwargs.get("reason"),
+            escalation=kwargs.get("escalation"),
+            rollback=bool(kwargs.get("rollback")),
+            attempts_used=attempts_used,
+            cycles_used=cycles_used,
+            recovered=recovered,
+        )
+
+    if first > ceiling:
+        # A resumed run whose attempts are already spent must not re-make the
+        # turn it was interrupted in: the interruption is not a free retry. The
+        # budget is the task's, and it is spent.
+        logger.warning(
+            "fix_loop_attempts_already_spent",
+            run_id=str(run.id),
+            task=task.external_task_id,
+            attempts_started=attempts_used,
+            ceiling=ceiling,
+            interrupted_attempt=recovered.interrupted_attempt,
+        )
+
     for number in range(first, ceiling + 1):
         if deadline_exceeded(effective_deadline):
-            return _settle(
-                session,
-                workspace,
-                run,
-                task,
-                project,
-                iterations,
+            return settle(
                 outcome=LoopOutcome.ESCALATED,
                 reason=FailureReason.RETRY_EXHAUSTED,
-                config=config,
             )
-        if number > first:
-            # The attempt number is advanced before the attempt, not after it:
-            # everything the attempt writes is filed under it, so a run that
-            # dies mid-attempt still has its artifacts under the attempt that
-            # was being made rather than the one before.
+        # The attempt number is advanced before the attempt, not after it:
+        # everything the attempt writes is filed under it, so a run that dies
+        # mid-attempt still has its artifacts under the attempt that was being
+        # made rather than the one before. Written whenever the row disagrees,
+        # not only for a second turn: after a resume the row is behind the loop
+        # and skipping the update would file this turn under the attempt before
+        # the one that was interrupted.
+        if number != run.attempt_number:
             run = runs.update_fields(run.id, attempt_number=number)
             _emit(
                 session, run, task, project, RunEventType.FIX_STARTED,
                 {
                     "attempt": number,
                     "of": ceiling,
-                    "cycle": run.review_cycle + 1,
-                    "after": iterations[-1].stage,
+                    "cycle": recovered.cycle,
+                    "after": iterations[-1].stage if iterations else "recovered state",
                     "failure_reason": (
                         iterations[-1].failure_reason.value
-                        if iterations[-1].failure_reason
+                        if iterations and iterations[-1].failure_reason
                         else None
                     ),
+                    "recovered": recovered.recovered,
+                    "interrupted_attempt": recovered.interrupted_attempt,
                 },
             )
-        cycle = run.review_cycle + 1
+        # A review cycle is spent when a reviewer answers, and that is counted
+        # on the run, so the cycle for this turn is one past the reviews that
+        # are actually on the record. Re-read every turn: the answer to the
+        # previous turn was written by the reviewer, and it is what makes the
+        # next turn a different cycle. ``recovered.reviews_completed`` is the
+        # floor for the same reason -- if a verdict was committed but the count
+        # was not, the count is wrong and the rows are not.
+        cycle = max(run.review_cycle, recovered.reviews_completed) + 1
 
         iteration = await _turn(
             session,
@@ -382,8 +453,24 @@ async def run_fix_loop(
             config=config,
             policy=policy,
             secrets=secrets,
+            checkpoint_call=checkpoint_turn,
         )
         iterations.append(iteration)
+        # The attempt was made, and charged, whether or not it succeeded: it
+        # cost a provider call and left a directory. Charged here rather than
+        # derived from the loop's own length so that a rollback upstream cannot
+        # make the run look like it had not tried.
+        attempts_used = max(attempts_used, number)
+        if iteration.review is not None:
+            # Same rule as the attempt: a review that answered is spent, and a
+            # resumed run's answer belongs to the same count.
+            cycles_used = max(cycles_used, cycle)
+            fingerprints.append(
+                frozenset(
+                    issue_fingerprint(issue)
+                    for issue in iteration.review.result.blocking_issues
+                )
+            )
         # Both rows are re-read, because the turn advanced them: the agents move
         # the task and count the review cycle against the database, not against
         # the copies held here. A stale status would make the terminal
@@ -404,7 +491,8 @@ async def run_fix_loop(
             checkpoint_turn()
 
         if _reviews_are_stagnant(
-            iterations, limit=config.fix_loop_stagnant_review_limit
+            [*fingerprints],
+            limit=config.fix_loop_stagnant_review_limit,
         ):
             logger.warning(
                 "fix_loop_stagnant_reviews",
@@ -412,40 +500,26 @@ async def run_fix_loop(
                 task=task.external_task_id,
                 consecutive_reviews=config.fix_loop_stagnant_review_limit,
             )
-            return _settle(
-                session,
-                workspace,
-                run,
-                task,
-                project,
-                iterations,
+            return settle(
                 outcome=LoopOutcome.ESCALATED,
                 reason=FailureReason.RETRY_EXHAUSTED,
-                config=config,
             )
 
         if iteration.succeeded:
-            return _settle(
-                session, workspace, run, task, project, iterations,
-                outcome=LoopOutcome.APPROVED, config=config,
-            )
+            return settle(outcome=LoopOutcome.APPROVED)
         if iteration.action is FailureAction.ESCALATE:
-            return _settle(
-                session, workspace, run, task, project, iterations,
+            return settle(
                 outcome=LoopOutcome.ESCALATED,
                 reason=iteration.failure_reason,
                 # A review that escalated has already written the escalation a
                 # person will read, and it can say more than this module can.
                 escalation=iteration.review.escalation if iteration.review else None,
-                config=config,
             )
         if iteration.action is FailureAction.ROLLBACK:
-            return _settle(
-                session, workspace, run, task, project, iterations,
+            return settle(
                 outcome=LoopOutcome.FAILED,
                 reason=iteration.failure_reason,
                 rollback=True,
-                config=config,
             )
         if iteration.action is FailureAction.SEND_TO_CODER and iteration.feedback:
             feedback = _correction_feedback(
@@ -473,20 +547,16 @@ async def run_fix_loop(
             action=iteration.action.value if iteration.action else None,
             has_feedback=iteration.feedback is not None,
         )
-        return _settle(
-            session, workspace, run, task, project, iterations,
+        return settle(
             outcome=LoopOutcome.ESCALATED,
             reason=FailureReason.HUMAN_DECISION_REQUIRED,
-            config=config,
         )
 
     # The attempts the task allows are spent and no reviewer has accepted the
     # candidate. Section 23: after the limit, create a human escalation.
-    return _settle(
-        session, workspace, run, task, project, iterations,
+    return settle(
         outcome=LoopOutcome.ESCALATED,
         reason=FailureReason.RETRY_EXHAUSTED,
-        config=config,
     )
 
 
@@ -508,12 +578,18 @@ async def _turn(
     config: Settings,
     policy: HumanApprovalPolicy | None,
     secrets: Mapping[str, str] | None,
+    checkpoint_call: Callable[[], None] | None = None,
 ) -> FixIteration:
     """Code, verify, review. Stops at the first of the three that has a verdict.
 
     The order is section 17's and the early exits are what make it honest: a
     candidate whose edits were refused has nothing to verify, and one that does
     not compile has nothing a reviewer can say anything useful about.
+
+    ``checkpoint_call`` is handed to each model call so that a call's record is
+    committed the moment it is made. Without it a provider failure takes the
+    record of the call with it, and the resumed run cannot tell an attempt that
+    was made from one that never was.
     """
     attempt = await run_coding_attempt(
         session,
@@ -523,6 +599,8 @@ async def _turn(
         review_feedback=feedback,
         # A correction attempt does not re-plan: see ``run_coding_attempt``.
         plan_required=False if number > 1 else None,
+        review_cycle=cycle,
+        checkpoint_call=checkpoint_call,
     )
     if attempt.failure_reason is not None:
         return _stop(
@@ -554,6 +632,7 @@ async def _turn(
         # the reviewer is shown is re-captured after the commands have run.
         settings=config,
         policy=policy,
+        checkpoint_call=checkpoint_call,
     )
     resolved = _close_unreraised_issues(session, run, task, project, review)
     iteration = FixIteration(
@@ -605,27 +684,23 @@ def _stop(
 
 
 def _reviews_are_stagnant(
-    iterations: Sequence[FixIteration], *, limit: int
+    fingerprints: Sequence[Fingerprint], *, limit: int
 ) -> bool:
     """Whether the last reviews repeated the same blocking findings.
+
+    Takes the per-cycle finding sets rather than the turns, because a resumed
+    run has no turns for the cycles it recovered: comparing only this process's
+    reviews would let a run whose last two reviews asked for the same thing
+    cycle past the limit, one fresh review at a time.
 
     Empty sets never count: repeated approvals are handled by the ordinary
     success route, and repeated human-only decisions already have their own
     policy. Fingerprints deliberately use the same identity as issue closing.
     """
-    if limit <= 0:
+    if limit <= 0 or len(fingerprints) < limit:
         return False
-    reviews = [item.review for item in iterations if item.review is not None]
-    if len(reviews) < limit:
-        return False
-    recent = reviews[-limit:]
-    fingerprints = [
-        frozenset(issue_fingerprint(issue) for issue in review.result.blocking_issues)
-        for review in recent
-    ]
-    return bool(fingerprints[0]) and all(
-        current == fingerprints[0] for current in fingerprints[1:]
-    )
+    recent = fingerprints[-limit:]
+    return bool(recent[0]) and all(current == recent[0] for current in recent[1:])
 
 
 def _correction_feedback(
@@ -712,6 +787,9 @@ def _settle(
     reason: FailureReason | None = None,
     escalation: HumanEscalation | None = None,
     rollback: bool = False,
+    attempts_used: int | None = None,
+    cycles_used: int | None = None,
+    recovered: RecoveredLoopState | None = None,
 ) -> FixLoopResult:
     """Close the loop: the worktree, the run row, the task, the artifact.
 
@@ -721,6 +799,12 @@ def _settle(
     and the condition matters -- a candidate a person has been asked to decide
     about must still be there when they look, so an escalated worktree is
     preserved and only a rejected one is thrown away.
+
+    ``attempts_used`` and ``cycles_used`` arrive from the caller rather than
+    being measured from ``iterations``, because ``iterations`` holds only the
+    turns *this* process made. Deriving them here is what made a resumed run
+    report one attempt for a run that had made several, and made its escalation
+    say "1 of 3 attempts were made" about work that had been tried three times.
     """
     workspace_reset = False
     if rollback:
@@ -743,12 +827,20 @@ def _settle(
             run.id, RunStatus.FAILED, reason.value if reason else None
         )
 
+    attempts = attempts_used if attempts_used is not None else len(iterations)
+    cycles = (
+        cycles_used
+        if cycles_used is not None
+        else sum(1 for iteration in iterations if iteration.review is not None)
+    )
     if outcome is LoopOutcome.ESCALATED and escalation is None:
         escalation = _escalate(
             session, run, task, project, iterations,
             reason=reason or FailureReason.HUMAN_DECISION_REQUIRED,
             rolled_back=workspace_reset,
             config=config,
+            attempts_used=attempts,
+            recovered=recovered,
         )
     _transition(session, task, status)
 
@@ -761,13 +853,25 @@ def _settle(
         failure_reason=reason,
         escalation=escalation,
         rolled_back=workspace_reset,
+        attempts_used=attempts,
+        cycles_used=cycles,
+        recovery=recovered,
     )
     stored = artifact_store.write_json(
         session, run.id, FIX_LOOP_ARTIFACT, result.describe(),
         kind=FIX_LOOP_ARTIFACT, settings=config,
     )
     result = replace(result, artifacts={FIX_LOOP_ARTIFACT: stored.relative_path})
-    _record_outcome(session, run, task, outcome, config=config)
+    if outcome is not LoopOutcome.APPROVED:
+        # Concern 48: an approved run has *not* settled here. Its candidate is
+        # still uncommitted and delivery is the workflow's next step, which is
+        # why the branch above leaves the run RUNNING. Writing a terminal
+        # outcome now would be writing the wrong one -- `_record_outcome` maps
+        # everything that is not an escalation to "rejected" -- and if delivery
+        # or the process then failed, the durable history would say an approved
+        # run was rejected. The provisional "in_progress" from the last turn
+        # boundary stands until delivery replaces it with "accepted".
+        _record_outcome(session, run, task, outcome, config=config)
     logger.info(
         "fix_loop_finished",
         run_id=str(run.id),
@@ -806,6 +910,22 @@ def _record_outcome(
     Best-effort for the same reason as delivery: the run has already been marked
     failed, and failing to write a summary of it must not change that.
     """
+    if outcome is LoopOutcome.APPROVED:
+        # Concern 48, second guard. This function maps everything that is not an
+        # escalation to "rejected", so being called with an approved outcome can
+        # only produce a false record. Refusing here rather than trusting the
+        # caller means the bug cannot come back through a new call site.
+        logger.error(
+            "outcome_recording_refused",
+            run_id=str(run.id),
+            task=task.external_task_id,
+            outcome=outcome.value,
+            detail=(
+                "an approved run has not settled until delivery commits it; "
+                "recording a terminal outcome here would record the wrong one"
+            ),
+        )
+        return
     try:
         from ..services.training import record_outcome
 
@@ -858,6 +978,8 @@ def _escalate(
     reason: FailureReason,
     rolled_back: bool,
     config: Settings,
+    attempts_used: int | None = None,
+    recovered: RecoveredLoopState | None = None,
 ) -> HumanEscalation:
     """Write the escalation for a run no reviewer escalated (section 24).
 
@@ -865,20 +987,29 @@ def _escalate(
     attempt was refused before a reviewer could see it. The review agent's own
     escalation is better where it exists -- it has the reviewer's words -- so
     this is only ever the one nobody else wrote.
+
+    The attempt history is the recovered turns followed by this process's,
+    because after a resume the in-memory list on its own would tell a person
+    that the run tried once when it tried three.
     """
     last = iterations[-1] if iterations else None
+    attempts = attempts_used if attempts_used is not None else len(iterations)
+    history: list[str] = (
+        [turn.summary() for turn in recovered.turns] if recovered else []
+    )
+    history.extend(iteration.summary() for iteration in iterations)
     options = run_escalation_options(reason)
     summary = render_run_escalation(
         external_task_id=task.external_task_id,
         reason=(
-            f"{len(iterations)} of the task's {task.limits.max_attempts} permitted "
+            f"{attempts} of the task's {task.limits.max_attempts} permitted "
             f"attempts were made and none produced a change a reviewer accepted."
             if reason is FailureReason.RETRY_EXHAUSTED
             else "The run reached a decision the orchestrator may not take."
         ),
         requirement=task.instructions or task.title,
         blocker=_blocker(last),
-        attempts=[iteration.summary() for iteration in iterations],
+        attempts=history,
         options=options,
         starting_commit=run.starting_commit,
         rolled_back=rolled_back,
@@ -903,8 +1034,9 @@ def _escalate(
         {
             "escalation_id": str(escalation.id),
             "failure_reason": reason.value,
-            "attempts_used": len(iterations),
+            "attempts_used": attempts,
             "blocker": _blocker(last),
+            "recovered_attempts": len(recovered.turns) if recovered else 0,
         },
     )
     logger.warning(
@@ -913,7 +1045,8 @@ def _escalate(
         task=task.external_task_id,
         escalation_id=str(escalation.id),
         failure_reason=reason.value,
-        attempts_used=len(iterations),
+        attempts_used=attempts,
+        recovered_attempts=len(recovered.turns) if recovered else 0,
     )
     return escalation
 

@@ -162,6 +162,38 @@ def test_a_call_records_what_it_cost(session: Session, run: TaskRun):
     assert stored.prompt_artifact == "runs/RUN-1/prompt.txt"
 
 
+def test_a_call_stamps_when_it_started_not_only_when_it_ended(
+    session: Session, run: TaskRun
+):
+    """A row whose two timestamps contradict its own duration is not evidence.
+
+    This is what the real TraceStack run recorded: four calls, durations of 38 to
+    190 seconds, and ``started_at == completed_at`` on every one of them, because
+    the success path never told the recorder when the call began and the fallback
+    was the completion time. Any arithmetic over the pair -- "when was this
+    model busy", "how long between the review and the fix" -- reads zero from
+    those rows, and a reader who checks the timestamps against ``duration_ms``
+    has every reason to stop believing the table.
+
+    The start is derived from the duration when the caller does not bracket the
+    call, so the two agree by construction rather than by luck.
+    """
+    recorded = record_model_call(
+        session,
+        task_run_id=run.id,
+        config=env_config(),
+        purpose=ModelPurpose.CODE,
+        status=RunStatus.SUCCEEDED,
+        duration_ms=190_126,
+    )
+
+    stored = ModelRunRepository(session).get(recorded.model_run.id)
+    span = (stored.completed_at - stored.started_at).total_seconds() * 1000
+    assert stored.started_at is not None and stored.completed_at is not None
+    assert abs(span - stored.duration_ms) < 1_000, (span, stored.duration_ms)
+    assert stored.started_at < stored.completed_at
+
+
 def test_unreported_usage_is_recorded_as_unknown_rather_than_zero(
     session: Session, run: TaskRun
 ):

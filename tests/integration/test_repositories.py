@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from sqlalchemy.orm import Session
 
@@ -218,6 +220,72 @@ def test_run_events_come_back_in_order(session: Session, project: Project, task:
     assert events[0].payload == {"detail": "TASK_SELECTED"}
     # Sequence is assigned by the repository, independent of timestamp resolution.
     assert [event.sequence for event in events] == [1, 2, 3]
+
+
+def test_each_event_is_stamped_when_it_is_appended(
+    session: Session, project: Project, task: Task
+):
+    """Concern 49: events in one transaction must not share one timestamp.
+
+    ``created_at``'s ``server_default`` is PostgreSQL's ``now()``, which returns
+    the *transaction* timestamp and does not advance inside a transaction. Since
+    concern 36 made each loop turn one transaction, every event in a turn used to
+    carry the moment the turn began -- on the first real run, ``TESTS_PASSED``
+    was stamped 79 seconds before the tests ran. Nothing here commits, so the
+    events below are all in one transaction: distinct timestamps are exactly the
+    property that was missing.
+    """
+    run = TaskRunRepository(session).add(TaskRun(task_id=task.id, run_number=1))
+    repo = RunEventRepository(session)
+    appended = [
+        repo.append(
+            RunEvent(
+                task_run_id=run.id,
+                project_id=project.id,
+                task_id=task.id,
+                event_type=event_type,
+                attempt=1,
+            )
+        )
+        for event_type in (
+            RunEventType.TASK_SELECTED,
+            RunEventType.CONTEXT_BUILT,
+            RunEventType.APPROVED,
+        )
+    ]
+
+    stamps = [event.created_at for event in appended]
+    assert all(stamp is not None for stamp in stamps)
+    assert len(set(stamps)) == len(stamps), "events in one transaction share a timestamp"
+    assert stamps == sorted(stamps)
+    # And the stamps survive the round trip rather than being a Python-side
+    # value the database then overwrote. Compared as naive instants because
+    # SQLite has no timezone-aware column type and drops the offset on read;
+    # PostgreSQL's `timestamptz` keeps it.
+    reread = [event.created_at for event in repo.list_for_run(run.id)]
+    assert [stamp.replace(tzinfo=None) for stamp in reread] == [
+        stamp.replace(tzinfo=None) for stamp in stamps
+    ]
+
+
+def test_an_event_that_carries_its_own_timestamp_keeps_it(
+    session: Session, project: Project, task: Task
+):
+    """A caller that knows when something happened is not overruled."""
+    moment = datetime(2026, 3, 1, 12, 30, tzinfo=UTC)
+    run = TaskRunRepository(session).add(TaskRun(task_id=task.id, run_number=1))
+
+    stored = RunEventRepository(session).append(
+        RunEvent(
+            task_run_id=run.id,
+            project_id=project.id,
+            task_id=task.id,
+            event_type=RunEventType.TASK_SELECTED,
+            created_at=moment,
+        )
+    )
+
+    assert stored.created_at == moment
 
 
 def test_model_metadata_round_trips(session: Session):

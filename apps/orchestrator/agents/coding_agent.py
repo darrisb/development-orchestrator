@@ -24,8 +24,9 @@ the workflow owns the retry ceiling.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from time import monotonic
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -75,6 +76,7 @@ from ..services.code_edits import EditApplication, apply_change_set
 from ..services.context_builder import ContextBuildResult, build_task_context
 from ..services.model_runs import (
     coding_purpose,
+    describe_error,
     ensure_model,
     record_model_call,
     record_response,
@@ -87,6 +89,7 @@ from .prompts import (
     render_coding_instructions,
     render_plan_instructions,
 )
+from .timing import elapsed_ms, started_at
 
 logger = get_logger(__name__)
 
@@ -157,6 +160,8 @@ async def run_coding_attempt(
     review_feedback: str | None = None,
     context: ContextBuildResult | None = None,
     plan_required: bool | None = None,
+    review_cycle: int | None = None,
+    checkpoint_call: Callable[[], None] | None = None,
 ) -> CodingAttempt:
     """Run one coding attempt inside ``workspace``.
 
@@ -175,6 +180,10 @@ async def run_coding_attempt(
             is following now, and asking a complex task to re-plan from scratch
             spends a model call on a plan the coder is not being asked for and
             risks refusing an attempt over an approach that is not the subject.
+        review_cycle: the cycle this attempt is being made for, recorded on
+            every model call it makes.
+        checkpoint_call: committed after each model call's record is written,
+            including before a failure is re-raised. See ``_generate_recorded``.
 
     Raises:
         EntityNotFound: the run, its task or its project is missing.
@@ -236,7 +245,8 @@ async def run_coding_attempt(
     if requires_plan(task) if plan_required is None else plan_required:
         _transition(session, task, TaskStatus.PLANNING)
         plan, assessment, plan_usage = await _request_plan(
-            session, run, task, project, built, provider, policy, sink
+            session, run, task, project, built, provider, policy, sink,
+            review_cycle=review_cycle, checkpoint_call=checkpoint_call,
         )
         if not assessment.approved or assessment.needs_human:
             return _refused_plan_attempt(
@@ -278,6 +288,9 @@ async def run_coding_attempt(
         prompt_artifact=CODER_PROMPT_ARTIFACT,
         response_artifact=CODER_RESPONSE_ARTIFACT,
         sink=sink,
+        attempt=run.attempt_number,
+        review_cycle=review_cycle,
+        checkpoint_call=checkpoint_call,
     )
 
     try:
@@ -394,6 +407,9 @@ async def _request_plan(
     provider: ModelProvider,
     policy: ScopePolicy,
     sink: _ArtifactSink,
+    *,
+    review_cycle: int | None = None,
+    checkpoint_call: Callable[[], None] | None = None,
 ) -> tuple[CodingPlan, PlanAssessment, TokenUsage]:
     """Ask for a plan and validate it (section 14, phase G items 2 and 3)."""
     request = ModelRequest(
@@ -412,6 +428,9 @@ async def _request_plan(
         prompt_artifact=PLAN_PROMPT_ARTIFACT,
         response_artifact=PLAN_RESPONSE_ARTIFACT,
         sink=sink,
+        attempt=run.attempt_number,
+        review_cycle=review_cycle,
+        checkpoint_call=checkpoint_call,
     )
 
     plan = CodingPlan.from_payload(response.data or {})
@@ -622,6 +641,9 @@ async def _generate_recorded(
     prompt_artifact: str,
     response_artifact: str,
     sink: _ArtifactSink,
+    attempt: int | None = None,
+    review_cycle: int | None = None,
+    checkpoint_call: Callable[[], None] | None = None,
 ) -> ModelResponse:
     """Send one request, keep both artifacts, and record the call.
 
@@ -630,22 +652,35 @@ async def _generate_recorded(
     are arithmetic over, and an uncounted call makes both of them quietly
     wrong rather than visibly incomplete.
 
-    A failure is recorded before it is re-raised. How often an endpoint times
-    out is exactly the kind of thing section 35 wants to be able to ask, and
-    a table holding only the calls that worked cannot answer it.
+    A failure is recorded before it is re-raised, and ``checkpoint_call`` is
+    invoked before the re-raise. How often an endpoint times out is exactly the
+    kind of thing section 35 wants to be able to ask, and a table holding only
+    the calls that worked cannot answer it -- but a row written into the
+    transaction that is about to be rolled back cannot answer it either. The
+    checkpoint is what separates "this call failed" from "everything after the
+    last turn boundary was lost": the call happened either way, and the loop's
+    reconstruction reads this row to know an attempt was really made.
     """
     sink.text(prompt_artifact, _render_prompt(request))
+    started = monotonic()
     try:
         response = await provider.generate(request)
-    except Exception:
+    except Exception as error:
         record_model_call(
             session,
             task_run_id=task_run_id,
             config=provider.config,
             purpose=purpose,
             status=RunStatus.FAILED,
+            duration_ms=elapsed_ms(started),
+            started_at=started_at(started),
             prompt_artifact=sink.paths.get(prompt_artifact),
+            error_detail=describe_error(error),
+            attempt=attempt,
+            review_cycle=review_cycle,
         )
+        if checkpoint_call is not None:
+            checkpoint_call()
         raise
     sink.text(response_artifact, response.raw_text)
     record_response(
@@ -656,7 +691,12 @@ async def _generate_recorded(
         purpose=purpose,
         prompt_artifact=sink.paths.get(prompt_artifact),
         response_artifact=sink.paths.get(response_artifact),
+        started_at=started_at(started),
+        attempt=attempt,
+        review_cycle=review_cycle,
     )
+    if checkpoint_call is not None:
+        checkpoint_call()
     return response
 
 

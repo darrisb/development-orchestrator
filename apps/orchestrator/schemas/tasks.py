@@ -45,6 +45,10 @@ class TaskResponse(BaseModel):
     files_to_modify: list[str]
     files_to_create: list[str]
     limits: TaskLimitsResponse
+    #: Set when this task is COMPLETE but its accepted commit is not in the
+    #: integration baseline (concern 51). An operator reading a task that nothing
+    #: downstream will start after should be able to see why from the task.
+    unintegrated_commit: str | None = None
     created_at: datetime | None
     updated_at: datetime | None
 
@@ -60,6 +64,7 @@ class TaskResponse(BaseModel):
             complexity=task.complexity,
             risk_level=task.risk_level,
             status=task.status,
+            unintegrated_commit=task.unintegrated_commit,
             depends_on=list(task.depends_on),
             verify_commands=list(task.verify_commands),
             files_to_inspect=list(task.files_to_inspect),
@@ -77,6 +82,9 @@ class ReadinessResponse(BaseModel):
     ready: list[str]
     blocked: dict[str, list[str]]
     waiting: dict[str, list[str]]
+    #: The subset of ``blocked`` whose cause is an integration a person has to
+    #: resolve, rather than a dependency to re-run (concern 51).
+    unintegrated: dict[str, list[str]] = {}
 
     @classmethod
     def from_domain(cls, report: ReadinessReport) -> ReadinessResponse:
@@ -84,6 +92,9 @@ class ReadinessResponse(BaseModel):
             ready=list(report.ready),
             blocked={key: list(value) for key, value in report.blocked.items()},
             waiting={key: list(value) for key, value in report.waiting.items()},
+            unintegrated={
+                key: list(value) for key, value in report.unintegrated.items()
+            },
         )
 
 

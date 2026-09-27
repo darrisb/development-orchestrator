@@ -486,15 +486,27 @@ def _approval_gates(
             f"the change deletes {len(deleted_paths)} files, more than the "
             f"{policy.max_deleted_files} that may be accepted automatically"
         )
-    if (
-        policy.min_confidence is not None
-        and result.confidence is not None
-        and result.confidence < policy.min_confidence
-    ):
-        reasons.append(
-            f"the reviewer's confidence of {result.confidence:.2f} is below the "
-            f"{policy.min_confidence:.2f} required to accept without a human"
-        )
+    if policy.min_confidence is not None:
+        # Concern 50: an installation that configured a confidence requirement
+        # must not have it disabled by a reviewer that simply omits the field.
+        # The guard used to require a value to be present before comparing it,
+        # so a review with no confidence cleared a gate no confidence could
+        # have cleared -- silently, since a missing value is not a parse error
+        # and left no warning. A stated requirement with no answer is a reason
+        # for a human, not a pass. ``min_confidence is None`` (which is what
+        # ``REVIEW_MIN_CONFIDENCE=0`` resolves to) means no requirement was
+        # stated, and then an absent confidence constrains nothing.
+        if result.confidence is None:
+            reasons.append(
+                f"the reviewer stated no confidence, and this installation "
+                f"requires at least {policy.min_confidence:.2f} to accept "
+                f"without a human"
+            )
+        elif result.confidence < policy.min_confidence:
+            reasons.append(
+                f"the reviewer's confidence of {result.confidence:.2f} is below the "
+                f"{policy.min_confidence:.2f} required to accept without a human"
+            )
     reasons.extend(pending_review_reasons)
     return tuple(dict.fromkeys(reasons))
 

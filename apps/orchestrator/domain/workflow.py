@@ -130,6 +130,12 @@ class ResolutionEffect:
     feedback_to_coder: bool = False
     #: Whether the task will be picked up again by the scheduler.
     reopens_task: bool = False
+    #: Re-attempt the integration of an already accepted candidate (concern 51).
+    #: The only field that authorises something without the task moving at all:
+    #: the task is already ``COMPLETE`` and stays so whether the retry succeeds
+    #: or not. What changes is whether the baseline contains its output, and
+    #: therefore whether anything downstream may run.
+    retry_integration: bool = False
 
     @property
     def completes_task(self) -> bool:
@@ -168,6 +174,19 @@ _EFFECTS: dict[EscalationIntent, ResolutionEffect] = {
     EscalationIntent.ABANDON_TASK: ResolutionEffect(
         intent=EscalationIntent.ABANDON_TASK,
         task_status=TaskStatus.FAILED,
+    ),
+    # Nothing about the task changes: ``task_status`` is where it already is,
+    # and it is named here only because every effect has to say where the task
+    # ends up. ``COMPLETE`` is also terminal in the state machine, which is the
+    # structural reason this intent cannot be anything but a retry of the
+    # integration -- there is no transition out of a delivered task, and there
+    # should not be one (concern 51). The worktree is not released because it
+    # was released at delivery.
+    EscalationIntent.RETRY_INTEGRATION: ResolutionEffect(
+        intent=EscalationIntent.RETRY_INTEGRATION,
+        task_status=TaskStatus.COMPLETE,
+        retry_integration=True,
+        release_worktree=False,
     ),
 }
 

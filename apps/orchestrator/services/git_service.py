@@ -362,6 +362,23 @@ class GitService:
         logger.info("worktree_created", path=str(target), branch=branch)
         return self.for_worktree(target)
 
+    def create_detached_worktree(self, path: str | Path, start_point: str) -> GitService:
+        """Add a linked worktree at ``path`` with no branch checked out.
+
+        The integration worktree (concern 51) is detached so that the branch it
+        will eventually advance is not checked out anywhere: a branch nobody has
+        checked out can be moved with ``force_branch`` after the gates pass, and
+        left alone when they do not.
+        """
+        target = self._validated_worktree_path(path)
+        if target.exists() and any(target.iterdir()):
+            raise WorktreePathRejected(target, "an empty or absent directory")
+        start_sha = self.resolve_sha(start_point)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._run("worktree", "add", "--detach", str(target), start_sha)
+        logger.info("detached_worktree_created", path=str(target), sha=start_sha)
+        return self.for_worktree(target)
+
     def remove_worktree(
         self, path: str | Path, *, force: bool = True, delete_branch: str | None = None
     ) -> None:
@@ -548,6 +565,89 @@ class GitService:
         if clean_untracked:
             self._run("clean", "-fd")
         logger.info("worktree_reset", path=str(self.path), sha=resolved)
+
+    def checkout_detached(self, rev: str) -> str:
+        """Check out ``rev`` with no branch attached. Returns the resolved SHA.
+
+        The integration worktree is always detached (concern 51): a branch that
+        is not checked out anywhere can be moved with ``force_branch`` once the
+        gates have passed, which is what keeps a failed integration from
+        advancing anything.
+        """
+        sha = self.resolve_sha(rev)
+        self._run("checkout", "--detach", sha)
+        return sha
+
+    def merge(self, rev: str, *, message: str) -> str:
+        """Merge ``rev`` into the current HEAD. Returns the resulting SHA.
+
+        Always a real merge attempt with no interactive resolution and no
+        ``rerere``: the result is a function of the two trees, so the same two
+        commits always integrate the same way or fail the same way.
+
+        A fast-forward is allowed and is the normal case, because a candidate
+        built on top of the current baseline contains it already.
+
+        Raises:
+            MergeConflict: the merge left unresolved paths. The merge is aborted
+                first, so the worktree is returned to where it was and the
+                caller's ref is untouched.
+        """
+        result = self._run(
+            *self._identity_flags(),
+            "-c",
+            "rerere.enabled=false",
+            "merge",
+            "--no-edit",
+            "--no-verify",
+            "--message",
+            message,
+            self.resolve_sha(rev),
+            check=False,
+        )
+        if result.exit_code != 0:
+            conflicts = tuple(
+                entry.path for entry in self.get_status() if entry.is_unmerged
+            )
+            self._run("merge", "--abort", check=False)
+            raise MergeConflict(self.path, conflicts or ("unknown",))
+        return self.get_head_sha()
+
+    def contains_commit(self, commit: str, *, ref: str = "HEAD") -> bool:
+        """Whether ``ref``'s history already contains ``commit``.
+
+        The deterministic form of the question "did that work actually land?".
+        Asked instead of trusting an operator's word that a conflict was resolved
+        by hand (concern 51): a commit either is an ancestor of the baseline or
+        it is not, and Git is the only acceptable authority on which.
+
+        Raises:
+            GitError: neither revision resolves.
+        """
+        result = self._run(
+            "merge-base",
+            "--is-ancestor",
+            self.resolve_sha(commit),
+            self.resolve_sha(ref),
+            check=False,
+        )
+        # Exit 1 is the answer "no"; anything else would be a broken repository,
+        # and `resolve_sha` has already proved both revisions exist.
+        return result.exit_code == 0
+
+    def force_branch(self, branch: str, sha: str) -> str:
+        """Point ``branch`` at ``sha``, creating it if it does not exist.
+
+        The only way the integration ref moves. It refuses the project's own
+        branch for the same reason ``commit`` does: the imported branch is the
+        operator's, and advancing it is not this system's decision to make.
+        """
+        assert_safe_ref_component(branch, label="branch")
+        self._assert_writable_branch(branch, "move")
+        resolved = self.resolve_sha(sha)
+        self._run("branch", "--force", branch, resolved)
+        logger.info("branch_moved", branch=branch, sha=resolved)
+        return resolved
 
     def restore_patch(self, base: str, patch: str) -> None:
         """Discard command side effects, then restore the measured candidate."""

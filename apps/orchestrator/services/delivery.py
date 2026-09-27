@@ -43,6 +43,7 @@ from ..domain.state_machine import assert_transition
 from ..repositories import RunEventRepository, TaskRepository, TaskRunRepository
 from .errors import EntityConflict
 from .git_errors import GitError
+from .integration import Integration, integrate_candidate
 from .workspace import (
     TaskWorkspace,
     commit_task_work,
@@ -72,6 +73,14 @@ class Delivery:
     tag: str | None = None
     #: Why the push did not happen, when it did not. ``None`` when it did.
     push_skipped_reason: str | None = None
+    #: What integrating this candidate into the cumulative baseline did
+    #: (concern 51). ``None`` when integration was not attempted.
+    integration: Integration | None = None
+
+    @property
+    def integrated(self) -> bool:
+        """Whether the cumulative baseline now contains this candidate."""
+        return self.integration is not None and self.integration.advanced
 
     def describe(self) -> dict[str, object]:
         return {
@@ -83,6 +92,9 @@ class Delivery:
             "pushed": self.pushed,
             "push_skipped_reason": self.push_skipped_reason,
             "worktree_released": self.released,
+            "integration": (
+                self.integration.describe() if self.integration is not None else None
+            ),
         }
 
 
@@ -166,6 +178,19 @@ def _deliver(
     if tag:
         tag_name = _tag_delivery(workspace, run.attempt_number)
 
+    # Concern 51: fold the accepted candidate into the cumulative baseline, so
+    # the next task starts from it. After the commit and the tag, because those
+    # are this run's own record and must not depend on whether the candidate
+    # composes with everything before it; and before the worktree is released,
+    # because a blocked integration is easier to look at while the tree is still
+    # there. A conflict or a cumulative verification failure leaves the baseline
+    # untouched and is reported, never raised: by this point the candidate is
+    # committed, and the ordering rule of this module is that a later step never
+    # undoes an earlier one.
+    integration = integrate_candidate(
+        session, project, task, run, sha, settings=settings
+    )
+
     pushed = False
     push_skipped: str | None = None
     try:
@@ -218,6 +243,7 @@ def _deliver(
         released=released,
         tag=tag_name,
         push_skipped_reason=push_skipped,
+        integration=integration,
     )
     logger.info("candidate_delivered", **delivery.describe())
     return delivery

@@ -123,6 +123,13 @@ class TaskRow(UUIDPrimaryKey, Timestamps, Base):
     max_files_changed: Mapped[int] = mapped_column(Integer, nullable=False, default=12)
     max_diff_lines: Mapped[int] = mapped_column(Integer, nullable=False, default=1200)
 
+    #: An accepted candidate commit that is not in the cumulative integration
+    #: baseline (concern 51). Runtime state rather than a declarative field, and
+    #: on the task rather than on the run because it is the *task* a dependent
+    #: one is waiting for: readiness reads it without a join, which is what lets
+    #: the invariant be checked on every scheduling pass.
+    unintegrated_commit: Mapped[str | None] = mapped_column(String(64))
+
     project: Mapped[ProjectRow] = relationship(back_populates="tasks")
     runs: Mapped[list[TaskRunRow]] = relationship(
         back_populates="task", cascade="all, delete-orphan"
@@ -396,6 +403,9 @@ class ModelRunRow(UUIDPrimaryKey, Base):
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     prompt_artifact: Mapped[str | None] = mapped_column(String(1024))
     response_artifact: Mapped[str | None] = mapped_column(String(1024))
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    attempt: Mapped[int | None] = mapped_column(Integer)
+    review_cycle: Mapped[int | None] = mapped_column(Integer)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

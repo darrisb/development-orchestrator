@@ -63,6 +63,16 @@ class VerificationType(StrEnum):
     TESTS = "TESTS"
     SECURITY = "SECURITY"
     DIFF_POLICY = "DIFF_POLICY"
+    #: The cumulative gate over the merged tree (concern 51). The same commands
+    #: as the three above, run against a different tree, so they are recorded
+    #: under their own types rather than being filed as another candidate check:
+    #: "did this task's candidate pass" and "did the baseline still pass after
+    #: merging it" are different questions with different answers, and one
+    #: ``TESTS`` row cannot say which one it answered.
+    INTEGRATION_BUILD = "INTEGRATION_BUILD"
+    INTEGRATION_LINT = "INTEGRATION_LINT"
+    INTEGRATION_TESTS = "INTEGRATION_TESTS"
+    INTEGRATION_SECURITY = "INTEGRATION_SECURITY"
 
 
 class VerificationStatus(StrEnum):
@@ -207,6 +217,13 @@ class FailureReason(StrEnum):
     SECURITY_FAILED = "SECURITY_FAILED"
     SCOPE_VIOLATION = "SCOPE_VIOLATION"
     GIT_CONFLICT = "GIT_CONFLICT"
+    #: An accepted candidate that will not go into the cumulative baseline --
+    #: a merge conflict against it, or the merged tree failing the project's own
+    #: verification (concern 51). Not a failure of the task, which is complete
+    #: with a reviewed candidate on its own branch: a failure of *composition*,
+    #: and the only one that has to be resolved before anything that depends on
+    #: the task may run.
+    INTEGRATION_BLOCKED = "INTEGRATION_BLOCKED"
     REVIEW_CHANGES_REQUESTED = "REVIEW_CHANGES_REQUESTED"
     REVIEWER_UNAVAILABLE = "REVIEWER_UNAVAILABLE"
     RETRY_EXHAUSTED = "RETRY_EXHAUSTED"
@@ -251,6 +268,13 @@ class RunEventType(StrEnum):
     #: A training example preserved for an accepted run (section 34).
     TRAINING_CAPTURED = "TRAINING_CAPTURED"
     COMMIT_CREATED = "COMMIT_CREATED"
+    #: The cumulative accepted baseline moved to include this run (concern 51).
+    INTEGRATION_ADVANCED = "INTEGRATION_ADVANCED"
+    #: An accepted candidate could not be integrated -- a merge conflict, or
+    #: cumulative verification failing on the merged tree. The baseline did not
+    #: move, so the next task still starts from the last good state and an
+    #: operator has to resolve this one.
+    INTEGRATION_BLOCKED = "INTEGRATION_BLOCKED"
     PUSH_COMPLETED = "PUSH_COMPLETED"
     TASK_COMPLETED = "TASK_COMPLETED"
     HUMAN_REVIEW_REQUIRED = "HUMAN_REVIEW_REQUIRED"

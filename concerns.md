@@ -6,10 +6,23 @@ to bite during the first real project (build.md phase M); concerns 18–24 came
 out of phase H, 25–33 out of phase I, 34–40 out of phase J, and 41–45 out of
 phase L.
 
+**48–54 are different in kind from everything above them.** Every earlier entry
+was found by reading the code or by driving it with scripted responses. These
+seven were found in the real execution path, and six of them were invisible to
+the whole test suite: the transaction-timestamp collapse (49) needs a
+transaction long enough to notice, the confidence bypass (50) had a test
+asserting the defective behaviour was correct, the integration-baseline
+defect (51) needed a *second* task that depended on a first, and each of 52–54
+needed a real failure rather than a scripted answer — a process that dies
+mid-correction, a provider that times out, a second task to integrate. The
+lesson is recorded here rather than implied: a green suite said nothing about
+any of them, and 51 in particular passed every per-candidate gate while
+producing four accepted candidates that would not merge together.
+
 Resolved entries are kept in place and marked, rather than deleted or
 renumbered: the reasoning is referenced from code comments and tests, and the
 numbers are how they are referenced. **Resolved: 1–12, 16, 18–20, 22–29, 32–36,
-38–39, 41, 43, 46.** **Partly resolved: 30, 45** -- each says which half.
+38–39, 41, 43, 46, 48–54.** **Partly resolved: 30, 45** -- each says which half.
 **Open: 13, 14, 15, 17, 21, 31, 37, 40, 42, 44, 47.**
 
 Every open entry is now a documented limitation rather than an unfinished fix.
@@ -49,6 +62,17 @@ targets (30) -- and established that concern 20's danger had already been
 removed by something written for another reason (the candidate-patch restore),
 which in turn removed concern 29's cause. Both are now pinned by tests, because
 a property that holds by accident is a property that stops holding.
+
+A second pass over the same real run — the one whose first pass produced
+concern 51 — found 52, 53 and 54, and they share a cause: the loop kept the
+state of a run in the process running it. The consequence was a resume that
+restarted the run (52), a record that could not survive the failure it was
+describing (53), and a cumulative gate whose verdict existed only in an event
+payload (54). The fix is the same shape in all three: a run's state is
+reconstructed from the records that must exist anyway, a call commits its own
+row before the exception leaves, and a gate writes through the same repository
+every other gate uses. All three are pinned by tests, and 52's are pinned by a
+real process restart rather than by a simulation of one.
 
 ## 1. A clipped file plus whole-file edits can destroy code — **resolved**
 
@@ -979,3 +1003,466 @@ with the actual configured coder and reviewer, preserve the run metrics, and do
 not cross section 54's production-safe boundary until those ten real-model runs
 meet the same outcomes. This is an operator validation boundary, not an open
 code blocker.
+
+## 48. An approved run acquired a durable `rejected` outcome before delivery — **resolved**
+
+**Found in the real execution path**, on the first task driven by a configured
+local model (TS-101, `RUN-20260927-000001`). Unlike the entries above it, this
+was not read out of the code: the run's own event log showed it.
+
+`_settle` called `_record_outcome` for every terminal outcome, and
+`_record_outcome` maps everything that is not an escalation to `"rejected"` --
+including `APPROVED`. So an approved run's `outcome.json` and its
+`OUTCOME_RECORDED` event both said `rejected`, and only the later delivery step
+replaced them with `accepted`:
+
+``` text
+APPROVED -> record "rejected" -> deliver -> record "accepted"
+```
+
+Observed window: 196ms. A durable `OUTCOME_RECORDED / rejected` row remains in
+that run's history permanently, because the event log is append-only and the
+correction is a *new* event rather than an edit of the old one.
+
+*Why it matters:* the window is the defect, not its width. **If delivery or the
+process fails between the two writes, the durable history asserts the opposite
+of what happened** -- an approved run recorded as rejected, with no escalation
+and no other record contradicting it. That is a correctness and recovery defect,
+and it lands precisely on what concern 41 exists to provide: an accurate account
+of a run that stopped. It also misleads anything counting rejections, which is
+every metric section 35 offers.
+
+*Resolved* by not writing a terminal outcome for an approval at all. The branch
+above it in `_settle` already says why -- an approved run deliberately stays
+`RUNNING` because its candidate is uncommitted and delivery is the workflow's
+next step -- so the honest record for it is the provisional `in_progress` from
+the last turn boundary, which stands until delivery writes `accepted`. Two
+guards, because one call site is one accident away from returning: the call is
+skipped for `APPROVED`, and `_record_outcome` refuses an approved outcome
+outright rather than mapping it to a value it cannot correctly represent. Its
+docstring always said it was "for a run that did not get delivered"; the call
+site simply did not honour that.
+
+## 49. Every event in a turn shared one timestamp, up to 79 seconds early — **resolved**
+
+Also found in the TS-101 run. `run_events.created_at` was written by its
+`server_default` of `func.now()`, and PostgreSQL's `now()` returns the
+*transaction* timestamp: it does not advance within a transaction. Concern 36
+made each code/verify/review turn a single transaction -- correct for recovery,
+and it is what makes this bite, because a longer transaction collapses more
+events onto one instant.
+
+Measured on that run: nine events shared `10:30:32.01` and four shared
+`10:32:17.73`. `TESTS_PASSED` was stamped **79 seconds before the tests
+actually ran**. Confirmed directly against the database: `now()` returned an
+identical value either side of a 300ms sleep while `clock_timestamp()` advanced.
+
+*Why it matters:* section 40's event stream is the record of what the system was
+doing and when. Ordering was never affected -- `sequence` is assigned by the
+repository and is independent of the clock -- so what was unusable was
+elapsed-time analysis, which is exactly what a first real workload is measured
+with. A stage that appears to take zero seconds and another that appears to take
+79 is not a measurement, and the error is silent.
+
+*Resolved* by stamping each event when it is appended, in
+`RunEventRepository.append`, leaving any timestamp a caller supplied intact. The
+clock is the application's rather than `clock_timestamp()` because that function
+is PostgreSQL-only and the test suite runs on SQLite; the `server_default`
+remains as a floor for any row written outside the repository. Note for anyone
+reading timestamps from SQLite: it has no timezone-aware column type and drops
+the offset on read, while PostgreSQL's `timestamptz` keeps it.
+
+## 50. A reviewer that omitted `confidence` silently bypassed the confidence gate — **resolved**
+
+The third defect from the TS-101 run, and the one with a safety consequence
+rather than a bookkeeping one. The reviewer returned no `confidence` field. The
+gate read:
+
+``` python
+if (policy.min_confidence is not None
+        and result.confidence is not None
+        and result.confidence < policy.min_confidence):
+```
+
+so an absent confidence skipped the comparison entirely. A missing value is not
+a parse error either, so `_confidence` returned `None` without appending a
+warning: the review recorded `warnings: []`, and nothing anywhere said the field
+had been absent.
+
+*Why it matters:* the reviewer prompt asks for `confidence` and explains that a
+low-confidence approval is sent to a human, so its absence is a contract
+violation, not an option being declined. An operator who sets
+`REVIEW_MIN_CONFIDENCE=0.6` believing it protects them gets **no protection at
+all** from a model that never emits the field, and no evidence that the gate
+never fired. This is concern 31 in a sharper form: not merely that confidence is
+uncalibrated, but that omitting it is indistinguishable from satisfying it.
+
+*Resolved* by making the absence deterministic instead of silent: when a minimum
+confidence is configured, a review with no confidence is a human-review reason
+naming what was required and not stated. The reason travels the same route as
+every other section 37 gate, so it appears in the routing record and in the
+escalation rather than only in a log.
+
+The fix is deliberately conditional on a requirement having been stated.
+`min_confidence is None` -- which is what `REVIEW_MIN_CONFIDENCE=0` resolves to,
+and what was configured during the TS-101 run -- states no requirement, and then
+an absent confidence constrains nothing and must not escalate. A gate that fired
+when the operator had asked for nothing would be the mirror-image defect, and
+the sort that gets a guard switched off.
+
+The same reasoning applies to the other reviewer-contract fields that came back
+null on that run, `risk` and `reported_task_id`, but their consequences differ
+and neither currently gates acceptance: nothing is decided from them, so an
+omission costs evidence rather than policy. They are worth revisiting when
+something starts deciding on them, and a test pins the direction this one was
+settled in.
+
+## 51. Task dependencies ordered work without sharing it — **resolved**
+
+Found on the first multi-task autonomous run, and the clearest example so far of
+a defect that only a real workload exposes: three tasks completed, every gate
+passed, nothing warned, and the result was still wrong.
+
+`depends_on` constrained *scheduling* and nothing else. `prepare_workspace`
+resolved the project's imported branch as every run's starting point, so a
+dependent task was correctly ordered after its dependency and then handed a tree
+without the dependency's accepted work in it.
+
+Evidence from the TraceStack run:
+
+* TS-101 through TS-104 all recorded `starting_commit 06a0697`.
+* TS-104 depends on TS-103, and its instructions said *reuse `find()` rather
+  than duplicating the search*.
+* TS-103 had added a **public** `find()`. TS-104 could not see it and wrote its
+  own **private** `find()` with the same signature -- which, given its context,
+  is the correct thing to have done. **This is not a model failure**, and reading
+  it as one is how a real orchestration defect gets attributed to quantization.
+* Test counts were non-cumulative: 10, 11, 10 against a baseline of 8, never
+  accumulating.
+* A throwaway merge probe: TS-101 merges, then TS-102, TS-103 and TS-104 all
+  conflict. Four individually verified candidates, collectively un-integrable.
+
+*Why it matters:* the failure is silent and it compounds. Every gate reports
+success, because every gate is per-candidate and each candidate really is
+correct in isolation. What nothing measured was whether the candidates compose,
+so the pile of conflicting branches grows one task at a time and is cheapest to
+address before it grows.
+
+*Resolved* with one ref and one gate.
+
+`domain.git.INTEGRATION_BRANCH` (`agent/integration`) holds the cumulative
+accepted state, under the agent prefix because it is orchestrator-owned by the
+same convention every task branch already is. `prepare_workspace` starts task
+worktrees from it instead of from the imported branch -- the read side of the fix
+is one function called where one line used to resolve `default_branch`, which is
+why candidate diffs, rollback and recovery all followed without changes: they
+were already relative to the run's recorded `starting_commit`.
+
+Delivery then folds an accepted candidate in, after the commit and the tag and
+before the worktree is released. Four properties make that safe:
+
+* **The imported branch is never advanced.** It stays where the operator left
+  it. `GitService` already protected it and `force_branch` refuses it too, so
+  this path cannot move it by mistake. Merging the orchestrator's work into a
+  project's own branch remains what `GitService` always said it was: a human's
+  decision.
+* **The ref moves last.** The integration worktree is always *detached*, so the
+  merge and the cumulative verification both happen on a commit no branch points
+  at, and the ref is moved only once both have passed. There is no window in
+  which the baseline names a tree nobody verified, and nothing has to be rolled
+  back when a gate fails -- the ref simply did not move.
+* **Verification runs over the merged tree.** Two candidates can each pass alone
+  and fail together, which is the whole reason a cumulative baseline needs a gate
+  of its own. The commands are the project's own profile in an ordinary worker
+  under the ordinary policy; nothing here relaxes the sandbox, and the logs are
+  filed under the run whose acceptance triggered them.
+* **A blocked integration is loud and keeps the last good baseline.** A conflict
+  or a cumulative failure records `INTEGRATION_BLOCKED` with the conflicting
+  paths or the failing commands, and the candidate's own commit and tag are
+  untouched -- it is still the run's audit trail. The next task therefore starts
+  from the last state known to work.
+
+In practice the merge is a fast-forward, because a candidate built on the current
+baseline already contains it. The conflict path exists for correctness rather
+than for the common case, and it is tested rather than assumed.
+
+One consequence worth knowing: the integration worktree persists under
+`WORKTREE_ROOT/<project>/_integration` instead of being created and destroyed
+per integration, because the dependency tree cumulative verification needs is
+expensive to copy. It belongs to no run, so `reap` never considers it (that works
+from runs) and the census now excludes it -- otherwise it would be reported
+`unclaimed` for ever, and `unclaimed` is how the census asks for a human.
+
+### What the first fix left open, and how it closed
+
+The paragraph that used to stand here said a blocked integration does not fail
+the task, that an operator has to resolve it, and that until they do *later tasks
+build on the older baseline*. The first two sentences were the right decision.
+The third was a defect with the same shape as the original one: a per-task gate
+reporting success while the composition was wrong.
+
+The hole was precise. A candidate could pass verification, pass review, be
+delivered, be marked `COMPLETE` -- and then conflict, or fail cumulative
+verification. `INTEGRATION_BLOCKED` recorded that, and nothing read it, because
+scheduling reads *state* and an event is a record. `evaluate_readiness` asked
+only "are the dependencies `COMPLETE`?", so a dependent task became eligible and
+was handed a baseline without its dependency's work in it. Unattended, that is
+exactly the TraceStack failure again, reached by a different route: the work is
+ordered correctly and then not shared.
+
+*Resolved* by making the invariant explicit and giving it somewhere to live.
+
+**The invariant.** A dependency is satisfied only when it is `COMPLETE` *and* its
+accepted output is in the current integration baseline. `COMPLETE` answers "was
+this task done"; the new `tasks.unintegrated_commit` answers "is it in the tree",
+and readiness needs both. `NULL` -- every existing row, and every task that
+integrated -- means nothing is outstanding. A task that produced nothing to
+integrate (`COMPLETED_BY_HAND`) is satisfied vacuously, which is not a loophole
+but the honest reading: the invariant is about a tree containing a dependency's
+work, and a dependency with no work of its own cannot be missing from it.
+
+**No new task state, and no new escalation mechanism.** Both were considered and
+both were unnecessary, which is the useful part of the answer. The task stays
+`COMPLETE`: the candidate is real, a reviewer accepted it, and `COMPLETE` is
+terminal in the state machine -- there is no transition out of a delivered task
+and there should not be one. The *dependent* moves to `BLOCKED`, which already
+means "a dependency cannot be satisfied without intervention" and already
+recovers. And the operator-visible condition is an ordinary section 24
+`HumanEscalation`, with reason `INTEGRATION_BLOCKED` and one machine-readable
+intent, `RETRY_INTEGRATION`. Extending the existing table was the whole change:
+`effect_of` gained one row, and `ResolutionEffect` one field.
+
+**One deterministic resolution.** The single option offered is "resolve the
+blockage by hand, then re-attempt the integration", and answering it re-runs the
+same merge and the same cumulative verification. Three cases, checked in order:
+the baseline already contains the candidate, so somebody merged it by hand and
+only the record was wrong; the task branch has moved *on top of* the accepted
+candidate, which is the ordinary resolution and is what gets integrated; or
+neither, and the same commit is merged again. The coding model is never asked to
+resolve a conflict, and a claimed resolution is verified with `merge-base
+--is-ancestor` rather than believed. A branch that no longer contains the
+reviewed commit is refused outright -- otherwise an escalation answer would be a
+way to land unreviewed work, which is the one thing the delivery path exists to
+prevent. A retry that fails again blocks again and opens a *new* escalation: the
+answered one stays answered, because somebody did try, and a condition that is
+still true is a new question.
+
+**Blocking follows the edges.** It is not a project-wide halt. An independent
+task whose chain is unaffected is selected exactly as before, and the readiness
+report separates `unintegrated` from `blocked` so an operator can tell the two
+apart -- a `FAILED` dependency is a task to re-run, and this is delivered work
+whose *integration* needs a person. Down a chain it is transitive for free:
+`BLOCKED` was already an unsatisfiable state.
+
+**Three doors, not one.** Readiness is where the invariant is enforced, and it is
+not the only way a task gets promoted. `resume_task` applies the same rule, so a
+pause and a resume cannot walk a task past a blocked dependency; and
+`prepare_workspace` refuses outright, because the invariant really belongs to the
+*starting commit* and that is the function which resolves one. The third is
+belt-and-braces by design: the scheduler will not select such a task, so it
+should never fire, but it is the door a hand-run single task or a future
+scheduler would otherwise come through.
+
+Everything the first fix promised still holds: the candidate's commit, tag and
+artifacts are untouched, the baseline does not advance on either failure, and the
+imported branch is still the operator's. What is new is that the orchestrator now
+*stops* instead of quietly building on a baseline it knows is incomplete.
+
+The regression tests are in `tests/integration/test_integration_baseline.py`
+under "a blocked integration, and its consequences", parametrised over both
+failure paths, plus the restart, the pause/resume, both resolutions, the retry
+that fails again and the refused branch; the pure eligibility rule is pinned in
+`tests/unit/test_dependencies.py`.
+
+One thing is deliberately *not* offered: a way to declare the divergence
+acceptable and unblock the dependents with the work still outside the baseline.
+It would be one field and it would undo the invariant, so an operator who wants
+that dismisses the escalation -- the dependents stay blocked, which is the safe
+direction -- and deals with the task by hand.
+
+## 52. A resumed run restarts the run instead of continuing it — **resolved**
+
+Found on the same first real run, in the gap left after concern 51's follow-up,
+and the most expensive defect in the file: it does not fail, it spends money.
+
+`run_fix_loop` held its iterations, its reviewer feedback, its attempt
+numbering and the attempt number it was about to use in lists and locals that
+existed only in the process running it, and committed a whole turn at once.
+Nothing in it could answer "where was this run when it stopped", so a process
+that came back for a run that was mid-correction began the run again from the
+beginning — with the same prompt, minus the review.
+
+Evidence from `RUN-20260927-000009` (TS-105), where the reviewer asked for
+corrections and the correction call then timed out after 600 seconds:
+
+* The resumed attempt's prompt (`attempt-1-cycle-2/prompt.txt`) is the original
+  task prompt with the entire *Review feedback to address* section removed — the
+  same prompt, byte for byte, minus the seventeen lines naming the two HIGH
+  findings. The correction was therefore requested a second time from a coder
+  that had been told nothing about the first request.
+* Attempt numbering restarted. The correction was attempt 2; the resume
+  committed as attempt 1.
+* `fix-loop.json` reported `attempts_used: 1, cycles_used: 1`, and
+  `outcome.json` reported `attempts: 1, review_cycles: 2`, for a run that had
+  begun two coding attempts and completed two reviews.
+* The escalation said `RETRY_EXHAUSTED`, which is a claim about a budget nobody
+  had spent.
+
+*Why it matters:* the resume path is not a recovery path at all — it is a second
+attempt that believes it is a first. The reviewer asked for something specific,
+the run spent another attempt without it, and the record reported that the
+budget was healthy. Every gate after that point was measuring the wrong run.
+
+*Resolved* by making the state of a run reconstructable instead of carried.
+
+`agents/loop_recovery.py` reads a run's durable records — its reviews and their
+unresolved issues, its model calls, its events, its own counters, and the
+attempt directories on disk — and returns where the run had got to: the next
+attempt number, the review cycle to resume in, the feedback text to put in the
+prompt, the fingerprints of the last two reviews for the stagnation guard, the
+attempt that was begun and never finished, and the turn history as a whole.
+`run_fix_loop` reconstructs before it does anything else, and the run row is
+read back from the database rather than trusted from the caller, so a run
+recovered by a fresh process and a run recovered by the same one are the same
+code path.
+
+Four properties of the accounting are worth naming separately, because each is a
+distinct way to get this wrong again:
+
+* **A coding attempt is charged when its call starts, not when it finishes.** A
+  run whose provider keeps timing out has to be able to exhaust its budget, and a
+  timeout is precisely the case in which nothing finishes. The evidence is the
+  `model_runs` row written by the call itself (concern 53), and the attempt
+  number on it.
+* **A review cycle is charged when a reviewer answers.** A process that died
+  waiting for the answer spent nothing, and resuming inside the same cycle is
+  the only honest reading. The alternative spends a cycle on a review that never
+  happened, and a task with two cycles silently gets one.
+* **The attempt number advances past the interrupted attempt.** Reusing it would
+  overwrite the artifacts of the attempt that was lost, which is how the resumed
+  prompt in the evidence above ended up filed as though it were a first attempt.
+* **The attempt a review belongs to comes from evidence, not from counting.**
+  Reviews and coding calls are separate tables with no key between them, so the
+  reconstruction pairs each review with the attempt that produced its candidate
+  using the coding calls' own attempt numbers. Guessing it by arithmetic is how an
+  escalation ends up describing a turn that never happened.
+
+Reporting is then read from those records rather than from `len(iterations)`,
+which is empty on a resume. The same numbers now reach `FixLoopResult`,
+`fix-loop.json`, `outcome.json` and the escalation summary, and the recovery
+itself is reported, so a reader can see that a run was resumed instead of
+inferring it from a missing iteration.
+
+The regression tests are in `tests/integration/test_fix_loop_resume.py`. The
+last of the ten is three real interpreters against a file-backed database: one
+sets the run up, one loses the correction to a provider timeout and exits with
+the loop's own commits on disk, and one picks it up. It asserts that the
+resumed prompt carries the reviewer's own words, that the attempt numbering
+neither reused a number nor a directory, that the failed call is on the record
+after the rollback, and that the run finishes approved. Reverting the recovery
+call fails five of the ten, which is the check that they describe something
+rather than decorate it.
+
+One thing deliberately not attempted: a serialized checkpoint, or a
+`loop_state` column. A run's state is already fully derivable from records that
+have to exist anyway, and a second copy of it is a second thing to be wrong.
+
+## 53. A model call that failed left no record, and a slow one said zero — **resolved**
+
+The table that sections 34 and 35 are arithmetic over held only the calls that
+worked.
+
+A failed call was recorded in the same transaction as the turn that raised, so
+the rollback that unwound the turn unwound the record of the call that caused it.
+`model_runs` therefore has no row for a provider that times out, no row for a
+reviewer that cannot be reached, and no row for a response in a shape the parser
+cannot use. A reliability question about a model is not missing from a report
+here — the data is not in the database.
+
+Two smaller untruths sat in the rows that did survive. `duration_ms` defaulted
+to zero for a call that failed, because nothing measured the wait, so a
+600-second timeout and a request that never left the endpoint were the same
+number. And every successful call's `started_at` equalled its `completed_at`,
+because the success path never passed a start time and the fallback was the
+completion instant.
+
+Evidence: `RUN-20260927-000009` has four `model_runs` rows — two `CODE`, two
+`REVIEW` — and none of them is the 600-second correction that cost more than
+every other call in that run put together. The four that do exist each claim a
+duration between 38 and 190 seconds across a zero-width interval between
+`started_at` and `completed_at`.
+
+*Why it matters:* a table that only records the calls a model answered cannot
+distinguish "this model is reliable" from "this model was never asked". The gap
+is not a zero in a report; it is an absence that reads as a zero.
+
+*Resolved* in four parts, and the last two are what make the first two mean
+anything:
+
+* **The failure path records, and measures.** `agents/timing.py` gives every
+  agent one definition of a call's duration, taken from a `monotonic()` origin
+  so that a wall clock stepping under NTP cannot produce a negative duration or
+  an hour-long one. The recorded row carries the failure text through the log
+  redactor — an exception's own `str()` can contain a URL with a key in it — and
+  bounded in length.
+* **The row is committed by the call.** Each model call is checkpointed before
+  the exception is re-raised, which is the last moment at which writing it is
+  possible. This is what separates "this call failed" from "everything after the
+  last turn boundary was lost": the call happened either way. The graph's
+  rollback still rolls back; it just no longer rolls back the fact that a call
+  was made.
+* **The row says where the call sat.** `attempt` and `review_cycle` are on every
+  `model_runs` row, and they are what the loop's reconstruction reads to know an
+  attempt was really begun (concern 52) and which attempt a review belongs to.
+* **The two timestamps agree with the duration.** Callers bracket their calls
+  and pass the start; where one does not, the start is derived from the measured
+  duration rather than left equal to the completion time.
+
+Three nullable columns, so every row written before the revision keeps the
+meaning it already has: `error_detail`, `attempt`, `review_cycle` — migration
+`b7c41d90e2a5`. `NULL` on all three is the ordinary case for a call that
+succeeded, and for every row that predates the revision.
+
+The tests are in `tests/integration/test_fix_loop_resume.py` (a timed-out call
+is on the record after the graph's rollback, and a slow failure reports the time
+it actually took — pinned with a sleep rather than a 600-second wait) and in
+`tests/integration/test_model_runs.py` (the two timestamps agree with the
+duration). The migration is pinned in `tests/integration/test_migrations.py`,
+which now also covers the case a fresh test suite never takes: the upgrade
+applied to a table that already has rows in it, keeping them.
+
+## 54. The cumulative gate ran and wrote nothing down — **resolved**
+
+Concern 51 added a gate that runs the project's own verification over the merged
+tree before the integration ref is allowed to move. Its *decisions* were
+recorded — an event, an artifact, the ref either moved or did not — and the
+checks themselves were not.
+
+`_verify_cumulative` executed the commands in an ordinary worker and discarded
+the results, so `verification_runs` for an integrating run showed the candidate's
+own checks and nothing about the tree that actually decided whether the baseline
+advanced. In the TraceStack run that is eight green rows for the candidate and
+no row at all for the cumulative pass.
+
+*Why it matters:* the cumulative gate is the only gate in the loop whose verdict
+is about the project rather than about a task, and it was the only gate with no
+durable record of its own. A reader could not tell that it had run, which is the
+question a `rejected` candidate's history invites first.
+
+*Resolved* through the existing verification table rather than a new one. Each
+cumulative command is recorded as a `VerificationRun` through the same
+repository, under its own type: `INTEGRATION_BUILD`, `INTEGRATION_LINT`,
+`INTEGRATION_TESTS`, `INTEGRATION_SECURITY`.
+
+The type is the point. Same table, same model, same command text, and a history
+that can answer "this passed on its own" from "this passed together with what
+came before" without parsing the command to find out. The logs stay separate
+from the candidate's own, filed under the run whose acceptance triggered them,
+and the rows are flushed before the ref moves — otherwise a crash between the
+verification and the flush would leave a moved ref with no record of why.
+
+Worth recording as well: the four new enum values needed no migration, because
+`verification_type` is stored as a plain `VARCHAR(32)` rather than a native
+enum. That is the sort of thing the column-comparison test in
+`tests/integration/test_migrations.py` would have caught for free if it had been
+otherwise, which is the argument for having that test at all.

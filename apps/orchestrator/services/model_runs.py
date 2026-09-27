@@ -27,7 +27,7 @@ is not part of a provider's identity.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 from ..config.logging import get_logger
 from ..domain.enums import ModelPurpose, RunStatus
 from ..domain.models import Model, ModelRun
+from ..domain.redaction import Redactor
 from ..providers import ModelResponse, ProviderConfig, TokenUsage
 from ..providers.registry import OPENAI_COMPATIBLE
 from ..repositories import ModelRepository, ModelRunRepository
@@ -45,6 +46,29 @@ logger = get_logger(__name__)
 #: an operator registered. An operator reading the table should be able to
 #: tell which rows they own.
 ENVIRONMENT_SOURCE = "environment"
+
+#: How much of a failure's own text is kept. Enough to name the error and where
+#: it came from; a provider's traceback is not an audit record and pasting one
+#: whole into every failed row is how a table stops being readable.
+MAX_ERROR_DETAIL_CHARS = 500
+
+
+def describe_error(error: BaseException) -> str:
+    """What a failed call's ``error_detail`` says, safe to store.
+
+    Sanitized because this text reaches a database an operator reads and a
+    dashboard they may share, and because an exception's message is whatever
+    the failing library put there -- an ``httpx`` timeout message carries the
+    request URL, and a URL can carry a key. The redactor masks the shapes it
+    recognises and the length is bounded so one pathological traceback cannot
+    dominate the row.
+    """
+    redacted = Redactor.for_values([]).redact(f"{type(error).__name__}: {error}")
+    collapsed = " ".join(redacted.split())
+    if len(collapsed) <= MAX_ERROR_DETAIL_CHARS:
+        return collapsed
+    return collapsed[: MAX_ERROR_DETAIL_CHARS - 1] + "…"
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +138,9 @@ def record_model_call(
     prompt_artifact: str | None = None,
     response_artifact: str | None = None,
     started_at: datetime | None = None,
+    error_detail: str | None = None,
+    attempt: int | None = None,
+    review_cycle: int | None = None,
 ) -> RecordedCall:
     """Record one call to a model, successful or not.
 
@@ -122,6 +149,25 @@ def record_model_call(
     reliability question -- how often does this model time out, how often does
     it answer in a shape we cannot use -- unanswerable from the data (section
     35).
+
+    ``duration_ms`` is measured by the caller, not derived here, because the
+    only value that is true is the time the call actually took: a default of
+    zero for a call that raised is indistinguishable from a call that never
+    reached the endpoint, and a 600-second timeout recorded as zero is worse
+    than no row at all -- it looks like a fact.
+
+    ``attempt`` and ``review_cycle`` say where in the run's work the call sat.
+    They are what makes a call survive as evidence: both are written by the
+    loop before and during a turn, so a rollback that unwinds the turn must not
+    be able to unwind the record of the call that caused it.
+
+    ``started_at`` is the caller's because only the caller knows when the call
+    began. When a caller does not bracket its call, the start is derived from the
+    measured duration rather than left equal to the completion time, because a
+    row saying a three-minute call started when it finished is a row that
+    contradicts itself: section 35 reads ``duration_ms`` and a reader who
+    sanity-checks it against the timestamps would be right to disbelieve the
+    table.
     """
     model = ensure_model(session, config)
     completed = datetime.now(UTC)
@@ -136,7 +182,10 @@ def record_model_call(
             duration_ms=duration_ms,
             prompt_artifact=prompt_artifact,
             response_artifact=response_artifact,
-            started_at=started_at or completed,
+            error_detail=error_detail,
+            attempt=attempt,
+            review_cycle=review_cycle,
+            started_at=started_at or completed - timedelta(milliseconds=duration_ms),
             completed_at=completed,
         )
     )
@@ -150,6 +199,9 @@ def record_model_call(
         duration_ms=duration_ms,
         input_tokens=model_run.input_tokens,
         output_tokens=model_run.output_tokens,
+        attempt=attempt,
+        review_cycle=review_cycle,
+        error_detail=error_detail,
     )
     return RecordedCall(model=model, model_run=model_run)
 
@@ -163,8 +215,17 @@ def record_response(
     purpose: ModelPurpose,
     prompt_artifact: str | None = None,
     response_artifact: str | None = None,
+    started_at: datetime | None = None,
+    attempt: int | None = None,
+    review_cycle: int | None = None,
 ) -> RecordedCall:
-    """Record a successful call from the response it produced."""
+    """Record a successful call from the response it produced.
+
+    ``started_at`` is passed rather than derived from the response because the
+    response's own ``duration_ms`` is measured by the provider client, and the
+    wall-clock bracket around the call is what makes the row's two timestamps
+    agree with it.
+    """
     return record_model_call(
         session,
         task_run_id=task_run_id,
@@ -175,6 +236,9 @@ def record_response(
         usage=response.usage,
         prompt_artifact=prompt_artifact,
         response_artifact=response_artifact,
+        started_at=started_at,
+        attempt=attempt,
+        review_cycle=review_cycle,
     )
 
 
@@ -215,8 +279,10 @@ def _refreshed(models: ModelRepository, model: Model, config: ProviderConfig) ->
 
 __all__ = [
     "ENVIRONMENT_SOURCE",
+    "MAX_ERROR_DETAIL_CHARS",
     "RecordedCall",
     "coding_purpose",
+    "describe_error",
     "ensure_model",
     "record_model_call",
     "record_response",

@@ -28,6 +28,11 @@ FAILURE_POLICY: dict[FailureReason, FailureAction] = {
     # A human owns the decision.
     FailureReason.RETRY_EXHAUSTED: FailureAction.ESCALATE,
     FailureReason.HUMAN_DECISION_REQUIRED: FailureAction.ESCALATE,
+    # Nothing automatic can resolve a blocked integration: the candidate is
+    # already accepted, so retrying the task would discard reviewed work, and
+    # resolving a merge is not something the coding model is asked to do
+    # (concern 51). A person owns it, and the baseline waits.
+    FailureReason.INTEGRATION_BLOCKED: FailureAction.ESCALATE,
 }
 
 

@@ -11,7 +11,18 @@ from ..domain.state_machine import assert_transition
 from .base import Repository
 
 _IMMUTABLE_FIELDS = frozenset(
-    {"id", "project_id", "external_task_id", "status", "created_at", "updated_at"}
+    {
+        "id",
+        "project_id",
+        "external_task_id",
+        "status",
+        "created_at",
+        "updated_at",
+        # Runtime state, like `status`: whether an accepted candidate is in the
+        # integration baseline is a fact about Git (concern 51), and a manifest
+        # re-sync must not be able to assert it. `record_integration` writes it.
+        "unintegrated_commit",
+    }
 )
 
 
@@ -41,6 +52,7 @@ class TaskRepository(Repository[TaskRow, Task]):
                 max_files_changed=row.max_files_changed,
                 max_diff_lines=row.max_diff_lines,
             ),
+            unintegrated_commit=row.unintegrated_commit,
             created_at=row.created_at,
             updated_at=row.updated_at,
         )
@@ -109,6 +121,40 @@ class TaskRepository(Repository[TaskRow, Task]):
             setattr(row, key, value)
         self.session.flush()
         return self._to_domain(row)
+
+    def record_integration(self, task_id: UUID, *, unintegrated_commit: str | None) -> Task:
+        """Record whether this task's accepted output is in the baseline.
+
+        Written only by the integration path (concern 51): ``None`` when the
+        baseline advanced to include the candidate, and the candidate's SHA when
+        it did not. Separate from ``update_fields`` because this is runtime state
+        derived from Git rather than anything the manifest may say, and separate
+        from ``transition`` because the task's own status does not change -- a
+        blocked integration leaves a delivered task ``COMPLETE``.
+
+        Raises:
+            LookupError: no such task.
+        """
+        row = self._get_row(task_id)
+        if row is None:
+            raise LookupError(f"Task {task_id} not found")
+        row.unintegrated_commit = unintegrated_commit
+        self.session.flush()
+        return self._to_domain(row)
+
+    def unintegrated_external_ids(self, project_id: UUID) -> frozenset[str]:
+        """Ids of this project's tasks with output outside the baseline.
+
+        The set readiness needs (concern 51), as one query rather than a scan of
+        loaded rows: it is read on every scheduling pass.
+        """
+        rows = self.session.scalars(
+            select(TaskRow.external_task_id).where(
+                TaskRow.project_id == project_id,
+                TaskRow.unintegrated_commit.is_not(None),
+            )
+        ).all()
+        return frozenset(rows)
 
     def transition(self, task_id: UUID, new_status: TaskStatus) -> Task:
         """Move a task to ``new_status``, enforcing the state machine.

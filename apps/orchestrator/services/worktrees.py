@@ -40,6 +40,7 @@ from ..config.logging import get_logger
 from ..config.settings import Settings, get_settings
 from ..db.models import TaskRow, TaskRunRow
 from ..domain.enums import RunStatus, TaskStatus
+from ..domain.git import INTEGRATION_WORKTREE_DIR
 from .errors import EntityNotFound
 from .git_errors import GitError, WorktreeMissing
 from .workspace import attach_workspace, release_workspace, workspace_path
@@ -232,7 +233,13 @@ def _candidates(session: Session, settings: Settings) -> list[_Candidate]:
 
 
 def _directories(root: Path) -> list[Path]:
-    """Worktree directories on disk: one level of project, one of run."""
+    """Worktree directories on disk: one level of project, one of run.
+
+    The project's integration worktree is not one of these (concern 51). It
+    belongs to no run, so it would be counted as unclaimed for ever, and
+    "unclaimed" is the census's way of saying a human should look at something.
+    It is also not reapable: ``reap`` works from runs, and this tree has none.
+    """
     if not root.exists():
         return []
     return sorted(
@@ -240,7 +247,7 @@ def _directories(root: Path) -> list[Path]:
         for project_dir in root.iterdir()
         if project_dir.is_dir()
         for child in project_dir.iterdir()
-        if child.is_dir()
+        if child.is_dir() and child.name != INTEGRATION_WORKTREE_DIR
     )
 
 
