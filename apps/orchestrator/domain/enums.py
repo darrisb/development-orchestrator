@@ -331,6 +331,15 @@ class RunEventType(StrEnum):
     #: this to the abandoned run instead would put a decision on the record of
     #: an execution that had nothing to do with it.
     TASK_RETRY_AUTHORIZED = "TASK_RETRY_AUTHORIZED"
+    #: An operator recovered a stranded in-flight run (concern 67).
+    #:
+    #: About a *run*, unlike ``TASK_RETRY_AUTHORIZED``: the run already exists
+    #: and keeps its identity, its history and its number, and what the event
+    #: records is that execution ownership moved to a new generation. Exactly
+    #: one of these is appended per successful recovery, and it carries the
+    #: generation that was fenced and the one that was taken, so a later reader
+    #: can tell which durable work belongs to which executor.
+    RUN_RECOVERY_AUTHORIZED = "RUN_RECOVERY_AUTHORIZED"
 
 
 class WorkerProfile(StrEnum):

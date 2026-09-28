@@ -152,6 +152,11 @@ class TaskRun:
     completed_at: datetime | None = None
     active_runtime_ms: int = 0
     active_started_at: datetime | None = None
+    #: Concern 67. The fencing token an executor must still own to persist.
+    execution_generation: int = 0
+    #: Concern 67. The dispatch holding this run, or ``None`` when none does.
+    execution_owner: str | None = None
+    execution_started_at: datetime | None = None
 
 
 @dataclass(slots=True)

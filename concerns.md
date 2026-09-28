@@ -2852,3 +2852,273 @@ attempt-2 call, and would begin a new attempt-2 durably fenced by
 `require_in_flight`; the supported operator action is
 `POST /tasks/{TS-109}/resume`, which is documented here but deliberately not
 executed.
+
+**Correction appended after Concern 67 (2026-09-28).** The operator action
+proposed above was executed against the real run and is not a supported
+operation for it. `POST /tasks/006950fe-2cdf-4624-a40a-eb8e2f1c1e1d/resume`
+returned:
+
+```
+HTTP 409
+{"error":"EntityConflict","detail":"Task TS-109 is not paused"}
+```
+
+`services.pauses.resume_task` requires `task.status == PAUSED`, and TS-109 was
+`VERIFYING`. The live run was not mutated: `RUN-20260928-000005` remained
+`RUNNING` with `attempt_number = 1` and `candidate_commit = NULL`, TS-109
+remained `VERIFYING`, no new TaskRun was created, `agent/integration` remained
+at `fc6abc579cee88f821c5f72f00162872b2dc8326`, and TS-110 remained `READY` with
+no runs.
+
+Nothing recorded above about Concern 66 itself is withdrawn: the transaction
+lifetime fix and the reconstruction correctness it proved both stand, and the
+reconstruction verdict (attempt 1 historical, the lost attempt-2 call not
+double-counted, the next durable coder execution being attempt 2) is confirmed
+by Concern 67's tests against the same durable signature. What the live 409
+exposed is that the supervisor had no operator surface for *continuing* an
+existing in-flight TaskRun at all: `resume` is for paused work, `retry`
+(concern 65) creates a new run after a terminal `FAILED`, and `abandon`
+(concern 64) ends one. Concern 67 was created to provide the missing operation
+safely, and it deliberately does not widen `resume` to cover it -- an operation
+that continues paused work cannot acquire a second executor, and one that
+continues possibly-live work can.
+
+## 67. A stranded in-flight run had no supported way to be continued -- **resolved**
+
+**Observed evidence.** Concern 66 fixed the database transaction-lifetime
+defect that stranded `RUN-20260928-000005`
+(`9760dfeb-3112-4b4f-b67f-5ae4daa7b2b1`, TS-109,
+`006950fe-2cdf-4624-a40a-eb8e2f1c1e1d`, project
+`d98cb1e7-75e4-401a-8b21-d0965b0b3115`) and proposed
+`POST /tasks/{task_id}/resume` as the operator recovery action. Executed
+against the real run it returned `409 EntityConflict: Task TS-109 is not
+paused`, preserved verbatim in the correction appended to Concern 66 above.
+The durable state it refused to act on: run `RUNNING`, task `VERIFYING`,
+`attempt_number = 1`, `review_cycle = 0`, `candidate_commit = NULL`, one
+`SUCCEEDED` attempt-1 `CODE` `model_runs` row, `BUILD_FAILED` and
+`OUTCOME_RECORDED(in_progress, attempts=1)` in `run_events`, no attempt-2
+`model_runs` row, worktree and `agent/integration` both at
+`fc6abc579cee88f821c5f72f00162872b2dc8326`.
+
+**Root cause.** Not a bug in `resume_task` -- its refusal is correct. The
+supervisor had four lifecycle needs and only three operations. `resume`
+continues intentionally `PAUSED` work; `retry` (concern 65) authorizes a *new*
+run after a terminal `FAILED` task; `abandon` (concern 64) ends an in-flight
+run. Nothing *continued* an existing in-flight `TaskRun` whose execution owner
+could no longer proceed. `POST /projects/{id}/run` would have picked the run up
+through `run_next`'s incomplete-run sweep, but as an implicit side effect of
+scheduling rather than as an operator decision, and with no mutual exclusion:
+two such requests would both dispatch the same run.
+
+**Why `resume` was not widened.** One verb would have meant two things, and the
+dangerous one silently. Continuing paused work cannot acquire a second
+executor, because a paused task has none. Continuing work somebody may still be
+executing absolutely can. The four operations are therefore kept semantically
+distinct, and recovery is the only one whose central problem is *ownership*
+rather than eligibility.
+
+**The ownership primitive, and why the existing fencing was not enough.**
+Concern 64's `TaskRunRepository.require_in_flight` is a `SELECT ... FOR UPDATE`
+whose predicate is *terminality*: it refuses a run that is `ABANDONED`,
+`SUCCEEDED` or `FAILED`. That cannot distinguish one in-flight executor from
+another -- both see `RUNNING` and both pass. Concern 66 widened the window it
+has to cover (an operator can now commit while inference is outstanding) but
+did not change the question it asks. There was no durable record of *who* was
+executing a run, and no weak proxy for it is acceptable: elapsed wall clock, an
+absent PID, a missing container and a quiet event log are all guesses that are
+wrong exactly when it matters.
+
+So `task_runs` gained three columns (migration `a1f47b0c93d2`; existing rows
+get generation 0 and no owner, which is the truthful reading of a row written
+before the column existed):
+
+* `execution_generation` -- the fencing token. Monotonic, never decremented.
+* `execution_owner` -- the dispatch currently inside the run, `NULL` when none
+  is. A *held/not-held* marker, stamped on acquisition and cleared on the way
+  out; explicitly never a liveness claim.
+* `execution_started_at` -- when the current owner took it. Audit only.
+
+`TaskRunRepository.acquire_execution` is one guarded `UPDATE` that increments
+the generation and stamps the owner, with optional predicates on the assessed
+generation and on the run being unowned. `release_execution` clears the stamp
+only for the dispatch that still holds it, so an old dispatch unwinding through
+its `finally` cannot strip ownership from the executor that superseded it.
+`require_in_flight` gained an optional `expected_generation` folded into the
+*same* locked predicate -- one statement, one lock, one answer -- and raises the
+new `RunOwnershipLostError` (409) when the run is in flight but a newer
+generation owns it. That is deliberately a third fault distinct from
+`AbandonedRunError` ("a person stopped this") and `RunNotInFlightError` ("the
+workflow is later than its own run").
+
+The invariant this establishes is the one the concern asks for:
+
+```
+old owner holds generation N and is off doing external work
+recovery atomically takes generation N+1
+old owner returns, tries to persist  -> refused, it holds N
+recovered owner holds N+1            -> may continue
+```
+
+Recovery therefore never has to prove the old executor is gone. It makes the
+question irrelevant.
+
+**Where the token is checked.** `WorkflowRunner.run` is now where execution
+ownership is taken, because `run_next`, `run_task`, `resume`,
+`recover_incomplete` and the recovery endpoint all pass through it -- an
+ownership rule each caller had to remember would be one a caller eventually
+forgot. The generation is carried in `WorkflowState` (serializable, so it
+survives the process like everything else there) and quoted back at every
+durable boundary: `agents.fix_loop.durable_checkpoint`, which wraps every
+fix-loop commit including the pre- and post-provider ones concern 66 added; the
+`prepare_workspace` node, which moves `PENDING` to `RUNNING`; and the `deliver`
+node, which is the most consequential write a run makes. A run that was already
+terminal when dispatched holds no generation and is walked to the terminal node
+as before. Concern 64's terminal fencing and concern 66's transaction boundary
+are unchanged: this is a third predicate on the same lock, not a replacement
+for either, and `test_abandonment_still_wins_against_a_recovered_owner` pins
+that an abandonment after a recovery still refuses with `AbandonedRunError`.
+
+**Recoverability contract.** `services.run_recovery.assess_recoverability` is
+read-only -- no lock, no acquisition, no event -- and records every check with
+its answer and what it was read from, so an operator gets the whole picture
+rather than the first refusal. It fails closed. The checks are:
+`run_not_abandoned`; `run_in_flight`; `not_superseded` (no competing in-flight
+run of the task); `task_not_paused` (which names `/tasks/{task_id}/resume`);
+`task_state_recoverable` (`ACTIVE_STATES` plus `READY`, `CHANGES_REQUESTED`,
+`APPROVED` -- built from the state machine's own definition, not a second copy
+of it); `no_pause_in_force`; `checkpoint_exists` (a durable
+`workflow_checkpoints` row for the run's thread); `starting_commit_recorded`
+and `starting_commit_exists`; `integration_baseline_compatible`;
+`candidate_state_understood`; `worktree_usable`; and
+`attempt_accounting_reconstructable`. Nothing is silently repaired: a missing
+worktree, an unresolvable starting commit and a diverged baseline are refusals
+an operator has to look at.
+
+The baseline policy is explicit and deterministic. Compatible means
+`agent/integration` still *contains* the run's starting commit. A baseline that
+merely advanced still contains it, so that case is reported
+(`integration_advanced_since_start`) and not refused. A baseline moved
+somewhere else does not contain it, and continuing would build on a tree the
+orchestrator never accepted, so it is refused by name.
+
+`execution_ownership_available` is the requirement-10 check, and the only one
+with an override. A process killed mid-dispatch leaves an owner stamp nothing
+will ever clear; `override_active_owner` is an explicit operator decision,
+recorded in the event payload along with the owner it displaced. It widens what
+may be *recovered* and never what may be *persisted*, because the older
+executor is fenced by the generation whether it is alive or not.
+
+**API contract.** `POST /runs/{run_id}/recover` and
+`GET /runs/{run_id}/recoverability`. Run-scoped, because the operation is about
+one run and the task may have several. `{run_id}` is the durable
+`task_runs.id` UUID and nothing else -- the same parameter as
+`GET /runs/{run_id}` and `POST /runs/{run_id}/abandon`, and accepting both
+spellings on the most consequential of the three would make "which run did I
+just take over" a question about parsing. The body requires a non-blank
+`reason` (422 otherwise, the same `OperatorReason` type concerns 64 and 65 use)
+and accepts `requested_by` and `override_active_owner`.
+
+The operation acts on the existing `TaskRun`; creates no new one; does not
+touch `run_number`, `attempt_number`, `review_cycle`, `candidate_commit` or the
+external run identity; preserves every historical attempt, event, model call
+and review; appends exactly one `RUN_RECOVERY_AUTHORIZED` event carrying the
+reason, the operator, both generations, the reconstruction and every check; and
+then continues the run through the ordinary workflow and fix loop. Errors:
+`404` unknown run; `422` blank reason; `409` for every refusal -- terminal
+`SUCCEEDED`/`FAILED`, `ABANDONED`, superseded, `PAUSED` task, pause in force,
+missing checkpoint, missing or unreadable starting commit, diverged baseline,
+missing worktree, exhausted attempt accounting, a dispatch currently holding
+the run, and a competing recovery that acquired it first. The eligibility
+endpoint returns `200` with `recoverable: false` rather than an error, and is
+guaranteed not to acquire ownership or mutate anything -- asserted, not merely
+documented.
+
+**`external_run_id` decision: implemented.** Preflight had to map
+`RUN-20260928-000005` to its durable UUID by reading a run artifact off disk,
+because `GET /runs/{id}` and `GET /tasks/{id}/runs` omitted the external
+identity. That hand mapping stands directly between an operator and the most
+consequential run-scoped operation there is, and getting it wrong recovers a
+different run -- so exposing it is necessary for safe operator run addressing
+rather than unrelated API work. It is an additive read-only field on the
+existing `TaskRunResponse`, with tests; the route stays unambiguous.
+
+**RUN-000005 reconstruction semantics.** An attempt is charged when a model is
+asked, because that left a recorded call and a directory; a review cycle is
+charged when a reviewer answers. Attempt 1 left a `CODE` `model_runs` row and a
+`CODING_STARTED` event, so it is spent and stays historical. The attempt-2
+provider call died with the transaction that would have recorded it, so it left
+neither and is not spent -- counting it would be inferring an event from the
+absence of evidence, and would burn a third of the task's budget on the
+inference. `loop_recovery.recover_loop_state` therefore yields
+`next_attempt = 2`, `attempts_started = 1`, `reviews_completed = 0`, against
+`max_attempts = 3`. The run keeps the same database id, the same `run_number`
+(2) and the same external `RUN-...` identity.
+
+**Tests.** `tests/integration/test_concern67.py`, 62 tests. The fixture rebuilds
+the exact `RUN-20260928-000005` durable signature -- opened by `create_run`,
+walked through the real state machine, with the attempt-1 call, the three
+events, a checkpoint row, a real repository with `agent/integration`, and the
+worktree at the starting commit -- and a guard test pins the fixture itself so
+every claim below is about that shape. Coverage: the reconstruction to attempt
+2 and the uncounted lost call; recovery operating on the existing run, creating
+no new one (counted from a rebuilt engine), preserving `run_number` and external
+identity, leaving attempt-1 rows byte-identical, and appending exactly one
+audit event; every refusal listed above; the old owner fenced after transfer,
+including the ordering where its model answer arrives *after* the transfer and
+is rejected before its row can commit; a fenced owner's release clearing
+nothing; duplicate recovery producing one owner and one event; a stale
+assessment losing the acquisition. An end-to-end section strands a run for real
+-- attempt 1 writes failing code, attempt 2 raises `ModelTimeout` exactly as the
+live provider did -- then recovers it and drives it to `COMPLETED` as the same
+single run, which also covers requirement 20. A subprocess section proves
+assessment and recovery work from a genuinely separate interpreter, engine and
+identity map. An HTTP section covers the routes, the contract, the 404/409/422
+behaviour and the `external_run_id` exposure. A regression section pins
+abandon, retry and resume unchanged, including the exact
+`EntityConflict: ... is not paused` that started this. `test_migrations.py`
+gains a test that pre-existing rows migrate to generation 0 with no owner.
+
+**PostgreSQL concurrency evidence.** Four tests on a scratch PostgreSQL
+database, using a `threading.Barrier` rather than sleeps so both threads have
+their session open and their assessment made before either may write. Two
+simultaneous `recover_run` calls: exactly one returns an authorization, one
+raises `EntityConflict`, the run ends at generation 1 with one owner, one
+`RUN_RECOVERY_AUTHORIZED` event and still two `task_runs` rows. Two
+simultaneous `acquire_execution` calls: exactly one returns a run. The loser is
+then shown to be fenced, not merely refused. And the reconstruction is
+re-derived on PostgreSQL to `next_attempt = 2`.
+
+**Mutation evidence.** Five controlled source mutations, each confirmed to
+apply (grepped in the file, with the source hash recorded before and after),
+each run against its expected detecting tests, each restored and the
+restoration verified by `sha256sum -c` against the pre-mutation snapshot
+followed by a green re-run. No result is counted from an edit that did not
+apply.
+
+| mutation | result |
+| --- | --- |
+| A -- `acquire_execution` made check-then-act instead of one guarded `UPDATE` | RED -- `test_two_simultaneous_recoveries_produce_exactly_one_owner` returned `[1, 1]`: both operators authorized, both at generation 1, two executors. `test_two_simultaneous_acquisitions_produce_exactly_one_owner` also red |
+| B -- the `expected_generation` predicate removed from `require_in_flight` | RED -- 4 tests, including `test_the_old_execution_owner_cannot_persist_after_recovery` and `test_an_outstanding_model_answer_is_rejected_after_the_transfer`: `DID NOT RAISE RunOwnershipLostError` |
+| C -- recovery opens a replacement `TaskRun` | RED -- `test_recovery_creates_no_new_task_run` observed `3 == 2` task_runs rows from a rebuilt engine; the PostgreSQL race test also red on its row count |
+| D -- reconstruction returns `run.attempt_number`, repeating historical attempt 1 | RED -- 5 tests, including the SQLite, subprocess, HTTP and PostgreSQL reconstructions: `next_attempt` observed as 1 |
+| E -- the terminal/abandoned recoverability guards always pass | RED -- 5 tests. Note the defence in depth this exposes: `acquire_execution` still refuses a terminal run, so the request is still a 409, but the *policy* layer no longer names the real reason and an abandoned run is no longer reported as abandoned -- which is exactly what the tests catch |
+
+**Regression validation.** Full SQLite suite: 1395 passed in 91.77s.
+Randomized order (`pytest-randomly`, seed 12345): 1395 passed in 91.59s. Full
+PostgreSQL 16 suite (`postgresql+psycopg://.../test_orchestrator`): 1395 passed
+in 104.60s. Concern 67 targeted: 62 passed in 9.45s. Concern 64/65/66
+regression (`test_concern64.py`, `test_concern65.py`,
+`test_fix_loop_resume.py`, `test_db_session_cleanup.py`): 128 passed in 22.44s.
+Phase M: 1 passed in 3.66s. Migrations: 10 passed in 0.82s. `ruff check .`
+clean. No hangs, no lock waits, no leaked sessions, no cross-test pollution
+(the PostgreSQL race tests each own a scratch database that is dropped on the
+way out, and the SQLite signature fixture owns a file per test), no stale
+worktrees left under `WORKTREE_ROOT`, and no unexpected changes to any managed
+repository.
+
+**Campaign preservation.** Throughout implementation and validation the
+recovery endpoint was never called against `RUN-20260928-000005`, TS-109 was
+never resumed, retried or abandoned, TS-110 was never started, TraceStack was
+never manually modified and `agent/integration` was never moved. Every fixture
+reproducing the run is synthetic, in a private database and a private
+repository under `tmp_path`.

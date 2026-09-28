@@ -232,6 +232,52 @@ def test_populated_task_runs_gain_conservative_runtime_accounting(alembic_config
         engine.dispose()
 
 
+def test_populated_task_runs_gain_unowned_generation_zero(alembic_config):
+    """Concern 67's columns say the truthful thing about a pre-existing run.
+
+    Generation 0 and no owner. Not "owned by whoever started it": nothing on
+    the old row could say who that was, and a migration that guessed would
+    either strand every historical run behind an owner nothing will ever clear
+    or claim an executor that is long gone. Zero and NULL mean "no dispatch
+    holds this", and the first acquisition takes generation 1 -- which is what
+    fences the run's original executor whether or not it is still out there.
+    """
+    config, url = alembic_config
+    command.upgrade(config, "e2d6b79a4f10")
+    engine = create_db_engine(url)
+    try:
+        with engine.connect() as connection:
+            factory = sessionmaker(bind=connection, expire_on_commit=False)
+            with factory.begin() as session:
+                project = ProjectRepository(session).add(
+                    Project(name="ownership", repository_path="/tmp/ownership")
+                )
+                task = TaskRepository(session).add(
+                    Task(project_id=project.id, external_task_id="T-67", title="own")
+                )
+                session.execute(
+                    text(
+                        "INSERT INTO task_runs "
+                        "(id, task_id, run_number, attempt_number, review_cycle, "
+                        "status, active_runtime_ms, started_at) "
+                        "VALUES (:id, :task_id, 1, 1, 0, 'RUNNING', 0, "
+                        "CURRENT_TIMESTAMP)"
+                    ),
+                    {"id": uuid.uuid4().hex, "task_id": task.id.hex},
+                )
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT execution_generation, execution_owner, "
+                    "execution_started_at FROM task_runs"
+                )
+            ).one()
+        assert row == (0, None, None)
+    finally:
+        engine.dispose()
+
+
 def test_upgrade_head_matches_the_mapped_lesson_foreign_keys(alembic_config):
     """Phase L's evidence columns are references, and the mapping says so.
 

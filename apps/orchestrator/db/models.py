@@ -168,6 +168,22 @@ class TaskRunRow(UUIDPrimaryKey, Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     active_runtime_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     active_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: The fencing token for execution ownership (concern 67). Every dispatch
+    #: of this run increments it, and every durable checkpoint validates the
+    #: executor's copy against it, so an executor whose run was recovered
+    #: underneath it can no longer commit progress.
+    execution_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", default=0
+    )
+    #: The dispatch currently executing this run, or NULL when no executor
+    #: holds it. Set when a dispatch acquires ownership and cleared when that
+    #: dispatch returns, so it is a *held/not held* marker and never a liveness
+    #: claim: a process killed mid-dispatch leaves it set, and recovery then
+    #: refuses until an operator says otherwise.
+    execution_owner: Mapped[str | None] = mapped_column(String(64))
+    execution_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
 
     task: Mapped[TaskRow] = relationship(back_populates="runs")
     verifications: Mapped[list[VerificationRunRow]] = relationship(

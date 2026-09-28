@@ -284,7 +284,11 @@ class FixLoopResult:
 
 
 def durable_checkpoint(
-    session: Session, run_id: UUID, commit: Callable[[], None]
+    session: Session,
+    run_id: UUID,
+    commit: Callable[[], None],
+    *,
+    expected_generation: int | None = None,
 ) -> Callable[[], None]:
     """The turn-boundary checkpoint, guarded by the run row (concern 64).
 
@@ -304,10 +308,27 @@ def durable_checkpoint(
     Wrapping the caller's commit rather than adding a second callback keeps the
     ordering impossible to get wrong: there is no way to make a turn durable
     without passing the guard.
+
+    **Concern 67 threads the executor's ownership token through the same
+    guard.** ``expected_generation`` is the ``execution_generation`` this
+    dispatch acquired, and the barrier now refuses a commit from an executor
+    whose generation has been superseded by an operator recovery. It is checked
+    here, at the commit, rather than only at the top of the loop, for exactly
+    the reason concern 64 gave about abandonment: everything before the commit
+    is a read, and a read is true until the moment it is not. An executor that
+    was recovered out from under itself while waiting on a provider gets as far
+    as this line and no further, so its work is discarded rather than layered
+    on top of the executor that replaced it.
+
+    ``None`` means "do not ask the ownership question", which is the
+    pre-concern-67 behaviour and what a caller with no dispatch of its own
+    passes.
     """
 
     def checkpoint() -> None:
-        TaskRunRepository(session).require_in_flight(run_id)
+        TaskRunRepository(session).require_in_flight(
+            run_id, expected_generation=expected_generation
+        )
         commit()
 
     return checkpoint

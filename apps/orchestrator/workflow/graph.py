@@ -7,6 +7,7 @@ serializable facts used only for conditional edges.
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import NotRequired, TypedDict
 from uuid import UUID
@@ -18,7 +19,13 @@ from ..agents.fix_loop import LoopOutcome, durable_checkpoint, run_fix_loop
 from ..config.logging import get_logger
 from ..config.settings import Settings, get_settings
 from ..db.session import rollback_preserving_original
-from ..domain.enums import EscalationStatus, ModelRole, RunStatus, TaskStatus
+from ..domain.enums import (
+    IN_FLIGHT_RUN_STATUSES,
+    EscalationStatus,
+    ModelRole,
+    RunStatus,
+    TaskStatus,
+)
 from ..domain.escalation import EscalationIntent
 from ..domain.workflow import WorkflowOutcome, WorkflowPhase
 from ..providers import ModelProvider, build_provider, build_review_provider
@@ -75,6 +82,14 @@ class WorkflowState(TypedDict):
     #: checks exist to avoid starting work that is already pointless, and they
     #: are checked again where it counts.
     run_abandoned: NotRequired[bool]
+    #: Concern 67: the execution generation this dispatch acquired. Carried in
+    #: the graph state rather than in a module variable because it has to
+    #: survive the same thing everything else here survives -- the process --
+    #: and because a node that persists anything has to be able to quote it
+    #: back to the database. Absent when the dispatch holds no ownership,
+    #: which happens only for a run that was already terminal when it was
+    #: dispatched and will walk straight to the terminal node.
+    execution_generation: NotRequired[int]
 
 
 class WorkflowRunner:
@@ -175,18 +190,111 @@ class WorkflowRunner:
             run = create_run(session, task.id)
         return await self.run(run.id)
 
-    async def run(self, run_id: UUID) -> WorkflowState:
-        """Start or recover a specific run using its durable thread id."""
-        with self.session_factory() as session:
-            run, task, project = load_run_context(session, run_id)
-            state: WorkflowState = {
-                "project_id": str(project.id),
-                "task_id": str(task.id),
-                "run_id": str(run.id),
-                "phase": WorkflowPhase.LOADING.value,
-            }
-        config = {"configurable": {"thread_id": str(run_id)}}
-        return await self.graph.ainvoke(state, config=config)
+    async def run(
+        self, run_id: UUID, *, acquired: tuple[str, int] | None = None
+    ) -> WorkflowState:
+        """Start or recover a specific run using its durable thread id.
+
+        Dispatch is where execution ownership is taken (concern 67). Acquiring
+        it here rather than in each caller is deliberate: ``run_next``,
+        ``run_task``, ``resume``, ``recover_incomplete`` and the operator
+        recovery endpoint all end up here, and an ownership rule that each of
+        them had to remember to apply is an ownership rule that one of them
+        would eventually not.
+
+        The acquisition increments the run's ``execution_generation``, and the
+        new number is carried in the graph state and quoted back to the
+        database at every durable checkpoint. So a second dispatch of the same
+        run does not merely fail to start -- if it somehow did start, the older
+        one could no longer persist.
+
+        Args:
+            acquired: ``(owner, generation)`` when the caller already acquired
+                ownership in its own transaction. The operator recovery path
+                does that, because for it the acquisition *is* the operation
+                and it has to be committed with the audit event, not separately
+                afterwards.
+
+        Raises:
+            EntityConflict: another dispatch holds this run.
+        """
+        owner: str | None
+        if acquired is not None:
+            owner, generation = acquired
+            # Ownership belongs to the caller's transaction; releasing it is
+            # still this dispatch's job, because this is what is executing.
+            release = True
+        else:
+            owner, generation = self._acquire_execution(run_id)
+            release = owner is not None
+        try:
+            with self.session_factory() as session:
+                run, task, project = load_run_context(session, run_id)
+                state: WorkflowState = {
+                    "project_id": str(project.id),
+                    "task_id": str(task.id),
+                    "run_id": str(run.id),
+                    "phase": WorkflowPhase.LOADING.value,
+                }
+                if generation is not None:
+                    state["execution_generation"] = generation
+            config = {"configurable": {"thread_id": str(run_id)}}
+            return await self.graph.ainvoke(state, config=config)
+        finally:
+            if release and owner is not None:
+                self._release_execution(run_id, owner)
+
+    def _acquire_execution(self, run_id: UUID) -> tuple[str | None, int | None]:
+        """Take ownership of an in-flight run, or explain why not.
+
+        A run that is already terminal is dispatched without ownership rather
+        than refused: the graph's job for such a run is to walk to its terminal
+        node and report, it persists nothing that needs fencing, and refusing
+        would change the behaviour of every caller that dispatches a run to
+        find out what became of it.
+        """
+        with self.session_factory.begin() as session:
+            runs = TaskRunRepository(session)
+            run = runs.get(run_id)
+            if run is None:
+                raise EntityNotFound("Run", run_id)
+            if run.status not in IN_FLIGHT_RUN_STATUSES:
+                return None, None
+            owner = uuid.uuid4().hex
+            acquired = runs.acquire_execution(run_id, owner=owner)
+            if acquired is None:
+                session.expire_all()
+                current = runs.get(run_id)
+                if current is not None and current.execution_owner is not None:
+                    raise EntityConflict(
+                        f"Run {current.external_run_id or current.id} is already "
+                        f"held by dispatch {current.execution_owner} since "
+                        f"{current.execution_started_at}; a run has one executor"
+                    )
+                raise EntityConflict(
+                    f"Run {run_id} could not be dispatched; it is no longer in "
+                    "flight"
+                )
+            return owner, acquired.execution_generation
+
+    def _release_execution(self, run_id: UUID, owner: str) -> None:
+        """Give the run back, if this dispatch still holds it.
+
+        Best effort on purpose. A dispatch that was fenced by a recovery no
+        longer matches the owner predicate and clears nothing, and a release
+        that fails outright must not replace the workflow's own outcome or
+        exception -- the generation, not this stamp, is what keeps the run
+        safe.
+        """
+        try:
+            with self.session_factory.begin() as session:
+                TaskRunRepository(session).release_execution(run_id, owner=owner)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "execution_ownership_release_failed",
+                run_id=str(run_id),
+                execution_owner=owner,
+            )
 
     async def resume(self, run_id: UUID) -> WorkflowState:
         """Release task-scoped pauses and resume at a safe boundary."""
@@ -293,6 +401,10 @@ class WorkflowRunner:
                     "task_status": task.status.value,
                     "run_abandoned": True,
                 }
+            # Concern 67: this node writes -- it moves PENDING to RUNNING and it
+            # creates or attaches a worktree -- so it re-asks the ownership
+            # question under the row lock rather than trusting the read above.
+            self._require_ownership(session, run.id, state)
             if run.branch_name:
                 attach_workspace(session, run.id, settings=self.settings)
             else:
@@ -378,7 +490,15 @@ class WorkflowRunner:
                 # flight stops the turn instead of being overwritten by it. The
                 # fences in the graph above are reads and cannot do this; see
                 # agents.fix_loop.durable_checkpoint.
-                checkpoint_turn=durable_checkpoint(session, run.id, session.commit),
+                checkpoint_turn=durable_checkpoint(
+                    session,
+                    run.id,
+                    session.commit,
+                    # Concern 67: the token this dispatch acquired. Every turn
+                    # boundary quotes it back, so an executor recovered out
+                    # from under itself cannot commit what it was doing.
+                    expected_generation=state.get("execution_generation"),
+                ),
             )
             end_active_runtime(
                 session,
@@ -451,6 +571,11 @@ class WorkflowRunner:
                     "outcome": WorkflowOutcome.FAILED.value,
                     "run_abandoned": True,
                 }
+            # Concern 67: delivery is the most consequential write a run makes
+            # -- a commit, and the integration baseline moving. A dispatch that
+            # no longer owns the run may not make it, and the question is asked
+            # under the row lock in the same transaction as the delivery.
+            self._require_ownership(session, run.id, state)
             workspace = attach_workspace(
                 session, UUID(state["run_id"]), settings=self.settings
             )
@@ -468,6 +593,23 @@ class WorkflowRunner:
             if blocked and integration.escalation_id is not None:
                 state_update["escalation_id"] = str(integration.escalation_id)
             return state_update
+
+    @staticmethod
+    def _require_ownership(
+        session: Session, run_id: UUID, state: WorkflowState
+    ) -> None:
+        """Refuse to write unless this dispatch still owns the run.
+
+        A no-op for a dispatch that holds no generation, which is only ever a
+        run that was terminal when it was dispatched and therefore has nothing
+        here to protect.
+        """
+        generation = state.get("execution_generation")
+        if generation is None:
+            return
+        TaskRunRepository(session).require_in_flight(
+            run_id, expected_generation=generation
+        )
 
     def _release(self, state: WorkflowState) -> dict[str, object]:
         with self.session_factory.begin() as session:

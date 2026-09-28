@@ -10,7 +10,13 @@ from __future__ import annotations
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
-from ..domain.errors import AbandonedRunError, InvalidStateTransition, LimitExceeded, ManifestError
+from ..domain.errors import (
+    AbandonedRunError,
+    InvalidStateTransition,
+    LimitExceeded,
+    ManifestError,
+    RunOwnershipLostError,
+)
 from ..providers.errors import ModelProviderError, ProviderNotConfigured
 from ..services.errors import (
     EntityConflict,
@@ -47,6 +53,11 @@ from ..services.git_errors import (
 #: have turned every one of them into a tidy 409 and hidden the next concern 59
 #: instead of surfacing it.
 #:
+#: ``RunOwnershipLostError`` (concern 67) is 409 for the same reason: the
+#: caller's request was well formed, and an operator recovery moved the run's
+#: execution generation on before it could persist. It reaches this layer only
+#: from a locked database predicate, so it is a report and not a guess.
+#:
 #: ``AbandonedRunError`` is here for the same reason ``EntityConflict`` is
 #: (concern 64): a caller racing an operator's abandonment of the same run
 #: asked for something well formed that the world no longer allows, which is
@@ -56,6 +67,7 @@ _STATUS_BY_ERROR: tuple[tuple[type[Exception], int], ...] = (
     (EntityNotFound, status.HTTP_404_NOT_FOUND),
     (EntityConflict, status.HTTP_409_CONFLICT),
     (AbandonedRunError, status.HTTP_409_CONFLICT),
+    (RunOwnershipLostError, status.HTTP_409_CONFLICT),
     (InvalidStateTransition, status.HTTP_409_CONFLICT),
     (LimitExceeded, status.HTTP_409_CONFLICT),
     (NotInCapturableState, status.HTTP_409_CONFLICT),

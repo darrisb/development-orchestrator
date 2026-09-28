@@ -59,6 +59,35 @@ class RunNotInFlightError(DomainError):
         super().__init__(message)
 
 
+class RunOwnershipLostError(DomainError):
+    """This executor no longer owns the run it is trying to persist to.
+
+    Concern 67. A run is continued by exactly one executor, and which one is
+    decided by the run's ``execution_generation``: a dispatch takes the next
+    generation, and every durable checkpoint re-reads the row under its lock
+    and refuses unless the generation is still the one the executor took.
+
+    Raised when an executor's generation is behind the row's -- which means an
+    operator recovered the run and a newer executor now owns it. The refusal is
+    the guarantee: the older executor's external work is allowed to finish and
+    is then discarded, rather than being committed on top of the newer one's.
+
+    Deliberately not :class:`AbandonedRunError` or :class:`RunNotInFlightError`.
+    The run is in flight and nobody stopped it; what changed is who is allowed
+    to continue it, and conflating that with either of the others would tell an
+    operator the wrong thing about what happened.
+    """
+
+    def __init__(self, run_id: object, *, held: int, current: int) -> None:
+        super().__init__(
+            f"Run {run_id} is now on execution generation {current}; this "
+            f"executor holds generation {held} and may no longer persist to it"
+        )
+        self.run_id = run_id
+        self.held = held
+        self.current = current
+
+
 class LimitExceeded(DomainError):
     """A configured limit (attempts, review cycles, diff size) was exceeded."""
 

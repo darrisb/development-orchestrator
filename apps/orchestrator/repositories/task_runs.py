@@ -8,7 +8,11 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from ..db.models import TaskRow, TaskRunRow
 from ..domain.enums import ABANDONABLE_RUN_STATUSES, IN_FLIGHT_RUN_STATUSES, RunStatus
-from ..domain.errors import AbandonedRunError, RunNotInFlightError
+from ..domain.errors import (
+    AbandonedRunError,
+    RunNotInFlightError,
+    RunOwnershipLostError,
+)
 from ..domain.models import TaskRun
 from .base import Repository
 
@@ -39,6 +43,9 @@ class TaskRunRepository(Repository[TaskRunRow, TaskRun]):
             completed_at=row.completed_at,
             active_runtime_ms=row.active_runtime_ms,
             active_started_at=row.active_started_at,
+            execution_generation=row.execution_generation,
+            execution_owner=row.execution_owner,
+            execution_started_at=row.execution_started_at,
         )
 
     def next_run_number(self, task_id: UUID) -> int:
@@ -69,6 +76,9 @@ class TaskRunRepository(Repository[TaskRunRow, TaskRun]):
             completed_at=run.completed_at,
             active_runtime_ms=run.active_runtime_ms,
             active_started_at=run.active_started_at,
+            execution_generation=run.execution_generation,
+            execution_owner=run.execution_owner,
+            execution_started_at=run.execution_started_at,
         )
         self.session.add(row)
         self.session.flush()
@@ -260,7 +270,93 @@ class TaskRunRepository(Repository[TaskRunRow, TaskRun]):
             return None
         return self._to_domain(self._require_row(run_id))
 
-    def require_in_flight(self, run_id: UUID) -> None:
+    def acquire_execution(
+        self,
+        run_id: UUID,
+        *,
+        owner: str,
+        expected_generation: int | None = None,
+        require_unowned: bool = True,
+    ) -> TaskRun | None:
+        """Take exclusive execution ownership of an in-flight run (concern 67).
+
+        One guarded ``UPDATE``, because the acquisition *is* the guard. It
+        increments ``execution_generation`` and stamps ``execution_owner`` in a
+        single statement whose predicate the database evaluates while it holds
+        the row lock, so two dispatches racing for the same run produce one
+        winner decided by commit order and not by whichever read the row last.
+        A read-then-write here would be the classic check-then-act: both
+        callers would see an unowned run at generation N and both would write
+        generation N+1, which is precisely the second executor this exists to
+        make impossible.
+
+        The increment is the fencing token. Whoever loses the race -- or whoever
+        was executing before it -- still holds the older number, and
+        :meth:`require_in_flight` refuses every durable checkpoint that presents
+        it. That is what makes an older executor's late answer harmless rather
+        than merely unlikely.
+
+        Args:
+            owner: an opaque identifier for this dispatch, written to
+                ``execution_owner`` and required back to release it.
+            expected_generation: when given, the generation the caller assessed
+                the run at. The update matches only if the row is still there,
+                which is how an operator recovery refuses a run that moved
+                between the recoverability assessment and the acquisition.
+            require_unowned: when true (the default), refuse a run another
+                dispatch is already holding. An operator may override this
+                deliberately -- a process killed mid-dispatch leaves an owner
+                behind that nothing will ever clear -- and the generation fence
+                is what keeps that override safe.
+
+        Returns:
+            The run, now owned at the new generation, or ``None`` when the
+            predicate did not match. ``None`` is a result to branch on and not
+            an error: the caller re-reads the row to say *why* truthfully.
+        """
+        conditions: list[ColumnElement[bool]] = [
+            TaskRunRow.status.in_(IN_FLIGHT_RUN_STATUSES)
+        ]
+        if expected_generation is not None:
+            conditions.append(TaskRunRow.execution_generation == expected_generation)
+        if require_unowned:
+            conditions.append(TaskRunRow.execution_owner.is_(None))
+        result = self.session.execute(
+            update(TaskRunRow)
+            .where(TaskRunRow.id == run_id, *conditions)
+            .values(
+                execution_generation=TaskRunRow.execution_generation + 1,
+                execution_owner=owner,
+                execution_started_at=datetime.now(UTC),
+            )
+            .execution_options(synchronize_session="fetch")
+        )
+        if result.rowcount != 1:
+            return None
+        return self._to_domain(self._require_row(run_id))
+
+    def release_execution(self, run_id: UUID, *, owner: str) -> bool:
+        """Give up ownership, but only if this dispatch still holds it.
+
+        The ``execution_owner = :owner`` predicate is why a fenced executor's
+        cleanup cannot strip ownership from the executor that superseded it: an
+        old dispatch unwinding through its ``finally`` matches no row and clears
+        nothing. The generation is deliberately *not* decremented -- it only
+        ever goes forwards, so a token that was fenced stays fenced.
+
+        Returns whether this call released anything.
+        """
+        result = self.session.execute(
+            update(TaskRunRow)
+            .where(TaskRunRow.id == run_id, TaskRunRow.execution_owner == owner)
+            .values(execution_owner=None, execution_started_at=None)
+            .execution_options(synchronize_session="fetch")
+        )
+        return result.rowcount == 1
+
+    def require_in_flight(
+        self, run_id: UUID, *, expected_generation: int | None = None
+    ) -> None:
         """Barrier: refuse unless this run is still PENDING or RUNNING.
 
         Concern 64, and the companion to :meth:`finish`. ``finish`` guards one
@@ -288,20 +384,38 @@ class TaskRunRepository(Repository[TaskRunRow, TaskRun]):
         true and wrong -- a guard that reports the answer it read a moment
         before the answer changed.
 
+        **Concern 67 adds the second half of the question.** "Is this run in
+        flight" and "am I still the one executing it" are different questions,
+        and until an operator could recover a stranded run only the first one
+        could be wrong. Now a run can be in flight, unabandoned, and owned by
+        somebody else -- so ``expected_generation`` is folded into the same
+        locked predicate rather than checked separately afterwards. One
+        statement, one lock, one answer: a caller cannot pass the in-flight test
+        and then lose the ownership test to a commit that landed in between.
+
+        Callers that pass no ``expected_generation`` get exactly the concern 64
+        behaviour. That is for the call sites whose question really is only
+        about terminality; every durable checkpoint in the fix loop passes its
+        generation, because that is where progress becomes persistent.
+
         Raises:
             LookupError: no such run.
             AbandonedRunError: an operator abandoned the run.
+            RunOwnershipLostError: the run is in flight but a newer execution
+                generation owns it (concern 67).
             RunNotInFlightError: the run is no longer in flight for some other
                 reason -- it finished on its own. The workflow is later than its
                 own run, which is a different fault and is not reported as an
                 abandonment.
         """
+        conditions: list[ColumnElement[bool]] = [
+            TaskRunRow.status.in_(ABANDONABLE_RUN_STATUSES)
+        ]
+        if expected_generation is not None:
+            conditions.append(TaskRunRow.execution_generation == expected_generation)
         found = self.session.scalar(
             select(TaskRunRow.id)
-            .where(
-                TaskRunRow.id == run_id,
-                TaskRunRow.status.in_(ABANDONABLE_RUN_STATUSES),
-            )
+            .where(TaskRunRow.id == run_id, *conditions)
             .with_for_update()
         )
         if found is not None:
@@ -309,6 +423,19 @@ class TaskRunRepository(Repository[TaskRunRow, TaskRun]):
         row = self._require_row(run_id)
         if row.status is RunStatus.ABANDONED:
             raise AbandonedRunError(row.id)
+        if (
+            expected_generation is not None
+            and row.execution_generation != expected_generation
+            and row.status in ABANDONABLE_RUN_STATUSES
+        ):
+            # Concern 67. The run is in flight and nobody stopped it; somebody
+            # else was authorized to continue it. Reported as its own fault so
+            # an operator is not told a run they recovered was abandoned.
+            raise RunOwnershipLostError(
+                row.id,
+                held=expected_generation,
+                current=row.execution_generation,
+            )
         raise RunNotInFlightError(
             f"Run {row.id} is {row.status}; a workflow still holding it is not in flight"
         )
