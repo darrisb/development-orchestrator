@@ -147,6 +147,13 @@ def run_recoverability(
     transaction and guards its acquisition on that number, so a "yes" here is
     never the authority for a later write.
 
+    ``recovery_mode`` (concern 68) says what a recovery would *do*:
+    ``continue`` when a coder attempt remains inside the task's budget, or
+    ``settlement_only`` when none does but the run is non-terminal and the fix
+    loop still owes it a deterministic ``ESCALATED / RETRY_EXHAUSTED`` ending.
+    A settlement-only recovery acquires ownership exactly as a continuation
+    does, and executes no attempt, no provider call and no verification.
+
     Responses:
 
     * ``200`` -- the assessment, whatever it says. A run that cannot be
@@ -195,6 +202,18 @@ async def recover_run(
     review accounting from the durable record, so an interrupted attempt is
     neither repeated nor double-counted.
 
+    **Two kinds of recovery, one operation (concern 68).** When the coder budget
+    is already spent, the run is still re-entered -- but only so the workflow can
+    write the ending it owes. The response's ``recovery_mode`` is then
+    ``settlement_only``, and the fix loop's own exhausted-budget path settles the
+    run as ``ESCALATED`` / ``RETRY_EXHAUSTED``: no attempt is started, no
+    provider is called, no verification command is run, no reviewer is asked, no
+    candidate is built and ``attempt_number`` does not move. There is no separate
+    code path and no request flag for this: it is the same call, and the
+    distinction is the fix loop's arithmetic rather than a branch the operator
+    chooses. What would previously have happened instead is a ``409``, leaving a
+    ``RUNNING`` run nothing would ever finish.
+
     Responses:
 
     * ``200`` -- ownership was acquired and the run was executed. The body
@@ -207,9 +226,10 @@ async def recover_run(
       same task; a ``PAUSED`` task (which has ``/tasks/{id}/resume``); a pause
       in force; a missing workflow checkpoint; a missing or unreadable starting
       commit; a diverged integration baseline; a missing worktree; attempt
-      accounting with nothing left inside ``max_attempts``; a dispatch that
-      currently holds the run; or a competing recovery that acquired the run
-      while this request was in flight.
+      accounting that could not be reconstructed or contradicts itself; a
+      dispatch that currently holds the run; or a competing recovery that
+      acquired the run while this request was in flight. A *spent* attempt
+      budget is no longer among them -- see ``settlement_only`` above.
     * ``422`` -- ``reason`` is missing, empty, or only whitespace.
 
     Two simultaneous requests cannot both acquire ownership: the acquisition is

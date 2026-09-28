@@ -7,7 +7,11 @@ from pydantic import BaseModel
 
 from ..domain.enums import RunStatus
 from ..domain.models import TaskRun
-from ..services.run_recovery import RecoverabilityReport, RecoveryAuthorization
+from ..services.run_recovery import (
+    RecoverabilityReport,
+    RecoveryAuthorization,
+    RecoveryMode,
+)
 
 
 class TaskRunResponse(BaseModel):
@@ -91,6 +95,13 @@ class RecoverabilityResponse(BaseModel):
     run_id: UUID
     external_run_id: str | None
     recoverable: bool
+    #: Concern 68. ``continue`` when a coder attempt remains inside the task's
+    #: budget; ``settlement_only`` when none does but the run is non-terminal and
+    #: the fix loop's deterministic exhausted-budget settlement is still owed to
+    #: it; ``None`` when the attempt accounting could not be trusted, which
+    #: always accompanies a refusal. A settlement-only recovery takes ownership
+    #: exactly as a continuation does and executes no attempt.
+    recovery_mode: RecoveryMode | None
     execution_generation: int
     execution_owner: str | None
     next_attempt: int | None
@@ -108,6 +119,7 @@ class RecoverabilityResponse(BaseModel):
             run_id=report.run_id,
             external_run_id=report.external_run_id,
             recoverable=report.recoverable,
+            recovery_mode=report.recovery_mode,
             execution_generation=report.execution_generation,
             execution_owner=report.execution_owner,
             next_attempt=report.next_attempt,
@@ -130,7 +142,10 @@ class RunRecoveryResponse(BaseModel):
     run: TaskRunResponse
     previous_generation: int
     generation: int
-    next_attempt: int | None
+    #: Concern 68: what this recovery was authorized to do. A
+    #: ``settlement_only`` recovery executed no coder attempt.
+    recovery_mode: RecoveryMode | None = None
+    next_attempt: int | None = None
     outcome: str | None = None
     state: dict[str, object] | None = None
 
@@ -145,6 +160,7 @@ class RunRecoveryResponse(BaseModel):
             run=TaskRunResponse.from_domain(run),
             previous_generation=authorization.previous_generation,
             generation=authorization.generation,
+            recovery_mode=authorization.recovery_mode,
             next_attempt=authorization.next_attempt,
             outcome=str(state.get("outcome")) if state and state.get("outcome") else None,
             state=dict(state) if state else None,

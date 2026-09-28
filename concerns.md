@@ -3142,3 +3142,213 @@ never resumed, retried or abandoned, TS-110 was never started, TraceStack was
 never manually modified and `agent/integration` was never moved. Every fixture
 reproducing the run is synthetic, in a private database and a private
 repository under `tmp_path`.
+
+## 68. Exhausting the attempt budget made a run permanently unrecoverable -- **resolved**
+
+**Observed evidence.** Discovered by the first live use of concern 67's
+recovery, against `RUN-20260928-000005`
+(`9760dfeb-3112-4b4f-b67f-5ae4daa7b2b1`, TS-109) on
+`clean@ca17e9ae032695121c152d3297145277263ff396`. The sequence, and the point
+is that eight of its nine steps are the system working:
+
+1. Concern 66 fixed the transaction lifetime: a fix-loop turn no longer holds a
+   database transaction across model inference.
+2. Concern 67 added safe execution ownership and an operator recovery that takes
+   the next `execution_generation` atomically.
+3. The run was recovered, correctly, generation 0 -> 1: one recovery
+   authorization, the same `TaskRun`, no duplicate executor.
+4. The reconstruction correctly selected attempt 3 -- not 1, which would have
+   overwritten the evidence of attempt 1, and not 2, whose `model_runs` row the
+   pre-concern-66 defect destroyed but whose artifact directory survived to
+   prove the provider had been asked.
+5. Attempt 3 reached the provider's 600-second timeout.
+6. Concern 66 correctly persisted that timeout after inference: the `CODE`
+   `model_runs` row is durably `FAILED` with `ModelTimeout` and
+   `duration_ms ~ 600000`. No coding output, no verification, no review, no
+   candidate.
+7. Concern 67 correctly released execution ownership on the way out.
+8. The durable accounting therefore correctly said attempts 1, 2 and 3 were
+   spent, against `max_attempts = 3`.
+
+**The attempt-3 timeout is a provider timeout, not a supervisor defect.** It is
+what a 600-second local endpoint does, and every layer of the supervisor
+recorded it exactly as it should have. The ninth step is the defect:
+
+9. `GET /runs/{run_id}/recoverability` then reported `recoverable: false`, with
+   one failing check -- `attempt_accounting_reconstructable`: *"the next durable
+   coder execution would be attempt 4 of at most 3 ... there is no attempt left
+   to execute, so recovering would only exhaust the budget again"*.
+
+So the run was stranded permanently: `run.status = RUNNING`,
+`task.status = CODING`, `attempt_number = 3`, `execution_generation = 1`,
+`execution_owner = NULL`, `candidate_commit = NULL`, and no supported operation
+that could finish it. Abandonment would have been a different and lossier
+answer: it writes `ABANDONED`, which is not the ending the run earned, and it
+produces no escalation for a person to read.
+
+**Root cause.** One check was answering two questions:
+
+A. is there a coder attempt left to execute?
+B. is there any useful workflow action left to take?
+
+Those are not equivalent, and the fix loop has always known it. When the budget
+is spent, `agents.fix_loop.run_fix_loop` computes `first > ceiling`, logs
+`fix_loop_attempts_already_spent`, and iterates `range(first, ceiling + 1)` --
+which is *empty*. No attempt is executed, no provider is called, no verification
+command is run, no reviewer is asked, no candidate is built and
+`attempt_number` is never advanced, because the row is only advanced inside the
+loop body. Control falls through to the closing
+`settle(outcome=ESCALATED, reason=RETRY_EXHAUSTED)`. That settlement is
+outstanding work owed to the run, and `fix_loop_attempts_already_spent` exists
+precisely to name this state. The recovery gate was refusing re-entry for the
+one operation that did not need a provider at all.
+
+**The invariant.** Exhausting the coder-attempt budget must never make an
+in-flight run unrecoverable when deterministic terminal settlement remains
+pending. Recovery after exhaustion must be able to reacquire execution ownership
+solely to perform that settlement, and it must not manufacture another attempt.
+
+**The fix, and what it deliberately is not.** It is not a settlement
+implementation. The fix loop already owns that policy, and a second copy of it
+in the recovery service would eventually disagree with the first -- so
+`services/run_recovery.py` gained no settlement code, no branch on mode in
+`recover_run`, and no new request parameter. What it gained is one distinction,
+made observable.
+
+`assess_recoverability` now asks the attempt-accounting question as two checks
+instead of one:
+
+* `attempt_accounting_reconstructable` -- can the record be trusted? Fails
+  closed when `recover_loop_state` raises, and fails when the numbers contradict
+  the reconstruction's own invariant (an attempt is charged when a model is
+  asked, so `next_attempt` is always strictly past `attempts_started`).
+* `workflow_action_available` -- is there anything left to do? Three answers,
+  reported as `recovery_mode`:
+  * `continue` -- `next_attempt <= max_attempts`. A coder/reviewer operation
+    remains; recovery behaves exactly as concern 67 made it behave.
+  * `settlement_only` -- `next_attempt > max_attempts` and the run is still in
+    flight (`run_in_flight` is a separate check and is not restated). No attempt
+    may be executed; the fix loop's own exhausted-budget path settles the run.
+  * neither, and the assessment refuses.
+
+`recovery_mode` is on `RecoverabilityReport`, on `RecoveryAuthorization`, in the
+`RUN_RECOVERY_AUTHORIZED` event payload, and on both
+`GET /runs/{run_id}/recoverability` and `POST /runs/{run_id}/recover`. The
+max-attempt guard was not deleted: the arithmetic is unchanged and still reports
+`next_attempt = 4 of at most 3`. What changed is only what that answer is taken
+to *mean*.
+
+**Settlement-only safety, all of it enforced by mechanisms that already
+existed.** Ownership is acquired by the same single guarded `UPDATE`, so old
+generations stay fenced and two simultaneous requests still produce one owner.
+The same `TaskRun` is used -- no new run, no `run_number` change, no new
+external identity. `attempt_number` does not move, no `model_run` is created,
+no provider is called, no verification command is executed, no reviewer is
+asked, no candidate is built, `agent/integration` does not move, exactly one
+audit event is appended, and execution ownership is released afterwards. The
+terminal result is the repository's existing one for a spent budget: run
+`FAILED` with `failure_reason = RETRY_EXHAUSTED`, task `HUMAN_REVIEW`, one
+`OPEN` `HumanEscalation` whose reason is `RETRY_EXHAUSTED` and whose summary
+reads "3 of the task's 3 permitted attempts were made", `HUMAN_REVIEW_REQUIRED`
+in `run_events`, and the workflow outcome `ESCALATED`. No parallel state was
+invented.
+
+**Boundary policy.** `max_attempts = 0` -- or any ceiling below the next attempt
+-- is `settlement_only`, because that is what the fix loop does with it: `first`
+is 1, `ceiling` is 0, the range is empty and the loop settles. A run nobody may
+make an attempt for still has a `RUNNING` row that something has to close. Such
+a run cannot be *created* (`create_run` refuses a first attempt outside the
+ceiling); it is reached by a ceiling lowered after the fact, which is how the
+test constructs it.
+
+**RUN-20260928-000005 reconstruction, unchanged.** `attempts_started = 3`,
+`next_attempt = 4`, `max_attempts = 3`. Attempt 2 is not reinterpreted as free,
+`attempt_number` is not rolled backward, attempt 3 is not re-executed and
+attempt 4 is not executed. `next_attempt > max_attempts` now routes to
+deterministic settlement instead of to a refusal.
+
+**Tests.** `tests/integration/test_concern68.py`, 25 tests. The fixture rebuilds
+the *post*-concern-67 signature -- attempt 1 `CODE` `SUCCEEDED` then
+`BUILD_FAILED`, attempt 2 as an artifact directory only (the row concern 66's
+defect ate), attempt 3 `CODE` `FAILED` with a 600000 ms `ModelTimeout`, run
+`RUNNING` at `attempt_number = 3` and `execution_generation = 1` with no owner,
+task `CODING`, `max_attempts = 3`, a real repository with `agent/integration`, a
+worktree at the starting commit, and a genuine LangGraph checkpoint written
+through `SqlAlchemyCheckpointSaver` because these tests actually resume the
+graph. A guard test pins the fixture itself.
+
+**The negative evidence is from witnesses, not from the event log.** A log can
+only say what was *recorded*, and an unrecorded call is exactly the failure mode
+this sequence of concerns began with. So the coder and reviewer handed to the
+recovered `WorkflowRunner` record every request and then raise
+(`NeverCalledCoder`, `NeverCalledReviewer`), the project's verification command
+is a script whose only job is to append to a sentinel file, and the tests assert
+the recorded call lists are empty and the sentinel does not exist. A settlement
+that quietly asked a model anything and swallowed the error fails here.
+
+Coverage: the exact signature recoverable for settlement; `settlement_only`
+rather than `continue`, and `continue` still reported when an attempt remains;
+the zero-ceiling boundary; inconsistent and unreadable accounting both
+fail-closed with both checks refusing; the read mutating nothing; generation
+1 -> 2 acquired atomically and released; the same `TaskRun`, `run_number` and
+`external_run_id`; `attempt_number` and `attempts_started` both still 3; no
+attempt-4 directory, `model_run` or `FIX_STARTED` event; no coder call, no
+reviewer call, no verification command and no `verification_runs` row; no
+candidate and `agent/integration` unmoved; the escalation and `RETRY_EXHAUSTED`
+from the fix loop's own path; the terminal state internally consistent and no
+longer recoverable; exactly one `RUN_RECOVERY_AUTHORIZED` event carrying
+`recovery_mode: settlement_only`; a repeated settlement request refused because
+the run is now terminal, with still one escalation and one authorization; the
+generation-1 holder fenced from persisting while the run is still in flight,
+with generation 2 allowed; a continuation recovery still really asking the
+coder; the whole settlement performed from a separate interpreter, engine and
+identity map; and the HTTP contract including the `RecoveryMode` enum in the
+OpenAPI schema.
+
+Two concern 67 tests asserted the refusal this concern removes and now assert
+the mode instead: `test_attempt_accounting_stays_inside_max_attempts` and
+`test_the_last_attempt_is_recoverable_and_the_one_after_only_settles`. Concern
+67's file header records the change.
+
+**PostgreSQL concurrency evidence.** Two tests on a scratch PostgreSQL database.
+`test_two_simultaneous_settlement_recoveries_produce_one_owner`: two threads, a
+`threading.Barrier` rather than sleeps, both reading the run at generation 1 and
+both correctly deciding it is recoverable for settlement -- which is why the
+decision cannot be the guard. Exactly one returns an authorization at generation
+2, one raises `EntityConflict`, and the run ends with one owner, one
+`RUN_RECOVERY_AUTHORIZED` event carrying `settlement_only`, `attempt_number`
+still 3 and still two `task_runs` rows. So one owner and one settlement. The
+reconstruction is also re-derived on PostgreSQL to `3 / 4 / 3`.
+
+**Mutation evidence.** Five controlled source mutations, each confirmed applied
+by grepping the file, each run against its detecting tests, each restored from a
+pre-mutation snapshot with the restoration verified by `sha256sum -c` followed by
+a green re-run. No result is counted from an edit that did not apply.
+
+| mutation | result |
+| --- | --- |
+| A -- `workflow_action_available` records `False` for the settlement branch, i.e. exhausted attempts are unrecoverable again | RED -- 10 tests, including the whole settlement fixture, both PostgreSQL tests, the HTTP eligibility test and both amended concern 67 tests |
+| B -- the fix loop's `ceiling` widened by one, so settlement starts attempt 4 | RED -- `AssertionError: the coder provider was asked for inference during a settlement-only recovery`, from the `execute` node; 10 fixture errors plus the subprocess test |
+| C -- `range(first, max(first, ceiling) + 1)`, so the loop makes a turn although the budget is spent | RED -- same coder-spy assertion, 10 fixture errors plus the subprocess test |
+| D -- settlement advances `attempt_number` to `first` | RED -- `test_the_settlement_does_not_move_the_attempt_accounting` observed `4 == 3`; `test_the_settlement_starts_no_fourth_attempt` observed an extra `attempt-4-cycle-1` directory; the subprocess test also red |
+| E -- settlement-only recovery skips `acquire_execution` entirely | RED -- 5 tests. `test_two_simultaneous_settlement_recoveries_produce_one_owner` returned `[1, 1]`: both operators authorized, both at generation 1, two owners and two settlements. The fence test stopped raising `RunOwnershipLostError` |
+
+**Regression validation.** Concern 68 targeted: 25 passed in 5.84s (of which the
+2 PostgreSQL tests run, not skip: 2 passed in 1.99s). Concern 67: 65 passed.
+Concern 64/65/67/68 plus `test_fix_loop_resume.py` and `test_db_locking.py`: 224
+passed in 61.63s. Concern 66 (`test_db_session_cleanup.py`) and Phase M: 3
+passed in 5.04s. Full SQLite suite, fixed order: 1424 passed in 108.19s.
+Randomized order (`pytest-randomly`): 1424 passed in 109.70s, and 1424 passed in
+106.90s on a second seed. Full PostgreSQL 16 suite
+(`postgresql+psycopg://.../test_orchestrator`): 1424 passed in 120.87s.
+Migrations: 10 passed. `ruff check .` clean. The PostgreSQL race tests each own a scratch database dropped on the way
+out and every SQLite fixture owns a file under `tmp_path`, so there is no
+cross-test pollution, no stale worktree under `WORKTREE_ROOT` and no change to
+any managed repository.
+
+**Campaign preservation.** Throughout implementation and validation
+`POST /runs/{run_id}/recover` was never called against `RUN-20260928-000005`,
+TS-109 was never retried or abandoned, TS-110 was never started, TraceStack was
+never modified and `agent/integration` was never moved. Every fixture
+reproducing the run is synthetic, in a private database and a private repository
+under `tmp_path`.

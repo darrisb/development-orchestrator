@@ -23,8 +23,16 @@ event is appended.
 
 **What they refuse.** Terminal, abandoned and superseded runs; a paused task,
 which keeps its own operation; a missing checkpoint; a starting commit that is
-gone; an integration baseline that diverged; attempt accounting with nothing
-left inside ``max_attempts``; and a run a dispatch is currently inside.
+gone; an integration baseline that diverged; and a run a dispatch is currently
+inside.
+
+**One of those refusals was wrong, and concern 68 removed it.** A spent attempt
+budget used to be refused here too. It is now reported as
+``recovery_mode="settlement_only"`` and recovered, because the fix loop still
+owes such a run a deterministic ``ESCALATED`` / ``RETRY_EXHAUSTED`` ending that
+costs no provider call. The two tests below that used to assert the refusal now
+assert the mode instead; ``tests/integration/test_concern68.py`` owns the rest
+of that behaviour, including the proof that no model is asked anything.
 
 **Where the real guarantee is.** Not in any of those refusals, which are
 policy, but in the fencing token: recovery increments
@@ -108,6 +116,7 @@ from apps.orchestrator.services.abandon import abandon_run
 from apps.orchestrator.services.errors import EntityConflict, EntityNotFound
 from apps.orchestrator.services.pauses import resume_task
 from apps.orchestrator.services.run_recovery import (
+    RecoveryMode,
     assess_recoverability,
     recover_run,
 )
@@ -412,12 +421,19 @@ def test_the_lost_provider_call_is_not_counted(signature: Signature):
 
 
 def test_attempt_accounting_stays_inside_max_attempts(signature: Signature):
-    """Recovery does not widen the budget, and refuses when it is spent."""
+    """Recovery does not widen the budget, and says so when it is spent.
+
+    Concern 68 changed the *consequence* of a spent budget, not the arithmetic:
+    the fourth attempt of a three-attempt task is still not executable, and the
+    assessment still says so. What it no longer does is call the run
+    unrecoverable, because settling it is neither an attempt nor optional.
+    """
     with signature.factory() as session:
         report = assess_recoverability(
             session, signature.run_id, settings=signature.settings
         )
         assert report.next_attempt <= report.max_attempts
+        assert report.recovery_mode is RecoveryMode.CONTINUE
 
     # Charge the remaining attempts the way they are really charged -- by
     # recording the calls that made them -- and the answer changes.
@@ -439,11 +455,9 @@ def test_attempt_accounting_stays_inside_max_attempts(signature: Signature):
             session, signature.run_id, settings=signature.settings
         )
     assert exhausted.next_attempt == 4
-    assert exhausted.recoverable is False
-    assert any(
-        check.name == "attempt_accounting_reconstructable"
-        for check in exhausted.refusals
-    )
+    assert exhausted.recovery_mode is RecoveryMode.SETTLEMENT_ONLY
+    assert exhausted.recoverable is True
+    assert exhausted.refusals == ()
 
 
 def test_the_review_cycle_accounting_is_preserved(signature: Signature):
@@ -2063,16 +2077,22 @@ def test_a_begun_attempt_with_no_row_is_still_charged(signature: Signature):
     assert report.recoverable is True
 
 
-def test_the_last_attempt_is_recoverable_and_the_one_after_is_not(
+def test_the_last_attempt_is_recoverable_and_the_one_after_only_settles(
     signature: Signature,
 ):
-    """The boundary, from both sides, with nothing else changed."""
+    """The boundary, from both sides, with nothing else changed.
+
+    Concern 68: past the boundary the run is still recoverable, but for a
+    different purpose. The two sides are distinguished by ``recovery_mode``,
+    which is the whole point of having one.
+    """
     _begin_attempt_directory(signature, 2, 1)
     with signature.factory() as session:
         last = assess_recoverability(
             session, signature.run_id, settings=signature.settings
         )
     assert (last.next_attempt, last.recoverable) == (3, True)
+    assert last.recovery_mode is RecoveryMode.CONTINUE
 
     _begin_attempt_directory(signature, 3, 1)
     with signature.factory() as session:
@@ -2080,10 +2100,9 @@ def test_the_last_attempt_is_recoverable_and_the_one_after_is_not(
             session, signature.run_id, settings=signature.settings
         )
     assert spent.next_attempt == 4
-    assert spent.recoverable is False
-    assert {check.name for check in spent.refusals} == {
-        "attempt_accounting_reconstructable"
-    }
+    assert spent.recoverable is True
+    assert spent.recovery_mode is RecoveryMode.SETTLEMENT_ONLY
+    assert spent.refusals == ()
 
 
 def test_a_recovered_run_does_not_overwrite_a_begun_attempt_directory(

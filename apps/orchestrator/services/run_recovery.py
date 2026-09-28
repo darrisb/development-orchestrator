@@ -63,12 +63,54 @@ executor is fenced whether it is alive or not.
 **Recoverability is decided from durable evidence, and it fails closed.** Every
 check below is a statement about what is on the record or on disk; none of them
 is a statement about how long something has taken.
+
+**Concern 68: an exhausted attempt budget is not an exhausted workflow.** The
+first live use of this module recovered ``RUN-20260928-000005`` as generation 1,
+the reconstruction correctly selected attempt 3, and attempt 3 reached the
+provider's 600-second timeout -- which concern 66 then persisted, and which
+concern 67 then unwound cleanly, releasing ownership. All of that is the system
+working. What was wrong was the answer to the *next* question: with attempts 1
+through 3 all durably spent against ``max_attempts = 3``, recoverability
+refused, on the grounds that "there is no attempt left to execute, so recovering
+would only exhaust the budget again".
+
+That conflated two different questions:
+
+A. is there a coder attempt left to execute?
+B. is there any useful workflow action left to take?
+
+They are not the same question, and the fix loop has always known it. When the
+budget is spent, ``run_fix_loop`` computes ``first > ceiling``, logs
+``fix_loop_attempts_already_spent``, iterates an *empty* range -- so no attempt
+is executed, no provider is called, no verification command is run, no reviewer
+is asked and no candidate is built -- and falls through to its closing
+``settle(ESCALATED, RETRY_EXHAUSTED)``. That deterministic settlement is
+outstanding work, owed to the run. Refusing re-entry to perform it leaves a
+``RUNNING`` row with a ``CODING`` task that nothing will ever finish.
+
+So the accounting assessment now reports three answers rather than two, and the
+distinction is observable as ``recovery_mode``:
+
+* ``continue`` -- a coder attempt remains inside the budget.
+* ``settlement_only`` -- the budget is spent and deterministic settlement is
+  pending. Ownership is acquired exactly as it is for a continuation, because
+  the settlement writes to the run and must be fenced like anything else, but
+  the recovered executor manufactures no attempt: the fix loop's own
+  exhausted-budget path is what settles, and this module deliberately does not
+  own a second copy of that policy.
+* neither -- the accounting could not be reconstructed or is not self
+  consistent, which remains a refusal.
+
+The arithmetic itself is unchanged. Attempts 1-3 of RUN-20260928-000005 are
+still spent, the next durable coder execution is still attempt 4, and 4 is
+still more than 3. What changed is only what that answer is taken to *mean*.
 """
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from enum import StrEnum
 from uuid import UUID
 
 from sqlalchemy import select
@@ -118,6 +160,26 @@ RECOVERABLE_TASK_STATES: frozenset[TaskStatus] = ACTIVE_STATES | frozenset(
 )
 
 
+class RecoveryMode(StrEnum):
+    """What a recovery of this run would actually do (concern 68).
+
+    Not a durable state and not a request parameter: it is a *reading* of the
+    durable record, derived in the same pass as every other check, and it exists
+    so that "recoverable" stops meaning two things at once. An operator deciding
+    what to do about a stranded run needs to know whether re-entering it will
+    ask a model for another attempt or only write the ending the workflow
+    already owes it, and those have very different consequences.
+    """
+
+    #: A valid next coder/reviewer operation remains inside the task's budget.
+    CONTINUE = "continue"
+    #: No coder attempt remains, but the run is non-terminal and the fix loop's
+    #: own exhausted-budget path can settle it without any external or model
+    #: work. See ``agents.fix_loop.run_fix_loop``: ``first > ceiling`` iterates
+    #: nothing and falls through to ``settle(ESCALATED, RETRY_EXHAUSTED)``.
+    SETTLEMENT_ONLY = "settlement_only"
+
+
 @dataclass(frozen=True, slots=True)
 class RecoverabilityCheck:
     """One durable question, its answer, and what the answer was read from."""
@@ -149,6 +211,10 @@ class RecoverabilityReport:
     #: request is implicitly quoting back to the database.
     execution_generation: int = 0
     execution_owner: str | None = None
+    #: What recovering this run would do: continue it, or only settle it
+    #: (concern 68). ``None`` when the accounting could not be trusted, which is
+    #: the fail-closed reading and always accompanies a refusal.
+    recovery_mode: RecoveryMode | None = None
     #: What the reconstruction says the next durable coder execution would be.
     next_attempt: int | None = None
     attempts_started: int | None = None
@@ -162,11 +228,17 @@ class RecoverabilityReport:
     def refusals(self) -> tuple[RecoverabilityCheck, ...]:
         return tuple(check for check in self.checks if not check.passed)
 
+    @property
+    def settlement_only(self) -> bool:
+        """This run may be re-entered only to be settled (concern 68)."""
+        return self.recovery_mode is RecoveryMode.SETTLEMENT_ONLY
+
     def describe(self) -> dict[str, object]:
         return {
             "run_id": str(self.run_id),
             "external_run_id": self.external_run_id,
             "recoverable": self.recoverable,
+            "recovery_mode": self.recovery_mode.value if self.recovery_mode else None,
             "execution_generation": self.execution_generation,
             "execution_owner": self.execution_owner,
             "next_attempt": self.next_attempt,
@@ -193,6 +265,17 @@ class RecoveryAuthorization:
     #: Present so a caller can state the reconstruction it is about to execute
     #: without recomputing it.
     next_attempt: int | None = field(default=None)
+    #: Concern 68. What this recovery is for: continuing the run, or only
+    #: letting the workflow settle it. The execution that follows is the same
+    #: call either way -- the distinction is enforced by the fix loop's own
+    #: arithmetic, not by a branch here -- so this is what the authorization
+    #: says it authorized, and it is on the audit event too.
+    recovery_mode: RecoveryMode | None = field(default=None)
+
+    @property
+    def settlement_only(self) -> bool:
+        """This recovery was authorized to settle the run, not to continue it."""
+        return self.recovery_mode is RecoveryMode.SETTLEMENT_ONLY
 
 
 def assess_recoverability(
@@ -399,35 +482,95 @@ def assess_recoverability(
         )
 
     # ---- attempt / review accounting --------------------------------------
+    #
+    # Concern 68 split this in two, because one check was answering two
+    # questions. "Can the accounting be trusted?" is about whether the durable
+    # record is coherent, and it fails closed. "Is there anything left to do?"
+    # is about the workflow, and its answer has three values, not two: a coder
+    # attempt inside the budget, a spent budget with the fix loop's
+    # deterministic settlement still owed, or nothing. The middle one used to be
+    # filed under "nothing", which is what stranded RUN-20260928-000005 for
+    # good; see this module's docstring.
     next_attempt: int | None = None
     attempts_started: int | None = None
     reviews_completed: int | None = None
+    mode: RecoveryMode | None = None
+    ceiling = task.limits.max_attempts
     try:
         loop_state = recover_loop_state(session, run, settings=config)
-        next_attempt = loop_state.next_attempt
-        attempts_started = loop_state.attempts_started
-        reviews_completed = loop_state.reviews_completed
-        within = next_attempt <= task.limits.max_attempts
-        record(
-            "attempt_accounting_reconstructable",
-            within,
-            f"the next durable coder execution would be attempt {next_attempt} "
-            f"of at most {task.limits.max_attempts} "
-            f"(attempts started: {attempts_started}, reviews completed: "
-            f"{reviews_completed})"
-            + (
-                ""
-                if within
-                else "; there is no attempt left to execute, so recovering would "
-                "only exhaust the budget again"
-            ),
-        )
-    except Exception as error:  # pragma: no cover - defensive; fails closed
+    except Exception as error:  # defensive; fails closed, and is tested
         record(
             "attempt_accounting_reconstructable",
             False,
             f"the run's attempt accounting could not be reconstructed: {error}",
         )
+        record(
+            "workflow_action_available",
+            False,
+            "accounting that cannot be reconstructed cannot be told apart from "
+            "accounting that says the run is finished, and acting on either "
+            "reading would be a guess",
+        )
+    else:
+        next_attempt = loop_state.next_attempt
+        attempts_started = loop_state.attempts_started
+        reviews_completed = loop_state.reviews_completed
+        # The reconstruction's own invariant, asserted rather than assumed: an
+        # attempt is charged when a model is asked, so the number to continue at
+        # is always strictly past every number already begun. A record that says
+        # otherwise is a record this module must not act on, in either mode.
+        consistent = (
+            next_attempt >= 1
+            and attempts_started >= 0
+            and reviews_completed >= 0
+            and next_attempt > attempts_started
+        )
+        accounting = (
+            f"attempts started {attempts_started}, reviews completed "
+            f"{reviews_completed}, the next durable coder execution would be "
+            f"attempt {next_attempt} of at most {ceiling}"
+        )
+        record(
+            "attempt_accounting_reconstructable",
+            consistent,
+            accounting
+            if consistent
+            else accounting
+            + "; those numbers are not self-consistent -- an attempt is charged "
+            "when a model is asked, so the next attempt cannot be at or behind "
+            "the attempts already started",
+        )
+        if not consistent:
+            record(
+                "workflow_action_available",
+                False,
+                "there is no safe continuation and no safe settlement to derive "
+                "from accounting that contradicts itself",
+            )
+        elif next_attempt <= ceiling:
+            mode = RecoveryMode.CONTINUE
+            record(
+                "workflow_action_available",
+                True,
+                f"attempt {next_attempt} of {ceiling} remains, so recovery "
+                "continues the run through the ordinary fix loop",
+            )
+        else:
+            # The budget is spent and the run is not terminal -- ``run_in_flight``
+            # above is what establishes the second half of that, and it is a
+            # check of its own, so this branch does not restate it. What is left
+            # is the ending the fix loop owes the run, and the fix loop is what
+            # writes it.
+            mode = RecoveryMode.SETTLEMENT_ONLY
+            record(
+                "workflow_action_available",
+                True,
+                f"the coder budget is spent ({accounting}), so no attempt may be "
+                "executed; the run is still in flight, and the fix loop's "
+                "exhausted-budget path settles it deterministically as "
+                "ESCALATED / RETRY_EXHAUSTED without calling a provider, "
+                "running a verification command or building a candidate",
+            )
 
     # ---- ownership ---------------------------------------------------------
     if run.execution_owner is None:
@@ -457,11 +600,12 @@ def assess_recoverability(
         checks=tuple(checks),
         execution_generation=run.execution_generation,
         execution_owner=run.execution_owner,
+        recovery_mode=mode,
         next_attempt=next_attempt,
         attempts_started=attempts_started,
         reviews_completed=reviews_completed,
         review_cycle=run.review_cycle,
-        max_attempts=task.limits.max_attempts,
+        max_attempts=ceiling,
         candidate_commit=run.candidate_commit,
         integration_advanced_since_start=integration_advanced,
     )
@@ -553,6 +697,9 @@ def recover_run(
                 "previous_execution_owner": report.execution_owner,
                 "task_status": task.status.value,
                 "run_status": run.status.value,
+                "recovery_mode": (
+                    report.recovery_mode.value if report.recovery_mode else None
+                ),
                 "next_attempt": report.next_attempt,
                 "attempts_started": report.attempts_started,
                 "reviews_completed": report.reviews_completed,
@@ -568,6 +715,7 @@ def recover_run(
         previous_generation=report.execution_generation,
         generation=acquired.execution_generation,
         execution_owner=dispatch,
+        recovery_mode=report.recovery_mode.value if report.recovery_mode else None,
         next_attempt=report.next_attempt,
         reason=reason,
         requested_by=requested_by,
@@ -580,6 +728,7 @@ def recover_run(
         report=report,
         event_id=event.id,
         next_attempt=report.next_attempt,
+        recovery_mode=report.recovery_mode,
     )
 
 
@@ -634,6 +783,7 @@ __all__ = [
     "RecoverabilityCheck",
     "RecoverabilityReport",
     "RecoveryAuthorization",
+    "RecoveryMode",
     "assess_recoverability",
     "recover_run",
 ]
