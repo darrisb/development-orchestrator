@@ -138,3 +138,68 @@ def test_the_integration_escalation_page_names_the_tasks_it_is_holding_up():
     assert "re-attempt the integration" in page
     # And it says what is true of the repository: nothing was rolled back.
     assert "nothing has been rolled back" in page
+
+
+def test_retry_task_option_does_not_claim_to_reword_or_split():
+    """Concern 69: RETRY_TASK must not advertise capabilities it does not provide.
+
+    The live TS-109 escalation exposed that the option text said "Reword or split
+    the task" but the operation only transitions HUMAN_REVIEW -> READY without
+    editing the task specification. There is no supported API for task editing or
+    splitting, so the text must not claim the operator can do either.
+    """
+    options = run_escalation_options(FailureReason.RETRY_EXHAUSTED)
+    retry_option = next(opt for opt in options if opt.intent == EscalationIntent.RETRY_TASK)
+    text = retry_option.text.casefold()
+
+    assert "reword" not in text
+    assert "split" not in text
+    assert "edit" not in text
+    assert "amend" not in text
+    assert "change the task" not in text
+
+
+def test_retry_task_option_communicates_same_specification_retry():
+    """Concern 69: the option must say what it actually does.
+
+    RETRY_TASK reopens the task to READY so the scheduler can create a new run
+    from the current task specification as it exists in the database. The text
+    must communicate that the same specification will be retried.
+    """
+    options = run_escalation_options(FailureReason.RETRY_EXHAUSTED)
+    retry_option = next(opt for opt in options if opt.intent == EscalationIntent.RETRY_TASK)
+    text = retry_option.text.casefold()
+
+    assert "same specification" in text or "same task" in text
+    assert "known-good sha" in text or "known-good" in text
+    assert "run" in text or "again" in text
+
+
+def test_review_retry_task_option_does_not_claim_to_reword_or_split():
+    """Concern 69: review escalation RETRY_TASK must also be truthful.
+
+    The review path (domain/review.py) offers RETRY_TASK in a different context
+    (retry_exhausted routing) but with the same semantics: it reopens the task
+    without editing it. The text must not claim capabilities the operation does
+    not provide.
+    """
+    from apps.orchestrator.domain.enums import ReviewDecision, TaskStatus
+    from apps.orchestrator.domain.review import ReviewRouting, escalation_options
+
+    routing = ReviewRouting(
+        decision=ReviewDecision.HUMAN_REVIEW_REQUIRED,
+        reviewer_decision=ReviewDecision.HUMAN_REVIEW_REQUIRED,
+        task_status=TaskStatus.HUMAN_REVIEW,
+        retry_exhausted=True,
+        escalated_by_policy=False,
+    )
+    options = escalation_options(routing)
+    retry_option = next(opt for opt in options if opt.intent == EscalationIntent.RETRY_TASK)
+    text = retry_option.text.casefold()
+
+    assert "reword" not in text
+    assert "split" not in text
+    assert "edit" not in text
+    assert "amend" not in text
+    assert "change the task" not in text
+    assert "same specification" in text or "same task" in text

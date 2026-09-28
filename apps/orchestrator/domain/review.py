@@ -723,7 +723,7 @@ def escalation_options(routing: ReviewRouting) -> tuple[EscalationOption, ...]:
             EscalationOption(
                 "B",
                 EscalationIntent.RETRY_TASK,
-                "Reword or split the task and run it again from the known-good SHA.",
+                "Run the task again from the known-good SHA with the same specification.",
             ),
             EscalationOption(
                 "C",
