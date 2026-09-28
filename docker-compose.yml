@@ -25,6 +25,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        SOURCE_REVISION: "${SOURCE_REVISION:-unknown/dev}"
+        SOURCE_DIRTY: "${SOURCE_DIRTY:-unknown}"
+        BUILD_TIME: "${BUILD_TIME:-unknown}"
     depends_on:
       postgres:
         condition: service_healthy

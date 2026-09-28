@@ -12,8 +12,20 @@ from .errors import InvalidStateTransition
 
 #: Allowed transitions. A state absent from a value set is unreachable from
 #: that key by design.
+#:
+#: ``PENDING`` and ``READY`` may reach ``FAILED`` (concern 64). Neither is
+#: "in flight" -- no work has started on either -- so a state machine built only
+#: from the workflow's own vocabulary had no way to record that a person's
+#: decision stopped the work: the only moves out of PENDING and READY are the
+#: ones that start or defer it. That left an abandoned run's task parked in
+#: READY, which the scheduler then treats as unstarted work and picks up again,
+#: so the run was stopped and the work was not. FAILED is the state that means
+#: "a person has to look at this", and from FAILED only a person can move on.
+#: Every state except COMPLETE can now reach it.
 ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
-    TaskStatus.PENDING: frozenset({TaskStatus.READY, TaskStatus.BLOCKED, TaskStatus.PAUSED}),
+    TaskStatus.PENDING: frozenset(
+        {TaskStatus.READY, TaskStatus.BLOCKED, TaskStatus.PAUSED, TaskStatus.FAILED}
+    ),
     TaskStatus.READY: frozenset(
         {
             TaskStatus.PLANNING,
@@ -21,6 +33,7 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.BLOCKED,
             TaskStatus.HUMAN_REVIEW,
             TaskStatus.PAUSED,
+            TaskStatus.FAILED,
         }
     ),
     TaskStatus.PLANNING: frozenset(

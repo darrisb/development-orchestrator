@@ -3,16 +3,19 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.sql.elements import ColumnElement
 
 from ..db.models import TaskRow, TaskRunRow
-from ..domain.enums import RunStatus
+from ..domain.enums import ABANDONABLE_RUN_STATUSES, RunStatus
+from ..domain.errors import AbandonedRunError, RunNotInFlightError
 from ..domain.models import TaskRun
 from .base import Repository
 
 
 class TaskRunRepository(Repository[TaskRunRow, TaskRun]):
     row_type = TaskRunRow
+    label = "Task run"
 
     def _to_domain(self, row: TaskRunRow) -> TaskRun:
         return TaskRun(
@@ -118,7 +121,16 @@ class TaskRunRepository(Repository[TaskRunRow, TaskRun]):
         return [self._to_domain(row) for row in rows]
 
     def list_incomplete(self) -> list[TaskRun]:
-        """Runs that were in flight when the orchestrator stopped (section 28)."""
+        """Runs that were in flight when the orchestrator stopped (section 28).
+
+        The ``status IN (PENDING, RUNNING)`` filter is the mechanism by which a
+        terminal run stays undiscoverable, and it is deliberately the only
+        mechanism. ``SUCCEEDED``, ``FAILED`` and ``ABANDONED`` (concern 64) are
+        all absent, so recovery never has to decide whether a terminal run is
+        worth resuming: it is never handed one. A caller cannot accidentally
+        resume an abandoned run by forgetting to check, because the query it
+        iterates does not return abandoned runs in the first place.
+        """
         rows = self.session.scalars(
             select(TaskRunRow).where(
                 TaskRunRow.status.in_([RunStatus.PENDING, RunStatus.RUNNING])
@@ -129,19 +141,168 @@ class TaskRunRepository(Repository[TaskRunRow, TaskRun]):
     def finish(
         self, run_id: UUID, status: RunStatus, failure_reason: str | None = None
     ) -> TaskRun:
-        row = self._get_row(run_id)
-        if row is None:
-            raise LookupError(f"Task run {run_id} not found")
-        row.status = status
-        row.failure_reason = failure_reason
-        row.completed_at = datetime.now(UTC)
-        self.session.flush()
-        return self._to_domain(row)
+        """Close a run, durably refusing to move one an operator abandoned.
+
+        Concern 64. Abandonment is the only terminal status a running workflow
+        can still race with: the operator writes ``ABANDONED`` from a different
+        transaction than the one that finishes the run. An unconditional
+        assignment here loses that race -- the workflow's ``SUCCEEDED``
+        overwrites the operator's decision and the run looks like it completed
+        normally, which is exactly the silent resurrection concern 64 is about.
+
+        So this is a compare-and-swap, not a read followed by a write. The
+        ``status <> 'ABANDONED'`` predicate is evaluated by the database while
+        the row lock is held, which is what makes the outcome a function of
+        commit order rather than of whichever transaction happened to read the
+        row last:
+
+        * abandonment committed first -- no row matches, and the caller is told
+          the run is abandoned;
+        * this call committed first -- the run reaches its intended terminal
+          status, and a later :meth:`abandon` finds nothing active to abandon.
+
+        No other transition is affected. ``PENDING``, ``RUNNING``,
+        ``SUCCEEDED`` and ``FAILED`` runs finish exactly as they did before;
+        only ``ABANDONED`` is protected, because it is the only status whose
+        loss is silent.
+
+        Raises:
+            LookupError: no such run.
+            AbandonedRunError: the run was abandoned by an operator. The write
+                did not happen.
+        """
+        if status is RunStatus.ABANDONED:
+            # The operator path has the mirror-image predicate, and it is the
+            # one that can legitimately lose; see abandon().
+            abandoned = self.abandon(run_id, failure_reason=failure_reason)
+            if abandoned is not None:
+                return abandoned
+            row = self._require_row(run_id)
+            raise AbandonedRunError(row.id)
+        finished = self._try_finish(
+            run_id, status, failure_reason, TaskRunRow.status != RunStatus.ABANDONED
+        )
+        if finished is not None:
+            return finished
+        row = self._require_row(run_id)
+        raise AbandonedRunError(row.id)
+
+    def abandon(self, run_id: UUID, *, failure_reason: str | None = None) -> TaskRun | None:
+        """Compare-and-swap a run to ``ABANDONED`` from an in-flight status.
+
+        The mirror image of :meth:`finish`: this write is refused unless the
+        run is ``PENDING`` or ``RUNNING``, so an operator cannot rewrite a run
+        that already completed, and two operators racing cannot both win.
+
+        Returns ``None`` -- rather than raising -- when the predicate did not
+        match, because "someone else already finished or abandoned this run" is
+        a *result* the caller has to branch on, not an error. The caller
+        re-reads the run and reports idempotency or a conflict truthfully.
+        """
+        return self._try_finish(
+            run_id,
+            RunStatus.ABANDONED,
+            failure_reason,
+            TaskRunRow.status.in_(ABANDONABLE_RUN_STATUSES),
+        )
+
+    def _try_finish(
+        self,
+        run_id: UUID,
+        status: RunStatus,
+        failure_reason: str | None,
+        *conditions: ColumnElement[bool],
+    ) -> TaskRun | None:
+        """Write a terminal status if the row still matches ``conditions``.
+
+        Returns the finished run, or ``None`` if the row did not match -- which
+        is the same answer whether it was missing, already terminal, or lost
+        the race. The caller re-reads to tell those apart.
+        """
+        result = self.session.execute(
+            update(TaskRunRow)
+            .where(TaskRunRow.id == run_id, *conditions)
+            .values(
+                status=status,
+                failure_reason=failure_reason,
+                completed_at=datetime.now(UTC),
+            )
+            # "fetch" refreshes the identity map from the rows the update
+            # matched, so the TaskRun returned below reflects this write rather
+            # than a stale copy read earlier in the transaction.
+            .execution_options(synchronize_session="fetch")
+        )
+        if result.rowcount != 1:
+            return None
+        return self._to_domain(self._require_row(run_id))
+
+    def require_in_flight(self, run_id: UUID) -> None:
+        """Barrier: refuse unless this run is still PENDING or RUNNING.
+
+        Concern 64, and the companion to :meth:`finish`. ``finish`` guards one
+        write -- the terminal status -- and that is not the same question as
+        "may this workflow keep going". A loop turn holds one transaction open
+        across a model call, and inside it the task moves several times and the
+        loop writes artifacts, model records and events. The graph's own fence
+        is a status read in an earlier node, so everything the turn writes after
+        that read happens with no further check at all, and the operator's
+        transaction can commit in the middle of it.
+
+        This is where that window is closed. ``SELECT ... FOR UPDATE`` with the
+        in-flight predicate, so the database evaluates the predicate while it
+        holds the row lock, and the ordering is the one PostgreSQL gives:
+
+        * the operator's commit landed first -- the lock is free, the predicate
+          is re-evaluated against the committed ``ABANDONED``, no row comes
+          back, and the turn is refused;
+        * this call got there first -- the operator's write blocks behind the
+          lock, this turn commits, and the operator's ``abandon`` finds the run
+          it is about to take. Whoever holds the lock first is the one whose
+          decision the other has to live with, which is the only ordering rule
+          that can be true for both.
+
+        A read would not do. ``SELECT`` without a lock takes no lock, so the
+        operator could commit immediately afterwards and the check would be
+        true and wrong -- a guard that reports the answer it read a moment
+        before the answer changed.
+
+        Raises:
+            LookupError: no such run.
+            AbandonedRunError: an operator abandoned the run.
+            RunNotInFlightError: the run is no longer in flight for some other
+                reason -- it finished on its own. The workflow is later than its
+                own run, which is a different fault and is not reported as an
+                abandonment.
+        """
+        found = self.session.scalar(
+            select(TaskRunRow.id)
+            .where(
+                TaskRunRow.id == run_id,
+                TaskRunRow.status.in_(ABANDONABLE_RUN_STATUSES),
+            )
+            .with_for_update()
+        )
+        if found is not None:
+            return
+        row = self._require_row(run_id)
+        if row.status is RunStatus.ABANDONED:
+            raise AbandonedRunError(row.id)
+        raise RunNotInFlightError(
+            f"Run {row.id} is {row.status}; a workflow still holding it is not in flight"
+        )
 
     def update_fields(self, run_id: UUID, **fields: object) -> TaskRun:
-        row = self._get_row(run_id)
-        if row is None:
-            raise LookupError(f"Task run {run_id} not found")
+        row = self._require_row(run_id)
+        # Concern 64: the same invariant as finish(), on the other write path
+        # into a run's status. _prepare_workspace uses this to move PENDING to
+        # RUNNING, which would resurrect an abandoned run just as surely as a
+        # late SUCCEEDED would. A read-then-write is enough here because this
+        # method is bookkeeping on a run the caller already holds, and the
+        # authoritative guard is finish()'s compare-and-swap.
+        if "status" in fields:
+            requested = fields["status"]
+            if requested is not RunStatus.ABANDONED and row.status is RunStatus.ABANDONED:
+                raise AbandonedRunError(row.id)
         for key, value in fields.items():
             if not hasattr(row, key):
                 raise AttributeError(f"TaskRun has no field {key!r}")

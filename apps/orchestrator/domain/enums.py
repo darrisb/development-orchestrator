@@ -41,7 +41,30 @@ class RunStatus(StrEnum):
     RUNNING = "RUNNING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    #: Terminal, and the only one an in-flight workflow can still race with:
+    #: an operator abandons a run from a different transaction than the one
+    #: executing it (concern 64).
     ABANDONED = "ABANDONED"
+
+
+#: Run statuses an operator may abandon (concern 64).
+#:
+#: ``ABANDONED`` is deliberately absent, and that is the whole point of this
+#: constant. A run that is already abandoned is not an *active abandonable*
+#: run; it is an abandoned one, and re-abandoning it is a question about
+#: idempotency rather than about eligibility. Carrying ``ABANDONED`` here --
+#: as the first cut of ``services.abandon`` did -- made one predicate answer
+#: two different questions, and callers that asked the eligibility question
+#: got "yes" for a run that was already closed. ``abandon_run`` recognizes an
+#: already-abandoned run on its own, before this set is consulted, and returns
+#: it without a second event.
+#:
+#: Every member is in flight. ``SUCCEEDED`` and ``FAILED`` are already
+#: terminal, so abandoning them would rewrite a completed run's outcome rather
+#: than stop work.
+ABANDONABLE_RUN_STATUSES: frozenset[RunStatus] = frozenset(
+    {RunStatus.PENDING, RunStatus.RUNNING}
+)
 
 
 class Complexity(StrEnum):
@@ -279,6 +302,9 @@ class RunEventType(StrEnum):
     PUSH_COMPLETED = "PUSH_COMPLETED"
     TASK_COMPLETED = "TASK_COMPLETED"
     HUMAN_REVIEW_REQUIRED = "HUMAN_REVIEW_REQUIRED"
+    #: An operator intentionally terminated an active durable run (concern 64).
+    #: The run is terminal and cannot be resumed.
+    RUN_ABANDONED = "RUN_ABANDONED"
 
 
 class WorkerProfile(StrEnum):

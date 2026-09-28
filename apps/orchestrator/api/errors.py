@@ -10,7 +10,7 @@ from __future__ import annotations
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
-from ..domain.errors import InvalidStateTransition, LimitExceeded, ManifestError
+from ..domain.errors import AbandonedRunError, InvalidStateTransition, LimitExceeded, ManifestError
 from ..providers.errors import ModelProviderError, ProviderNotConfigured
 from ..services.errors import (
     EntityConflict,
@@ -46,9 +46,16 @@ from ..services.git_errors import (
 #: traceback is the honest answer to a bug. Mapping ``GitError`` wholesale would
 #: have turned every one of them into a tidy 409 and hidden the next concern 59
 #: instead of surfacing it.
+#:
+#: ``AbandonedRunError`` is here for the same reason ``EntityConflict`` is
+#: (concern 64): a caller racing an operator's abandonment of the same run
+#: asked for something well formed that the world no longer allows, which is
+#: what 409 means. It reaches this layer only when the database refused a
+#: terminal write, so a 409 is a truthful report rather than a policy choice.
 _STATUS_BY_ERROR: tuple[tuple[type[Exception], int], ...] = (
     (EntityNotFound, status.HTTP_404_NOT_FOUND),
     (EntityConflict, status.HTTP_409_CONFLICT),
+    (AbandonedRunError, status.HTTP_409_CONFLICT),
     (InvalidStateTransition, status.HTTP_409_CONFLICT),
     (LimitExceeded, status.HTTP_409_CONFLICT),
     (NotInCapturableState, status.HTTP_409_CONFLICT),

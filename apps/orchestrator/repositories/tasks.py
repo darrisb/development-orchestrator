@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from ..db.models import TaskRow
 from ..domain.enums import TaskStatus
+from ..domain.errors import InvalidStateTransition
 from ..domain.models import Task, TaskLimits
 from ..domain.state_machine import assert_transition
 from .base import Repository
@@ -28,6 +29,7 @@ _IMMUTABLE_FIELDS = frozenset(
 
 class TaskRepository(Repository[TaskRow, Task]):
     row_type = TaskRow
+    label = "Task"
 
     def _to_domain(self, row: TaskRow) -> Task:
         return Task(
@@ -159,12 +161,61 @@ class TaskRepository(Repository[TaskRow, Task]):
     def transition(self, task_id: UUID, new_status: TaskStatus) -> Task:
         """Move a task to ``new_status``, enforcing the state machine.
 
+        Concern 64. A compare-and-swap, and not a read followed by a write, for
+        the same reason ``TaskRunRepository.finish`` is one: the status the
+        state machine checked is the status this session *believes* the task is
+        in, and a long workflow transaction believes it for a long time. When
+        the operator abandons a run, the same transaction moves the task to
+        FAILED; a workflow still holding the older copy then writes its own idea
+        of the task back over that, and the operator's decision silently
+        disappears from the task row while it stands on the run row. A task
+        resurrected from FAILED to APPROVED is worse than the run's own
+        resurrection, because APPROVED is the state that makes a candidate
+        deliverable.
+
+        So the database evaluates the predicate, while it holds the row lock:
+
+        * this call's commit lands first -- the move happens, and the operator's
+          abandonment then finds a task it may still move;
+        * the operator's commit landed first -- no row matches, nothing is
+          written, and the caller is told the task is no longer where it left
+          it rather than being allowed to overwrite a newer decision.
+
+        Nothing else changes. Every transition the orchestrator makes on its own
+        is unaffected, and ``InvalidStateTransition`` still answers "that move
+        is not permitted" from the same helper it always used -- what is new is
+        that a move is also refused when the row moved underneath the caller.
+
         Raises:
-            InvalidStateTransition: if the move is not permitted.
+            LookupError: no such task.
+            InvalidStateTransition: the move is not permitted from the task's
+                current status, including when another transaction changed it
+                after this session read it.
         """
         row = self._get_row(task_id)
         if row is None:
             raise LookupError(f"Task {task_id} not found")
-        row.status = assert_transition(row.status, new_status)
-        self.session.flush()
-        return self._to_domain(row)
+        current = row.status
+        target = assert_transition(current, new_status)
+        result = self.session.execute(
+            update(TaskRow)
+            .where(TaskRow.id == task_id, TaskRow.status == current)
+            .values(status=target)
+            # "fetch" so the identity map reflects the row that was matched
+            # rather than the copy this session read earlier.
+            .execution_options(synchronize_session="fetch")
+        )
+        if result.rowcount != 1:
+            # The row is there -- the predicate is what failed. Its current
+            # status is read with a statement rather than through the identity
+            # map, because the identity map is the stale copy this whole guard
+            # exists about, and quoting it would produce a confident and false
+            # message. assert_transition then explains the refusal in the terms
+            # the rest of the code already uses.
+            now = self.session.scalar(
+                select(TaskRow.status).where(TaskRow.id == task_id)
+            )
+            raise InvalidStateTransition(
+                TaskStatus(now) if now is not None else current, new_status
+            )
+        return self._to_domain(self._require_row(task_id))

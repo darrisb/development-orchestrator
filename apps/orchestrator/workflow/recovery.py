@@ -1,4 +1,16 @@
-"""Restart reconciliation for incomplete runs (build.md section 28)."""
+"""Restart reconciliation for incomplete runs (build.md section 28).
+
+**Abandoned runs are excluded by the query, not by a branch here (concern
+64).** The first cut of this module carried an explicit ``ABANDONED``
+disposition, reached from a check like ``if run.status is RunStatus.ABANDONED``,
+which could never be true: the loop iterates ``list_incomplete()``, and that
+repository method selects only ``PENDING`` and ``RUNNING``. The branch was
+unreachable code standing in for a real guarantee, and the real guarantee is
+one level down in the query itself. Terminality for *discovery* is therefore a
+property of the repository filter, and a test asserts it directly -- an
+abandoned run is absent from ``list_incomplete()`` after the session and
+process are rebuilt, not merely skipped by a conditional that never runs.
+"""
 
 from __future__ import annotations
 

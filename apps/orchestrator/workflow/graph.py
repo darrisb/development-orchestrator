@@ -14,7 +14,7 @@ from uuid import UUID
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy.orm import Session, sessionmaker
 
-from ..agents.fix_loop import LoopOutcome, run_fix_loop
+from ..agents.fix_loop import LoopOutcome, durable_checkpoint, run_fix_loop
 from ..config.settings import Settings, get_settings
 from ..domain.enums import EscalationStatus, ModelRole, RunStatus, TaskStatus
 from ..domain.escalation import EscalationIntent
@@ -52,13 +52,25 @@ class WorkflowState(TypedDict):
     commit_sha: NotRequired[str]
     worktree_released: NotRequired[bool]
     #: The task completed, but its accepted work is not in the cumulative
-    #: integration baseline and a person has to resolve that (concern 51).
+    #: integration baseline (concern 51).
     #: Reported rather than turned into a failed outcome: the task really is
     #: complete, and what is blocked is everything that depends on it.
     integration_blocked: NotRequired[bool]
     pause_request_id: NotRequired[str]
     resume_status: NotRequired[str]
     error: NotRequired[str]
+    #: Concern 64: set when the run was abandoned by an operator. The workflow
+    #: stops rather than proceeding with any consequential transition.
+    #:
+    #: This flag is an optimization, not the guarantee. It is computed from a
+    #: status read in one node and acted on in the next, so an operator's
+    #: transaction can commit in the gap. The guarantees that do not have that
+    #: gap are the compare-and-swap in ``TaskRunRepository.finish`` (which
+    #: refuses to write any status to an abandoned run) and the fence in
+    #: ``services.delivery._deliver`` (which refuses before the commit). These
+    #: checks exist to avoid starting work that is already pointless, and they
+    #: are checked again where it counts.
+    run_abandoned: NotRequired[bool]
 
 
 class WorkflowRunner:
@@ -238,6 +250,14 @@ class WorkflowRunner:
     def _load_task(self, state: WorkflowState) -> dict[str, object]:
         with self.session_factory.begin() as session:
             run, task, project = load_run_context(session, UUID(state["run_id"]))
+            # Concern 64: fencing check. If the run was abandoned by an operator,
+            # do not proceed. The run is terminal.
+            if run.status is RunStatus.ABANDONED:
+                return {
+                    "phase": WorkflowPhase.LOADING.value,
+                    "task_status": task.status.value,
+                    "run_abandoned": True,
+                }
             pause = PauseRequestRepository(session).in_force_for_task(
                 project.id, task.id
             )
@@ -248,6 +268,9 @@ class WorkflowRunner:
             }
 
     def _after_load(self, state: WorkflowState) -> str:
+        # Concern 64: if the run was abandoned, go to terminal.
+        if state.get("run_abandoned"):
+            return "terminal"
         status = TaskStatus(state["task_status"])
         if state.get("pause_request_id") or status is TaskStatus.PAUSED:
             return "pause"
@@ -258,6 +281,14 @@ class WorkflowRunner:
     def _prepare_workspace(self, state: WorkflowState) -> dict[str, object]:
         with self.session_factory.begin() as session:
             run, task, project = load_run_context(session, UUID(state["run_id"]))
+            # Concern 64: fencing check. If the run was abandoned by an operator,
+            # do not proceed with workspace preparation.
+            if run.status is RunStatus.ABANDONED:
+                return {
+                    "phase": WorkflowPhase.PREPARING_WORKSPACE.value,
+                    "task_status": task.status.value,
+                    "run_abandoned": True,
+                }
             if run.branch_name:
                 attach_workspace(session, run.id, settings=self.settings)
             else:
@@ -272,6 +303,9 @@ class WorkflowRunner:
             }
 
     def _after_prepare(self, state: WorkflowState) -> str:
+        # Concern 64: if the run was abandoned, go to terminal.
+        if state.get("run_abandoned"):
+            return "terminal"
         if state.get("pause_request_id"):
             return "pause"
         return "deliver" if state["task_status"] == TaskStatus.APPROVED.value else "execute"
@@ -300,6 +334,15 @@ class WorkflowRunner:
         session = self.session_factory()
         try:
             run, task, _ = load_run_context(session, UUID(state["run_id"]))
+            # Concern 64: fencing check. If the run was abandoned by an operator,
+            # do not proceed with execution.
+            if run.status is RunStatus.ABANDONED:
+                return {
+                    "phase": WorkflowPhase.EXECUTING.value,
+                    "loop_outcome": LoopOutcome.FAILED.value,
+                    "task_status": task.status.value,
+                    "run_abandoned": True,
+                }
             if task.status is TaskStatus.APPROVED:
                 return {"loop_outcome": LoopOutcome.APPROVED.value}
             if task.status is TaskStatus.HUMAN_REVIEW:
@@ -326,7 +369,12 @@ class WorkflowRunner:
                 deadline=budget.runtime_deadline,
                 worker_deadline=budget.worker_deadline,
                 runtime_budget=budget,
-                checkpoint_turn=session.commit,
+                # Concern 64: the turn's commit is behind the run row's lock, so
+                # an operator's transaction that committed while this call was in
+                # flight stops the turn instead of being overwritten by it. The
+                # fences in the graph above are reads and cannot do this; see
+                # agents.fix_loop.durable_checkpoint.
+                checkpoint_turn=durable_checkpoint(session, run.id, session.commit),
             )
             end_active_runtime(
                 session,
@@ -359,6 +407,9 @@ class WorkflowRunner:
             session.close()
 
     def _after_execute(self, state: WorkflowState) -> str:
+        # Concern 64: if the run was abandoned, go to terminal.
+        if state.get("run_abandoned"):
+            return "terminal"
         outcome = LoopOutcome(state["loop_outcome"])
         if outcome is LoopOutcome.APPROVED:
             return "deliver"
@@ -368,6 +419,22 @@ class WorkflowRunner:
 
     def _deliver(self, state: WorkflowState) -> dict[str, object]:
         with self.session_factory.begin() as session:
+            # Concern 64: do not deliver a candidate for an abandoned run. This
+            # is the one place in the graph where a fence and a guarantee
+            # overlap, so it is worth being precise about which is which: the
+            # check here avoids entering delivery at all, and
+            # services.delivery._deliver raises AbandonedRunError if the
+            # operator commits after this read but before the commit. Removing
+            # this check does not by itself let a candidate land -- the service
+            # fence does that -- so the candidate/integration regression test
+            # pins the service fence, not this node.
+            run, _, _ = load_run_context(session, UUID(state["run_id"]))
+            if run.status is RunStatus.ABANDONED:
+                return {
+                    "phase": WorkflowPhase.DONE.value,
+                    "outcome": WorkflowOutcome.FAILED.value,
+                    "run_abandoned": True,
+                }
             workspace = attach_workspace(
                 session, UUID(state["run_id"]), settings=self.settings
             )
@@ -398,6 +465,12 @@ class WorkflowRunner:
         }
 
     def _terminal(self, state: WorkflowState) -> dict[str, object]:
+        # Concern 64: if the run was abandoned, report it as abandoned.
+        if state.get("run_abandoned"):
+            return {
+                "phase": WorkflowPhase.DONE.value,
+                "outcome": WorkflowOutcome.FAILED.value,
+            }
         status = TaskStatus(state["task_status"])
         if status is TaskStatus.COMPLETE:
             outcome = WorkflowOutcome.COMPLETED

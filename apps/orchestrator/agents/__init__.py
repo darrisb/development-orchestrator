@@ -23,6 +23,7 @@ from .fix_loop import (
     FixIteration,
     FixLoopResult,
     LoopOutcome,
+    durable_checkpoint,
     run_fix_loop,
 )
 from .prompts import (
@@ -72,6 +73,7 @@ __all__ = [
     "FixLoopResult",
     "LoopOutcome",
     "ReviewOutcome",
+    "durable_checkpoint",
     "render_coding_instructions",
     "policy_from_settings",
     "render_plan_instructions",

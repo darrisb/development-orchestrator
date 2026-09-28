@@ -37,6 +37,7 @@ from sqlalchemy.orm import Session
 from ..config.logging import get_logger
 from ..config.settings import Settings, get_settings
 from ..domain.enums import RunEventType, RunStatus, TaskStatus
+from ..domain.errors import AbandonedRunError
 from ..domain.git import checkpoint_tag_name
 from ..domain.models import RunEvent, Task, TaskRun
 from ..domain.state_machine import assert_transition
@@ -123,6 +124,8 @@ def deliver_candidate(
         EntityNotFound: the run, its task or its project is missing.
         EntityConflict: the task is not ``APPROVED``, so there is nothing this
             function is allowed to land.
+        AbandonedRunError: an operator abandoned this run (concern 64). Raised
+            before the commit, so nothing is landed and no ref moves.
         NothingToCommit: the worktree matches the starting commit.
         MergeConflict: the worktree has unresolved paths.
         GitError: the commit itself failed.
@@ -167,6 +170,22 @@ def _deliver(
     release: bool,
 ) -> Delivery:
     run, task, project = load_run_context(session, workspace.task_run_id)
+    # Concern 64: the abandonment fence, at the service boundary rather than
+    # only in the graph node that calls this. The graph's own check saves the
+    # work of getting here, but it is a status read in an earlier node and a
+    # write in this one, and the operator's transaction can commit in between --
+    # which is precisely the window an abandonment is for. This check is the
+    # last point before the first irreversible step (the commit), and it is
+    # repeated here so that the guarantee does not depend on the graph node
+    # above it still having one.
+    #
+    # Before the task-status check, deliberately. An abandonment moves the task
+    # to FAILED, so checking the task first reports "this task is FAILED, I
+    # expected APPROVED" -- a description of the symptom, and one that reads as
+    # though the caller were the problem. The run being ABANDONED is the cause,
+    # and it is what a caller needs in order to know nothing is going to land.
+    if run.status is RunStatus.ABANDONED:
+        raise AbandonedRunError(run.id)
     if task.status is not allowed_status:
         raise EntityConflict(
             f"Task {task.external_task_id} is {task.status}; expected {allowed_status}"

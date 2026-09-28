@@ -283,6 +283,38 @@ class FixLoopResult:
         }
 
 
+def durable_checkpoint(
+    session: Session, run_id: UUID, commit: Callable[[], None]
+) -> Callable[[], None]:
+    """The turn-boundary checkpoint, guarded by the run row (concern 64).
+
+    A turn is made durable at two points: after every model call, so a provider
+    failure cannot roll away the record of the call that failed, and after every
+    turn. Both are places where the workflow is about to make its work
+    permanent, which is exactly where an operator's abandonment has to be able
+    to stop it -- the workflow holds one transaction open across a model call
+    and writes the task several times inside it, and a status read at the start
+    of the turn says nothing about what is true now.
+
+    So the barrier runs immediately before the commit, inside the same
+    transaction: ``TaskRunRepository.require_in_flight`` locks the run row and
+    evaluates the in-flight predicate under that lock. If an operator's
+    transaction committed first, the commit never happens, the turn is rolled
+    back, and the workflow stops with ``AbandonedRunError`` rather than making
+    a run that a person stopped look like work that completed.
+
+    Wrapping the caller's commit rather than adding a second callback keeps the
+    ordering impossible to get wrong: there is no way to make a turn durable
+    without passing the guard.
+    """
+
+    def checkpoint() -> None:
+        TaskRunRepository(session).require_in_flight(run_id)
+        commit()
+
+    return checkpoint
+
+
 async def run_fix_loop(
     session: Session,
     workspace: TaskWorkspace,

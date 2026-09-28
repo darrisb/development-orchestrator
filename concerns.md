@@ -22,7 +22,7 @@ producing four accepted candidates that would not merge together.
 Resolved entries are kept in place and marked, rather than deleted or
 renumbered: the reasoning is referenced from code comments and tests, and the
 numbers are how they are referenced. **Resolved: 1–12, 16, 18–20, 22–29, 32–36,
-38–39, 41, 43, 46, 48–56, 58–62.** **Partly resolved: 30, 45** -- each says which half.
+38–39, 41, 43, 46, 48–56, 58–64.** **Partly resolved: 30, 45** -- each says which half.
 **Open: 13, 14, 15, 17, 21, 31, 37, 40, 42, 44, 47.**
 
 Every open entry is now a documented limitation rather than an unfinished fix.
@@ -2096,6 +2096,10 @@ FAILED / RETRY_EXHAUSTED. TS-106 remains HUMAN_REVIEW. `agent/integration`
 remains `a2e40f2`. The existing escalation remains open. TS-106 was not retried
 as part of this fix.
 
+*(State as recorded at the time of this fix. TS-106 and the escalation have since
+moved, through `RUN-20260927-000020` and Concerns 63/64; see section 64 for the
+current values. The run and the ref above did not change.)*
+
 ## 62. Proportional-only growth left medium files with too little room -- **resolved**
 
 Found in `RUN-20260927-000019`, the third TS-106 run. Concern 61 had closed the
@@ -2212,3 +2216,322 @@ unchanged. TS-106 remains HUMAN_REVIEW. Escalation
 remains `a2e40f226146feb723658b5eae0c7dac3635cf7e`. TS-106 was not retried,
 TS-107 was not run, no candidate was accepted, and no model or context
 configuration was changed.
+
+*(State as recorded at the time of this fix. Section 63 established that
+`RUN-20260927-000020` -- the run that was meant to validate Concern 62 -- ran
+against a stale image, and section 64 records the campaign state after that run.
+TS-106 is now FAILED and escalation `deb00534` is RESOLVED; the run and the ref
+above did not change.)*
+
+## 63. Stale container image defeated Concern 62 validation -- **resolved**
+
+Found after `RUN-20260927-000020`, the fourth TS-106 run. The investigation
+established that the run executed against stale container image `168a74d323e2`,
+built before Concern 62 commit `d50752d` by approximately 49 minutes. The host
+source and the Concern 62 tests were correct. The deployed image contained
+Concern 61-era code.
+
+Both the missing prompt limit and the old 10137 enforcement had that one cause.
+`RUN-20260927-000020` therefore was not a valid Concern 62 experiment, and the
+second half of the problem is the reason it went unnoticed: the *code under
+test* and *the code running* were different code, and nothing in the system said
+so. A green host suite and an invalid experiment looked identical.
+
+*Why it matters:* the same class of defect can silently invalidate any future
+experiment, and the only detection mechanism was a person comparing image
+digests. Worse, the naive fix -- asking the container for its own revision at
+runtime -- reproduces the lie: the container has no `.git`, and a bind-mounted
+host value would report the host's HEAD, which is not what is running either.
+
+*Resolved* with a build-time identity the image carries, and a check that refuses
+to let an unverified deployment be believed.
+
+**Build-time metadata injection.** The Dockerfile accepts `SOURCE_REVISION`,
+`SOURCE_DIRTY` and `BUILD_TIME` as build arguments and writes them to
+`apps/orchestrator/_build_meta.py` during the image build. The values describe
+the source the image was built from, baked in at build time, with no `.git` and
+no runtime inspection involved. `SOURCE_DIRTY` is mapped onto three real Python
+values -- `True`, `False`, `None` -- by shell `case` in the Dockerfile, so a
+build that could not determine it writes `None` rather than a string that would
+read as a boolean.
+
+**Three states, kept distinct.** `apps/orchestrator/services/deployment.py`
+derives one line of identity from those values, and it is deliberately not
+two-valued:
+
+| build | `source_state` | meaning |
+| --- | --- | --- |
+| `SOURCE_REVISION=<sha> SOURCE_DIRTY=false` | `clean@<sha>` | built from a known commit with no local changes |
+| `SOURCE_REVISION=<sha> SOURCE_DIRTY=true` | `dirty@<sha>` | the SHA names a commit that is *not* what is in the image |
+| defaults, or no SHA | `unknown/dev` | the build cannot be verified, and says so |
+
+`dirty@<sha>` exists because collapsing it into `clean@<sha>` is exactly how a
+modified artifact acquires a passing freshness check. The default is
+`unknown/dev` rather than a placeholder SHA, because a placeholder would pass a
+comparison and the comparison is the whole mechanism.
+
+**Health endpoint exposure.** `/health` now returns `source_revision`,
+`source_dirty`, `source_state` and `build_time` alongside the existing `status`,
+`version` and `components`. The identity is read per report (through
+`current_source()`), not captured at import, so a test can replace the values and
+a production build is not affected by import order. The response shape is:
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "source_revision": "d50752dfc52d02aa2bcc29a25928fff1c1bcfaa8",
+  "source_dirty": false,
+  "source_state": "clean@d50752dfc52d02aa2bcc29a25928fff1c1bcfaa8",
+  "build_time": "2026-09-27T21:24:36Z",
+  "components": [...]
+}
+```
+
+The new fields are additive: `status` still answers for the same three
+components, so existing monitoring does not start failing.
+
+**The check that goes red.** `assert_deployment_fresh()` raises
+`StaleDeploymentError` -- it does not return a bool, because the interesting case
+is the one a caller is tempted to log and move past -- and refuses four
+situations, each naming the expected source, the actual source and the difference:
+a revision that does not match, an image built from uncommitted changes, an image
+that reports `unknown/dev`, and an expected value that is not a commit (so
+"checked against nothing" cannot pass forever). A short SHA is not accepted as a
+match: comparing prefixes would call a stale image fresh the first time two
+commits shared seven characters. A dirty image can be accepted with an explicit
+`allow_dirty=True`, because refusing everything is not verification, and a check
+that cannot be overridden is a check people turn off.
+
+**Reaching the running deployment.** `scripts/check_deployment_freshness.py`
+asks a deployment what it is and compares that to the commit that was meant to
+be running:
+
+```bash
+scripts/check_deployment_freshness.py --expected HEAD
+SOURCE_REVISION=$(git rev-parse HEAD) SOURCE_DIRTY=false \
+  BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) docker compose build orchestrator
+```
+
+It exits 0 when the deployment is the intended source, 1 when it is not, and 2
+when the check could not be performed. The third code exists because "I could
+not find out" is not "the image is wrong", and reporting the second when the
+truth is the first is how a real incident gets filed against the wrong thing. A
+`/health` response missing the fields is read as unknown and therefore refused:
+something that is not this orchestrator must not pass by omission. Git is used
+on the host to resolve `HEAD`, and only there -- the machine deciding what
+*should* be running is a different machine from the one that has to know what
+*is* running.
+
+**Regression coverage.** `tests/integration/test_concern63.py` (32 tests): the
+developer build's defaults are the truth and the fallback imports; clean, dirty
+and unknown stay three distinguishable states, including a `dirty=None` build and
+an empty revision; the health report and the endpoint carry the whole identity;
+the identity is read per report; the existing health contract is untouched; a
+matching clean build passes; a stale image is refused *even though it reports
+healthy*, which is the exact incident; the refusal message names both sides; a
+dirty build is refused, and can be accepted deliberately; an unidentifiable
+deployment is refused; an expected value that is not a commit is refused; a
+short SHA is not a match; the script returns 0 / 1 / 2 as designed through a
+real socket; a response without the fields cannot pass by omission; `HEAD`
+resolves to a full commit; the script runs as a standalone process and exits
+non-zero against a stale server; and the Dockerfile and compose plumbing pass all
+three values through.
+
+**Discrimination evidence.** Mutation: `assert_deployment_fresh` made to return
+instead of raise, in `deployment.py` and not in the test. Result: **RED** --
+`test_a_stale_image_is_refused_even_though_it_reports_healthy` and the rest of the
+refusal tests fail. A check that cannot fail is a comment, so this is the test
+that matters most in this concern, and it was run rather than assumed.
+
+**Validation.** `tests/integration/test_concern63.py` 32 passed;
+`tests/integration/test_concern64.py` 56 passed; full suite 1272 passed in the
+default order and under two randomized orders; Phase M acceptance gate passed;
+`ruff check .` clean.
+
+**Campaign facts preserved.** `RUN-20260927-000020` remains historical and
+invalid (it ran under the stale image). TS-106 remains FAILED. Escalation
+`deb00534-4521-416b-ad0f-75e6d1266e3c` remains RESOLVED. `agent/integration`
+remains `a2e40f226146feb723658b5eae0c7dac3635cf7e`. TS-106 was not retried,
+TS-107 was not run, no candidate was accepted, and no model or context
+configuration was changed. The Concern 62 policy implementation was not changed.
+
+## 64. Supported operator abandonment of an active durable run -- **resolved**
+
+Found in `RUN-20260927-000020`, the fourth TS-106 run. The run was still
+RUNNING/recoverable but was known to be an invalid experiment because it began
+under the stale supervisor image described in Concern 63, and the operator had
+no supported way to stop it.
+
+The domain model already had `RunStatus.ABANDONED` and
+`TaskRunRepository.finish()` was already capable of terminalizing a run, but
+abandonment was not exposed as a first-class operation. The only way to stop an
+invalid run was manual database mutation, which bypasses the audit trail, breaks
+recovery's invariants, and risks leaving the task state machine inconsistent.
+
+*Why it matters:* a run that keeps going wastes resources and produces evidence
+that looks real; a run deleted from the database loses the forensic record of
+what happened. And the interesting part is not the endpoint -- it is that a
+workflow already in flight, holding an open transaction across a model call, must
+not be able to undo the operator's decision by finishing afterwards.
+
+*Resolved* with an operator operation, and with fencing at every layer that could
+otherwise have overruled it.
+
+**Operator API.** `POST /runs/{run_id}/abandon` takes a required `reason` and an
+optional `requested_by`, and is an operator action only -- it is not in the model
+tool surface. A blank or whitespace-only reason is refused with 422 by a Pydantic
+`field_validator` rather than being stored as an empty string and reported as
+"the operator gave no reason", which is the failure this endpoint most invites.
+
+**Terminal semantics.** The run becomes `RunStatus.ABANDONED` and is terminal: it
+cannot be resumed, recovered or restarted. Recovery no longer has an ABANDONED
+branch to classify -- an abandoned run is simply not an incomplete run, so it
+cannot be picked up by `list_incomplete()`, `inspect_incomplete_runs()` or
+recovery. The `RecoveryDisposition.ABANDONED` member that would have existed is
+removed rather than left returning a disposition nothing can act on.
+
+**Audit evidence.** One `RUN_ABANDONED` event per abandonment, carrying the
+reason, the operator and the previous status. The log is append-only, and a
+repeated request appends nothing.
+
+**Task state semantics.** The owning task moves to `TaskStatus.FAILED` in the
+same transaction as the run. This required widening the state machine: `PENDING ->
+FAILED` and `READY -> FAILED` did not exist, and an abandoned run whose task was
+never picked up could not otherwise be recorded. Every state except `COMPLETE` is
+now failable, because the work is genuinely over in all of them and a task stuck
+in `VERIFYING` with no run left to finish it is a lie about the repository's
+state. From `FAILED` the state machine still permits an explicit `READY` for a
+future retry. The task does not become COMPLETE, downstream tasks stay blocked,
+and no replacement run starts by itself.
+
+**Fencing, at each layer that could have overruled the operator.**
+
+1. `TaskRunRepository.finish()` compare-and-swaps on the in-flight status, so a
+   late `SUCCEEDED` (delivery) or `FAILED` (fix loop) or `RUNNING`
+   (`_prepare_workspace`, which used `update_fields`) cannot overwrite
+   `ABANDONED`. The guarded `update_fields` path matters as much as `finish`: an
+   unguarded one resurrects a run with no exception and no event.
+2. `TaskRunRepository.require_in_flight()` -- `SELECT ... FOR UPDATE` with the
+   in-flight predicate, called by `durable_checkpoint()` before **every** turn
+   and model-call commit. This is the guard the incident actually needed. A loop
+   turn holds one transaction open across a model call, so the graph's own status
+   read (in an earlier node) is stale by the time the turn commits, and the
+   operator's transaction can commit in the middle of it. The lock makes the
+   ordering explicit: whichever transaction gets the row lock first is the one
+   whose decision stands, and the other is refused. A plain read would take no
+   lock, so the operator could commit immediately afterwards and the check would
+   be true and wrong.
+3. `deliver_candidate()` re-checks the run immediately before the first
+   irreversible step, the commit -- and **before** the task-status check, on
+   purpose. An abandonment also moves the task to FAILED, so checking the task
+   first reports "expected APPROVED, found FAILED": a description of the symptom
+   that reads as though the caller were the problem. The run being ABANDONED is
+   the cause.
+4. `TaskRepository.transition()` is a compare-and-swap. The run's guard is only
+   half the answer: a workflow also moves the task, from a copy that is exactly as
+   stale as its copy of the run. Without it, an abandoned run's FAILED task is
+   quietly rewritten to APPROVED by a session that read it earlier, and APPROVED
+   is the state that makes a candidate deliverable. On a CAS miss the current
+   status is re-read with a statement rather than through the identity map,
+   because the identity map is the stale copy the guard is about and quoting it
+   would produce a confident and false message.
+
+**What the race actually looks like.** Not what it was first assumed to look
+like. A turn holds the run-row lock through its model call, so an operator
+request arriving mid-call *blocks*, and the ordering is: turn checkpoints and
+commits; operator's `abandon` commits `ABANDONED` and moves the task to FAILED;
+the workflow resumes, is refused by the barrier, and rolls back. The
+`test_a_late_worker_cannot_resurrect_an_abandoned_run` test drives this against
+real PostgreSQL with two sessions and asserts the operator request is still
+blocked while the turn is in flight, so the test proves the ordering rather than
+assuming it.
+
+The in-flight coder call survives as a model-run record. The guard stops the
+outcome from changing; it does not make the attempt not have happened, and a
+table holding only the calls that mattered would not be an audit trail. What the
+barrier rolls back is everything the turn claimed afterwards -- including its own
+`CODING_COMPLETED` event, because the attempt was not finished.
+
+**Idempotency and conflicts.** Repeating the request on an already-abandoned run
+returns the existing state with no second event. A terminal run
+(SUCCEEDED/FAILED) returns 409, and the repository's `abandon()` returns `None`
+rather than raising, because "the run got there first" is a result the caller has
+to report. An unknown run is a 404.
+
+**Failure is atomic.** A task transition that cannot be made takes the run with
+it: the whole abandonment is one savepoint, and the run is still RUNNING
+afterwards. This is asserted, not assumed -- the failure is provoked by making
+the task update raise, and the run's status is then read back.
+
+**What is preserved.** The integration ref does not move. No candidate commit is
+created or accepted. `candidate_commit` stays null. The task does not become
+COMPLETE. Downstream tasks stay blocked. Artifacts, model-call history,
+verification history and checkpoints remain inspectable; the workspace is
+released by the project's existing terminal policy rather than by a new one.
+
+**Regression coverage.** `tests/integration/test_concern64.py` (56 tests), in
+seven groups: the service boundary (abandon a running run; status; task to FAILED;
+candidate stays null; integration ref unmoved and at the expected SHA; downstream
+blocked; no replacement run; idempotency; conflict on a terminal run; the event's
+reason and operator; atomic failure); the state machine (every state except
+COMPLETE fails, and the ones that should not, do not); durability across a commit
+and a whole-process reconstruction; the persistence boundary (`finish` refused
+for each terminal status a real workflow writes; `update_fields` refused; the
+guard is one status wide, so every other transition still works; `abandon` loses
+to a run that already finished; the turn barrier permits an in-flight run and
+refuses an abandoned one; it distinguishes an abandoned run from one that
+finished on its own; a stale session cannot overwrite a newer task status); the
+HTTP boundary (the endpoint abandons a running run; 422 for a blank reason; the
+persisted event carries the reason; idempotent over HTTP; 409 on a terminal run;
+404 unknown; an abandoned run reads back as abandoned; the route is part of the
+documented contract; a lost race is a 409); a real PostgreSQL race; and the
+pollution guarantee.
+
+**The pollution guarantee, and its own discrimination check.** The shared
+`session` fixture commits nothing: a test's `session.commit()` releases a
+savepoint inside an outer transaction that is rolled back at teardown, so nothing
+a test writes is durable. The cheap form of the check reads every table through a
+connection that had no part in the work and compares before and after. The form
+that depends on nothing else in the repository runs this whole module in a
+subprocess against a database file it shares with nobody, and counts the
+survivors with a standard-library `sqlite3` connection -- no fixture teardown, no
+test ordering, no other file. That is the assertion the old `session.commit()`
+could not have survived, and the one "the full suite passes" could never have
+supplied, because a leaked row in a single process is only visible to whichever
+test happens to run next.
+
+**Discrimination evidence.** Five mutations, each in the source and not in the
+test, each restored afterwards, each observed to go red:
+
+| mutation | result |
+| --- | --- |
+| A. `require_in_flight` no longer raises (the lock and the predicate stay) | RED -- `test_a_turn_may_only_be_made_durable_while_the_run_is_in_flight` |
+| B. the delivery fence removed | RED -- `test_abandonment_before_delivery_prevents_the_candidate` |
+| C. the abandon route not registered | RED -- `test_the_endpoint_abandons_a_running_run` |
+| D. the fixture stops rolling back and commits at teardown | RED -- `test_projects_api.py::test_a_project_is_created_and_listed`, the original failure, with 47 projects listed instead of 1 |
+| F. one `session.commit()` added inside the module | RED -- `test_this_module_leaves_no_rows_in_a_shared_database` |
+
+Mutation F is the one that checks the checker. Mutation A is the shape of a guard
+that survives review -- it still locks the row and still evaluates the
+predicate -- and it is the guard the incident needed. A first attempt at the
+mutation driver reported every mutation as RED without running anything, because
+it invoked `python` on the test path instead of `python -m pytest`; the driver
+now treats a pytest usage error as invalid rather than as a failure, since that
+is the same "a check that cannot fail" mistake one level up.
+
+**Validation.** `tests/integration/test_concern64.py` 56 passed, including three
+consecutive runs of the race tests with no flakiness; Concern 63 32 passed; the
+full suite 1272 passed in the default order and under two randomized orders;
+Phase M acceptance gate passed; `ruff check .` clean.
+
+**Campaign facts preserved.** `RUN-20260927-000020` remains historical and
+invalid, and remains as it was found: `ABANDONED`, attempt 3, run 5,
+`candidate_commit` null, no `requested_by`, reason `"x"`. TS-106 remains FAILED
+and was not retried, TS-107 was not run, no candidate was accepted, and no model
+or context configuration was changed. Escalation
+`deb00534-4521-416b-ad0f-75e6d1266e3c` remains RESOLVED. `agent/integration`
+remains `a2e40f226146feb723658b5eae0c7dac3635cf7e`. The new abandonment
+capability was **not** used against `RUN-20260927-000020`; validating a
+capability by exercising it on the campaign's historical run would have changed
+the record it is supposed to explain.

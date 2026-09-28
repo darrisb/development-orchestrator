@@ -11,6 +11,7 @@ from ..config.settings import WorkerBackend
 from ..db.base import Base
 from ..db.session import get_engine
 from ..schemas.health import ComponentHealth, HealthResponse, WorktreeHealth
+from .deployment import current_source
 from .worker_errors import WorkerBackendUnavailable
 from .worker_service import assert_backend_available
 from .worktrees import census
@@ -95,9 +96,14 @@ def build_health_report(settings: Settings) -> HealthResponse:
         check_worker_backend(settings),
     ]
     status = "ok" if all(component.healthy for component in components) else "degraded"
+    source = current_source()
     return HealthResponse(
         status=status,
         version=VERSION,
+        source_revision=source.revision,
+        source_dirty=source.dirty,
+        source_state=source.state,
+        build_time=source.built_at,
         components=components,
         worktrees=check_worktrees(settings),
     )
