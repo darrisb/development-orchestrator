@@ -3606,11 +3606,14 @@ of the run's own records, not estimated: `run_events` for
 the verbatim feedback strings, the stored `coder-response.txt` and
 `candidate.patch` for attempt 2's byte counts and its 315 deletions, and
 `context.md` for the baseline's 11,813 bytes and 39 tests. Those queries were
-`SELECT`s. TS-109's state is unchanged and is recorded as it was found: status
-`READY`, four `task_runs` rows, the last of them
-`RUN-20260928-000007` `FAILED` / `SCOPE_VIOLATION` at attempt 2. The live run
-records `prompt_version: "coder-prompt/1+code-edits/2"`, which is the pair this
-concern replaces.
+`SELECT`s. TS-109's state is unchanged and is recorded as it was found: the task
+row is `FAILED`, with four `task_runs` -- `RUN-20260928-000004` and
+`RUN-20260928-000007` `SCOPE_VIOLATION` at attempt 2, and
+`RUN-20260928-000005` and `RUN-20260928-000006` `RETRY_EXHAUSTED` at attempt 3
+-- of which the last is the one analysed above. The live run records
+`prompt_version: "coder-prompt/1+code-edits/2"`, which is the pair this concern
+replaces. TS-110 is `READY` with no runs, one escalation is `OPEN`, and
+`task_runs` holds 28 rows.
 
 **Campaign preservation.** `POST /runs/{run_id}/recover` was never called against
 `RUN-20260928-000005`, TS-109 was never retried or abandoned, TS-110 was never
