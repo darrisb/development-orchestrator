@@ -2718,6 +2718,18 @@ the full suite 1326 passed; `ruff check` clean on the changed files;
 touched here). The Phase M acceptance gate is unaffected by this change and was
 not re-run as a gate for it.
 
+**Deployed, with its identity.** The image was rebuilt with `SOURCE_REVISION`
+and `BUILD_TIME` set from the commit, `scripts/check_deployment_freshness.py
+--expected HEAD` reports `fresh`, and `/health` answers
+`clean@<commit>`. The first rebuild of the session did not set them, so
+`/health` reported `unknown/dev` and the freshness check refused it --
+`STALE DEPLOYMENT: the running deployment reports its source as unknown/dev` --
+which is the check working, not a flake. The route answers on the live service
+and `POST /tasks/{task_id}/retry` appears in the deployed OpenAPI schema. It was
+not called: the live `run_events` table still holds zero
+`TASK_RETRY_AUTHORIZED` rows, because the only place it would be used is the
+task it was written for.
+
 **Campaign facts preserved.** `RUN-20260927-000020` remains as it was found:
 `ABANDONED`, attempt 3, run 5, `candidate_commit` null. TS-106 remains `FAILED`
 and was **not** retried -- the new capability was deliberately not used on the
