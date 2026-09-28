@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import exists, select, update
 
-from ..db.models import TaskRow
-from ..domain.enums import TaskStatus
+from ..db.models import TaskRow, TaskRunRow
+from ..domain.enums import IN_FLIGHT_RUN_STATUSES, TaskStatus
 from ..domain.errors import InvalidStateTransition
 from ..domain.models import Task, TaskLimits
 from ..domain.state_machine import assert_transition
@@ -218,4 +218,91 @@ class TaskRepository(Repository[TaskRow, Task]):
             raise InvalidStateTransition(
                 TaskStatus(now) if now is not None else current, new_status
             )
+        return self._to_domain(self._require_row(task_id))
+
+    def lock(self, task_id: UUID) -> Task:
+        """Read a task under a row lock, so what follows cannot race it.
+
+        Concern 65, and the same barrier ``TaskRunRepository.require_in_flight``
+        is for a run. ``SELECT ... FOR UPDATE``: the database evaluates and
+        holds the lock, so a concurrent writer of this row blocks here rather
+        than committing between this read and the write it justifies.
+
+        A plain read is a snapshot, and an operator authorization is a decision
+        made *from* that snapshot -- "this task is FAILED, so I may authorize a
+        new run for it". If the row can change under the decision, the decision
+        is made about a task that is no longer there. The lock makes the read
+        authoritative: it is either the state the next write is checked against,
+        or the caller waited for whoever moved it.
+
+        Raises:
+            LookupError: no such task.
+        """
+        row = self.session.scalar(
+            select(TaskRow).where(TaskRow.id == task_id).with_for_update()
+        )
+        if row is None:
+            raise LookupError(f"Task {task_id} not found")
+        return self._to_domain(row)
+
+    def transition_guarded(
+        self,
+        task_id: UUID,
+        *,
+        expected_status: TaskStatus,
+        new_status: TaskStatus,
+        require_no_in_flight_run: bool = False,
+    ) -> Task | None:
+        """Move a task from one status to another under a two-part predicate.
+
+        Concern 65. :meth:`transition` guards a move on the task's own status
+        changing underneath the caller. An operator retry needs a second
+        condition that spans another table: a task with a run in flight is not a
+        task whose work has finished, whatever its status row says, and
+        authorizing a new run for it would put two runs on one task.
+
+        That condition cannot be a read. A read answers "no run was in flight a
+        moment ago", and the moment in between is where a run gets created.
+        So it goes in the ``WHERE`` clause as a ``NOT EXISTS`` over
+        ``task_runs``, and the database evaluates it in the same statement that
+        takes the row lock -- one decision, from one snapshot, with no window:
+
+        * this call commits first -- the retry's own move happens, and any run
+          creation that follows sees a task that is no longer FAILED;
+        * a run commits first -- the retry's predicate no longer matches, no
+          write happens, and the caller is told a run is in flight.
+
+        Returns ``None`` rather than raising, for the reason
+        :meth:`TaskRunRepository.abandon` does: "someone else got there first"
+        is a *result* the caller has to branch on and report truthfully, not an
+        error. The caller re-reads to say which condition failed.
+
+        The state machine is still consulted, so a guarded move cannot be used
+        to make an illegal transition; what is added is the cross-table
+        condition, and the narrow expectation that the caller read.
+
+        Raises:
+            LookupError: no such task.
+            InvalidStateTransition: the move is not permitted from
+                ``expected_status``.
+        """
+        target = assert_transition(expected_status, new_status)
+        conditions = [TaskRow.id == task_id, TaskRow.status == expected_status]
+        if require_no_in_flight_run:
+            conditions.append(
+                ~exists().where(
+                    TaskRunRow.task_id == TaskRow.id,
+                    TaskRunRow.status.in_(IN_FLIGHT_RUN_STATUSES),
+                )
+            )
+        result = self.session.execute(
+            update(TaskRow)
+            .where(*conditions)
+            .values(status=target)
+            # "fetch" so the identity map reflects the row this write matched
+            # rather than the copy the caller read before it.
+            .execution_options(synchronize_session="fetch")
+        )
+        if result.rowcount != 1:
+            return None
         return self._to_domain(self._require_row(task_id))

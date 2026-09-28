@@ -148,6 +148,40 @@ def active_tasks(session: Session, project_id: UUID) -> list[Task]:
     ]
 
 
+def unsatisfied_dependencies(session: Session, task: Task) -> tuple[str, ...]:
+    """This task's dependencies that are not satisfied right now.
+
+    One rule, asked in three places, and it has to be the *same* rule each time:
+    a dependency counts only when it is ``COMPLETE`` **and** its accepted work
+    is in the integration baseline (concern 51). ``COMPLETE`` says the work was
+    done; ``is_integrated`` says it is in the tree the next run would start
+    from, and a run that started without it would build on a tree missing the
+    work it was told to build on.
+
+    The three callers are :func:`refresh_readiness` (which promotes and demotes
+    on this), ``pauses.resume_task`` (which promotes a resumed task on it), and
+    concern 65's operator retry (which authorizes a new run on it). Before this
+    the second and third would each have re-derived it, and a retry that
+    answered the question slightly differently from the scheduler that acts on
+    the answer would be a task authorized to start without its dependencies.
+
+    Ordered as declared, so a refusal names the dependencies the manifest named.
+    """
+    if not task.depends_on:
+        return ()
+    by_external_id = {
+        candidate.external_task_id: candidate
+        for candidate in TaskRepository(session).list_for_project(task.project_id)
+    }
+    return tuple(
+        dependency
+        for dependency in task.depends_on
+        if (candidate := by_external_id.get(dependency)) is None
+        or candidate.status is not TaskStatus.COMPLETE
+        or not candidate.is_integrated
+    )
+
+
 def select_next_task(session: Session, project_id: UUID) -> Selection:
     """Return the single task that should run next for this project.
 

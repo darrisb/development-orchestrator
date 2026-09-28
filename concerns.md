@@ -2535,3 +2535,195 @@ remains `a2e40f226146feb723658b5eae0c7dac3635cf7e`. The new abandonment
 capability was **not** used against `RUN-20260927-000020`; validating a
 capability by exercising it on the campaign's historical run would have changed
 the record it is supposed to explain.
+
+## 65. A failed task had a decision behind it and no way to record it -- **resolved**
+
+Concern 64 made it possible to stop an invalid run, and it left the owning task
+in `FAILED` because the work was genuinely over. Then the next TS-106
+experiment ran into what that state actually is: `create_run` accepts only
+`READY` and `CHANGES_REQUESTED`; the scheduler does not manage `FAILED`; task
+resume accepts only `PAUSED`; and escalation resolution needs an `OPEN`
+escalation, which a consumed `RETRY_TASK` answer had already closed. A person
+was holding a decision -- this attempt is invalid, run it again against the
+current image -- with no supported way to record it.
+
+The workarounds were both refused, correctly, and neither was an operation. A
+direct database mutation bypasses the audit trail, the state machine and the
+locks, and is the failure mode Concern 64 existed to remove. A manifest
+re-import cannot move a task out of `FAILED` either, and would have refreshed
+declarative fields of a task mid-campaign to get nowhere. The honest summary is
+that the repository had a supported way to *stop* work and no supported way to
+*start* it again.
+
+*Why it matters:* `FAILED` is the state the orchestrator deliberately parks in
+when it cannot finish. Treating that as terminal makes a failed campaign
+unrecoverable without a DBA, and makes the one state a person most wants to
+act on the one state they are least able to. The alternative is not "add a
+flag"; it is a manual database write, which is exactly the kind of repair that
+leaves a repository unable to explain itself later.
+
+**Resolved** with an operator operation, and with the refusals that make it
+trustworthy moved into the single statement that performs the write.
+
+**Operator API.** `POST /tasks/{task_id}/retry` takes a required `reason` and an
+optional `requested_by`, and is an operator action only -- it is not in the
+model tool surface, and the orchestrator never retries its own failures from
+here. A blank or whitespace-only reason is refused by the same Pydantic
+validator Concern 64 introduced (`OperatorReason`), before a task is even read.
+README section "Retrying a failed task" documents the call, the refusals and
+what it does not do, and a test reads the README rather than trusting it.
+
+**Authorization, not execution.** The operation moves the task `FAILED ->
+READY` and appends one `TASK_RETRY_AUTHORIZED` event. The run is created by the
+next project execution, by the same scheduler that creates every other run.
+That was a decision with a rejected alternative rather than a default: having
+this endpoint create the run itself would be more direct, and it would
+duplicate the pause check, the project-runnable check, the one-task-at-a-time
+check and the dependency check in a second place that does not own them, and it
+would introduce a `PENDING` run whose task is still `READY` for the scheduler to
+learn to respect. The authorization is the part a person decides; the run is
+the part the orchestrator already knows how to create from the accepted
+integration baseline.
+
+**Two refusals the database has to make, in one statement.** The task must
+still be `FAILED`, and no run of it may be in flight. Both are predicates on the
+same guarded `UPDATE` in `TaskRepository.transition_guarded` -- `WHERE status =
+expected AND NOT EXISTS (SELECT ... status IN ('PENDING','RUNNING'))` -- which
+is evaluated while the row lock taken by `TaskRepository.lock()` is held. A
+read-then-write would answer "there was no run in flight a moment ago" and be
+wrong the moment after. The same statement works unchanged on SQLite and
+PostgreSQL, so the guarantee is not a dialect's. When the guarded move matches
+nothing, `_explain_refusal` re-reads both facts with statements rather than
+through the identity map, because the identity map is the stale copy the guard
+exists about, and reports which predicate lost: the task moved, or a run is
+live.
+
+**What is preserved, and it is the point.** The abandoned run is left exactly as
+found: `ABANDONED`, terminal, unresumable, `candidate_commit` null, its event
+log unchanged, and still refused by `require_in_flight()`. Nothing is resumed,
+rewritten or re-pointed. Resolved escalations stay resolved and none is
+reopened. The integration ref does not move. No candidate is created. The
+downstream task stays blocked. The new run is a new run -- new durable and
+external id, `run_number` incremented, new branch and worktree, and the
+integration baseline **as it stands when the run is created**, not as it stood
+when the retry was authorized; a dependency that regressed in between blocks
+the run instead of being silently assumed. `HUMAN_REVIEW` is deliberately *not*
+retryable: that state is a task waiting for an answer to an open escalation, and
+answering it is `apply_escalation_answer`'s job. `COMPLETE` is terminal and has
+no move out of it, so it cannot be made retryable.
+
+**The dependency rule is one rule, not two.** `unsatisfied_dependencies()` is
+shared with the scheduler and with `pauses.resume_task`, so a dependency that is
+complete but unintegrated leaves a task un-runnable the same way in both paths.
+Resume defers such a task to `PENDING`; a retry refuses it outright. What must
+never happen is either path producing a `READY` task the scheduler would create
+a run for. A dependency on a task that does not exist is refused rather than
+treated as satisfied, which is the mistake a lenient "not in the unsatisfied
+list" would make.
+
+**Audit evidence.** One `TASK_RETRY_AUTHORIZED` event per authorization, with
+`task_run_id = NULL`: this is a decision about a task made before any run
+exists, and filing it against the abandoned run would put a new decision on the
+record of an execution that had nothing to do with it. The payload carries the
+external task id, reason, operator, the previous and authorized statuses, and
+`historical_runs` -- a fact rather than a prediction, so a later reader can tell
+a new run from a reused one without counting rows.
+
+**Idempotency and conflicts.** Repeating the request finds a task that is no
+longer `FAILED` and is refused with a truthful 409. There is no "already
+retried, here is the old answer" branch, because the answer would be a claim
+that the caller did not ask for and that the current state may not support.
+An unknown task is a 404. `422` for a missing or blank reason. `409` for a
+non-`FAILED` task, an unrunnable project, a pause in force, an unsatisfied
+dependency, and a run already in flight -- each with a message that names the
+rule it violated.
+
+**Regression coverage.** `tests/integration/test_concern65.py` (54 tests), in
+eight groups: the authorization itself (FAILED becomes READY; only FAILED is
+retryable, parametrized over all seven other states plus a COMPLETE task that is
+also not made retriable; an unknown task; a repeat request authorizing once; the
+authorization creates no run of its own; the run event never reaches a run's
+log; the route in both the OpenAPI schema and the README); the refusals (a
+dependency not complete; a dependency that does not exist; complete but
+unintegrated; a task under a task pause; a project pause; a released pause that
+does not block; an unrunnable project; one rule shared with resume); what the
+authorization must not disturb (the abandoned run's status, attempt, run number
+and null candidate; its event log; `AbandonedRunError` from
+`require_in_flight`; a resolved escalation staying resolved, none reopened); the
+run that follows (new id, run number and external id; new branch and worktree;
+attempt 1, review cycle 0, zero active runtime, and no inherited candidate,
+failure reason, context hash or worker image; a new run executes and
+completes through the real LangGraph graph with scripted models and a real
+commit; the scheduler creates the run and the next pass continues that same
+run; the baseline at the time it runs, not the time it was authorized; a
+dependency that regressed afterwards blocks the run; a pause that arrives
+between authorization and execution stops the run); the HTTP boundary (a failed
+task is retried; 409 for a non-FAILED task, a pause and unmet dependencies; 404
+unknown; 422 for a missing and a blank reason; a repeat conflicts and creates
+nothing; the documented contract); durability across a real commit and a
+rebuilt process read by a child interpreter with only the standard library; the
+races against real PostgreSQL; and the pollution guarantee.
+
+**The races, on a real database.** SQLite serializes writers, so "one
+transaction reads while another writes" is not a thing it can express, and a
+race test there would pass without testing anything. Three tests use a scratch
+PostgreSQL database, two sessions and two threads: two operator requests
+through the real HTTP handler cannot both authorize; a retry racing a run
+creation cannot produce two runs; and a committed in-flight run closes the
+door, which is a real scheduler state rather than a synthetic one. The HTTP
+concurrency test goes through `get_db` and `session_scope` with a real
+`DATABASE_URL` instead of a dependency override, because FastAPI runs a
+handler on a worker thread and an override that creates a session per request
+in the portal thread leaves sessions nobody closes.
+
+**One bug this file found, in itself.** The first version of the race test
+asserted through a session that its own `with` block had already closed, which
+borrows a fresh connection from the pool and leaves that connection's
+transaction open. Nothing failed: the test passed, and the scratch database's
+`drop_all` then blocked for 30 seconds on the lock its own teardown could not
+get, which surfaced as a `LockWaitTimeout` during teardown rather than as a
+test failure -- 31 seconds for a test whose assertions take milliseconds, and a
+`LockWaitTimeout` raised from `drop_all`, a line that is not part of the claim
+under test at all. The assertion now happens inside the block and the module
+runs in 4.9 seconds. A check that reports the wrong layer is still a wrong
+check, and the way to find that out was to read which test the teardown error
+was attached to rather than to look at the passing count.
+
+**Discrimination evidence.** Four mutations, each in the source and not in the
+test, each restored afterwards, each observed to go red:
+
+| mutation | result |
+| --- | --- |
+| A. the FAILED-only eligibility rule removed | RED -- 13 tests, including every non-FAILED state, the repeat request, and the in-flight race |
+| B. `require_no_in_flight_run=False` on the guarded transition | RED -- `test_a_task_with_a_run_in_flight_is_refused`, `test_a_task_with_a_run_in_flight_is_a_conflict_over_http` |
+| C. the dependency rule removed | RED -- 5 tests, including the shared-rule comparison with resume |
+| D. the authorization resurrecting the most recent historical run instead of leaving history alone | RED -- 13 failures and 9 errors, across identity, history, event-log and race assertions |
+
+Mutation B is the shape of a guard that survives review -- the row is still
+locked, the CAS on status is still there, and the only thing removed is the
+predicate about runs -- and it is the predicate the incident needed. A and C
+needed a second attempt: the driver's first edits did not match the source as
+written, it raised, and the shell loop went on to run the **unmutated** module,
+which reported 54 passed under a heading that said A. A mutation check that
+measures nothing is the same "check that cannot fail" as Concern 64's driver
+bug, one layer down. Both were re-applied and re-run, and the four rows above
+are what those runs reported.
+
+**Validation.** `tests/integration/test_concern65.py` 54 passed, three
+consecutive runs under three different randomized orders (`pytest-randomly` is
+installed and active) with no flakiness, including the three PostgreSQL races;
+the full suite 1326 passed; `ruff check` clean on the changed files;
+`ruff format --check` clean on the changed files (the repository-wide
+`--check` still reports its pre-existing 135-file baseline, none of them
+touched here). The Phase M acceptance gate is unaffected by this change and was
+not re-run as a gate for it.
+
+**Campaign facts preserved.** `RUN-20260927-000020` remains as it was found:
+`ABANDONED`, attempt 3, run 5, `candidate_commit` null. TS-106 remains `FAILED`
+and was **not** retried -- the new capability was deliberately not used on the
+task it was written for, for the same reason Concern 64 did not abandon a run to
+validate abandonment. TS-107 was not run. No candidate was accepted, no
+manifest was re-imported, no model or context configuration was changed, and no
+direct database mutation was performed. Escalation
+`deb00534-4521-416b-ad0f-75e6d1266e3c` remains RESOLVED. `agent/integration`
+remains `a2e40f226146feb723658b5eae0c7dac3635cf7e`.

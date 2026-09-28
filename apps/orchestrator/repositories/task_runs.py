@@ -7,7 +7,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.sql.elements import ColumnElement
 
 from ..db.models import TaskRow, TaskRunRow
-from ..domain.enums import ABANDONABLE_RUN_STATUSES, RunStatus
+from ..domain.enums import ABANDONABLE_RUN_STATUSES, IN_FLIGHT_RUN_STATUSES, RunStatus
 from ..domain.errors import AbandonedRunError, RunNotInFlightError
 from ..domain.models import TaskRun
 from .base import Repository
@@ -130,13 +130,37 @@ class TaskRunRepository(Repository[TaskRunRow, TaskRun]):
         worth resuming: it is never handed one. A caller cannot accidentally
         resume an abandoned run by forgetting to check, because the query it
         iterates does not return abandoned runs in the first place.
+
+        The filter is ``IN_FLIGHT_RUN_STATUSES`` rather than a second literal,
+        and concern 65's operator retry refuses on exactly that set: a task may
+        be retried only when recovery would say no run of its work is going.
+        One definition, so the two answers cannot disagree.
         """
         rows = self.session.scalars(
-            select(TaskRunRow).where(
-                TaskRunRow.status.in_([RunStatus.PENDING, RunStatus.RUNNING])
-            )
+            select(TaskRunRow).where(TaskRunRow.status.in_(IN_FLIGHT_RUN_STATUSES))
         ).all()
         return [self._to_domain(row) for row in rows]
+
+    def in_flight_for_task(self, task_id: UUID) -> TaskRun | None:
+        """The run of this task that is still in flight, if there is one.
+
+        The read that explains a refusal: concern 65's operator retry is
+        guarded on the absence of an in-flight run, and when the guard refuses
+        the operator is told *which* run is in the way rather than a bare
+        conflict. A statement, not the identity map, because the answer has to
+        be the committed one -- the identity map is precisely the stale copy
+        the guard exists about.
+        """
+        row = self.session.scalar(
+            select(TaskRunRow)
+            .where(
+                TaskRunRow.task_id == task_id,
+                TaskRunRow.status.in_(IN_FLIGHT_RUN_STATUSES),
+            )
+            .order_by(TaskRunRow.run_number)
+            .limit(1)
+        )
+        return self._to_domain(row) if row is not None else None
 
     def finish(
         self, run_id: UUID, status: RunStatus, failure_reason: str | None = None

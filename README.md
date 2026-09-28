@@ -290,6 +290,37 @@ Two rules govern importing:
   run in flight, and never deletes a task that has left the manifest -- it is
   reported as orphaned so its run history survives.
 
+### Retrying a failed task
+
+A task that ended `FAILED` can be authorized for another attempt. This is an
+operator action, not a model tool: a new run starts from the integration
+baseline rather than from the work the failed attempt left behind, so retrying
+is a decision about the campaign rather than about one run.
+
+```bash
+curl -X POST localhost:8000/tasks/$TASK_ID/retry \
+  -H 'content-type: application/json' \
+  -d '{"reason": "the preflight left no supported path; re-run against the current image", "requested_by": "darri"}'
+```
+
+The endpoint does not create a run. It moves the task from `FAILED` to `READY`
+and appends one `TASK_RETRY_AUTHORIZED` event carrying the reason, the operator
+and the run history the decision was made against. The next project execution
+creates the new run: a new run number, a new branch and worktree, and the
+integration baseline as it stands at that moment, so a dependency that has not
+been integrated since is honoured rather than assumed. Every earlier run is left
+exactly as it was found -- terminal, with its own `candidate_commit` untouched,
+and still readable. Nothing is resumed, rewritten or re-pointed.
+
+The request is refused with 409 when the task is not `FAILED`, when the project
+is not runnable or a pause is in force, when a `PENDING` or `RUNNING` run
+already exists for the task, or when a dependency is not complete in the
+integration baseline. A blank or whitespace-only reason is 422. Two requests
+arriving together cannot both be authorized: the guarded task update -- which
+requires the current status to be `FAILED` *and* no run to be in flight -- is
+the authority, and the loser is told it lost a race rather than given a second
+run.
+
 ## Git workspaces
 
 Each task run gets its own branch and its own worktree; the managed

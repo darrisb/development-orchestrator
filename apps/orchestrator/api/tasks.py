@@ -3,14 +3,21 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..db.session import get_db
 from ..schemas.runs import TaskRunResponse
-from ..schemas.tasks import PauseRequestResponse, PauseTaskRequest, TaskResponse
+from ..schemas.tasks import (
+    OperatorReason,
+    PauseRequestResponse,
+    PauseTaskRequest,
+    RetryTaskRequest,
+    TaskResponse,
+)
 from ..services import abandon as abandon_service
 from ..services import pauses as pause_service
+from ..services import retry as retry_service
 from ..services import runs as run_service
 from ..services import tasks as task_service
 
@@ -20,7 +27,7 @@ router = APIRouter(tags=["tasks"])
 class AbandonRunRequest(BaseModel):
     """An operator's request to abandon one durable run (concern 64)."""
 
-    reason: str = Field(
+    reason: OperatorReason = Field(
         ...,
         min_length=1,
         description=(
@@ -32,23 +39,6 @@ class AbandonRunRequest(BaseModel):
     requested_by: str | None = Field(
         None, description="Operator identifier, recorded in the event payload."
     )
-
-    @field_validator("reason")
-    @classmethod
-    def _reason_is_not_blank(cls, value: str) -> str:
-        """Reject a reason that is only whitespace, as 422 rather than a 500.
-
-        ``min_length=1`` above is about the request being well formed; it lets
-        ``"   "`` through, and ``"   "`` records nothing a reader could learn
-        from. The service refuses it too, but a ``ValueError`` raised inside a
-        route is a 500 with a traceback, and the request was the caller's
-        mistake, not the server's. A validator keeps it a 422 and keeps the
-        text itself verbatim -- the operator's wording is evidence and is not
-        silently trimmed.
-        """
-        if not value.strip():
-            raise ValueError("reason is required")
-        return value
 
 
 @router.get("/tasks/{task_id}", response_model=TaskResponse)
@@ -104,6 +94,51 @@ def abandon_run(
         requested_by=payload.requested_by,
     )
     return TaskRunResponse.from_domain(run)
+
+
+@router.post("/tasks/{task_id}/retry", response_model=TaskResponse)
+def retry_task(
+    task_id: UUID,
+    payload: RetryTaskRequest,
+    session: Session = Depends(get_db),
+) -> TaskResponse:
+    """Authorize a new run for a failed task (concern 65).
+
+    An operator action, like abandonment: the only thing that may start a run
+    for a task the orchestrator itself gave up on is a person. It is not in the
+    model tool surface.
+
+    The authorization is not the execution. The task becomes ``READY`` -- the
+    state the scheduler selects from and the only one a new run may be created
+    from -- and the next project execution creates the run through the same
+    machinery as any other, from the current accepted integration baseline. The
+    response is the task, because the task is what changed.
+
+    Responses:
+
+    * ``200`` -- the task is now ``READY`` and eligible for a new run.
+    * ``404`` -- no such task.
+    * ``409`` -- the task is not ``FAILED`` (including a task that is
+      ``COMPLETE``, and including a task that stopped being ``FAILED`` while
+      the request was in flight); a run of the task is in flight; a dependency
+      is not complete in the integration baseline; the project is not runnable;
+      or a pause is in force. Every one of those is a statement about the world
+      as it is now, not a policy about the request.
+    * ``422`` -- ``reason`` is missing, empty, or only whitespace.
+
+    Repeating the request is not idempotent in the sense of quietly doing the
+    thing again: the second call finds a task that is no longer ``FAILED`` and
+    is refused with 409, having created no run and recorded no second
+    authorization.
+    """
+    return TaskResponse.from_domain(
+        retry_service.retry_failed_task(
+            session,
+            task_id,
+            reason=payload.reason,
+            requested_by=payload.requested_by,
+        )
+    )
 
 
 @router.post("/tasks/{task_id}/pause", response_model=PauseRequestResponse)

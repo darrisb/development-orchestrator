@@ -11,6 +11,7 @@ from ..domain.models import PauseRequest, Task
 from ..domain.state_machine import is_active
 from ..repositories import PauseRequestRepository, TaskRepository, TaskRunRepository
 from .errors import EntityConflict, EntityNotFound
+from .scheduler import unsatisfied_dependencies
 
 
 def pause_task(
@@ -74,15 +75,12 @@ def resume_task(session: Session, task_id: UUID) -> Task:
     # is in the integration baseline (concern 51). Resuming is one of the places
     # a task is promoted without the scheduler's readiness pass, so it has to
     # apply the same rule or a resume would smuggle a task past a blocked
-    # dependency.
-    satisfied = {
-        candidate.external_task_id
-        for candidate in tasks.list_for_project(task.project_id)
-        if candidate.status is TaskStatus.COMPLETE and candidate.is_integrated
-    }
+    # dependency. The rule itself is the scheduler's, shared rather than restated
+    # here: two copies of "satisfied" would eventually disagree, and the one
+    # that disagreed would be the one with no readiness pass to correct it.
     target = (
         TaskStatus.READY
-        if all(dependency in satisfied for dependency in task.depends_on)
+        if not unsatisfied_dependencies(session, task)
         else TaskStatus.PENDING
     )
     return tasks.transition(task.id, target)

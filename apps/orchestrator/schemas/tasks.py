@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import AfterValidator, BaseModel, Field
 
 from ..domain.dependencies import ReadinessReport
 from ..domain.enums import Complexity, RiskLevel, TaskStatus
@@ -115,6 +116,46 @@ class NextTaskResponse(BaseModel):
 class PauseTaskRequest(BaseModel):
     reason: str | None = None
     requested_by: str | None = None
+
+
+def _reason_is_not_blank(value: str) -> str:
+    """Reject an operator reason that is only whitespace, as 422 not 500.
+
+    One rule for every operator request that requires an explanation -- abandoning
+    a run (concern 64) and retrying a failed task (concern 65) -- because two
+    spellings of it is how one of them ends up quietly accepting ``"   "`` and
+    recording nothing a reader could learn from.
+
+    The text itself is kept verbatim rather than trimmed: an operator's wording
+    is evidence. The service refuses a blank reason too, since it is reachable
+    without this layer, but a ``ValueError`` raised inside a route is a 500 with
+    a traceback, and a missing reason is the caller's mistake, not the server's.
+    """
+    if not value.strip():
+        raise ValueError("reason is required")
+    return value
+
+
+#: A required operator explanation. ``Field(min_length=1)`` is about the request
+#: being well formed; this is about it being worth recording.
+OperatorReason = Annotated[str, AfterValidator(_reason_is_not_blank)]
+
+
+class RetryTaskRequest(BaseModel):
+    """An operator's authorization of a new run for a failed task (concern 65)."""
+
+    reason: OperatorReason = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Why this task is being run again. Required: an unexplained new run "
+            "on a failed task is indistinguishable from the orchestrator retrying "
+            "itself, which is exactly what this operation is not."
+        ),
+    )
+    requested_by: str | None = Field(
+        None, description="Operator identifier, recorded in the event payload."
+    )
 
 
 class PauseRequestResponse(BaseModel):

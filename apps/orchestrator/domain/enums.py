@@ -47,6 +47,19 @@ class RunStatus(StrEnum):
     ABANDONED = "ABANDONED"
 
 
+#: Run statuses that mean a run is in flight: opened, or executing.
+#:
+#: One definition, used by every question that is actually about flight rather
+#: than about a name. ``TaskRunRepository.list_incomplete`` filters on it, so
+#: recovery never sees a terminal run; concern 65's operator retry refuses
+#: while a run of the task is in one of these states, which is deliberately the
+#: same set -- a retry must refuse exactly when recovery would consider the
+#: task's work unfinished, or the two answers would disagree about whether the
+#: task has a run going.
+IN_FLIGHT_RUN_STATUSES: frozenset[RunStatus] = frozenset(
+    {RunStatus.PENDING, RunStatus.RUNNING}
+)
+
 #: Run statuses an operator may abandon (concern 64).
 #:
 #: ``ABANDONED`` is deliberately absent, and that is the whole point of this
@@ -62,9 +75,13 @@ class RunStatus(StrEnum):
 #: Every member is in flight. ``SUCCEEDED`` and ``FAILED`` are already
 #: terminal, so abandoning them would rewrite a completed run's outcome rather
 #: than stop work.
-ABANDONABLE_RUN_STATUSES: frozenset[RunStatus] = frozenset(
-    {RunStatus.PENDING, RunStatus.RUNNING}
-)
+#:
+#: An alias rather than a second literal. Abandonability and flight are asked
+#: separately -- "may this run be abandoned" is not "is this run in flight",
+#: and ``abandon_run`` handles the idempotent case of an already-abandoned run
+#: without consulting either -- but for now the only in-flight runs are the
+#: only abandonable ones, and two literals would be free to drift apart.
+ABANDONABLE_RUN_STATUSES: frozenset[RunStatus] = IN_FLIGHT_RUN_STATUSES
 
 
 class Complexity(StrEnum):
@@ -305,6 +322,15 @@ class RunEventType(StrEnum):
     #: An operator intentionally terminated an active durable run (concern 64).
     #: The run is terminal and cannot be resumed.
     RUN_ABANDONED = "RUN_ABANDONED"
+    #: An operator authorized a new run for a failed task (concern 65).
+    #:
+    #: The first event type that is deliberately about a *task* rather than
+    #: about a run: the authorization happens before any run exists, so the row
+    #: carries a task id and a null ``task_run_id``. That is what the nullable
+    #: column is for (see ``services.lessons._lesson_event``), and attaching
+    #: this to the abandoned run instead would put a decision on the record of
+    #: an execution that had nothing to do with it.
+    TASK_RETRY_AUTHORIZED = "TASK_RETRY_AUTHORIZED"
 
 
 class WorkerProfile(StrEnum):
