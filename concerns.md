@@ -2808,5 +2808,47 @@ apply, run, fail for the intended reason, and were reversed before validation:
 The restored-source discrimination run passed all five directly affected
 tests. No mutation result was counted from an edit that failed to apply.
 
-**Validation and deployment.** Recorded after the complete acceptance run and
-fresh deployment in this repair.
+**SQLite fixture note.** The shared `session` fixture in `tests/conftest.py`
+wraps every test in an outer transaction and binds the ORM Session with
+`join_transaction_mode="create_savepoint"`. Under that mode a test-level
+`session.commit()` releases a SAVEPOINT rather than committing to the database,
+so the outer transaction's rollback still discards every row on teardown even
+when the code under test now commits explicitly (as Concern 66 requires before
+each model call). No production semantics are affected: the fixture change is
+scoped to the test harness and controls how the test connection observes
+in-test commits; the orchestrator's own `session_scope` and the pre-provider
+`durable_checkpoint` continue to issue real commits against PostgreSQL.
+`tests/integration/test_fix_loop_resume.py` and
+`tests/unit/test_db_session_cleanup.py` include the regression coverage: a test
+that commits data, followed by a test that observes a clean database.
+
+**Validation and deployment.** The complete acceptance suite passed on both
+SQLite (1333 passed in 83.71s) and PostgreSQL 16
+(`postgresql+psycopg://.../test_orchestrator`, 1333 passed in 95.93s), with an
+additional randomized-order run (seed 12345) at 1333 passed in 83.47s. The
+Concern 66 targeted set --
+`tests/integration/test_fix_loop_resume.py`,
+`tests/unit/test_db_session_cleanup.py`, and the concurrency slice in
+`tests/integration/test_concern64.py` -- passed 74/74 on PostgreSQL. The Phase M
+acceptance exercise passed. `ruff check .` was clean. The orchestrator image
+was rebuilt at commit `c748543fb100dc438c4c327e96a4e3af0e3adb80` with
+`SOURCE_REVISION=c748543fb100dc438c4c327e96a4e3af0e3adb80`, `SOURCE_DIRTY=false`,
+and `BUILD_TIME=2026-09-28T12:54:17Z`; `docker compose up -d orchestrator`
+recreated the container and `scripts/check_deployment_freshness.py --expected
+HEAD` reported `fresh: deployment is clean@c748543fb100dc438c4c327e96a4e3af0e3adb80`.
+The mutation evidence recorded in this section reflects the mutations
+performed while Concern 66 was being written; they are preserved rather than
+re-executed here to avoid touching production source without a defect signal.
+Preservation checks after the fresh deployment confirmed: TS-109 remains
+`VERIFYING`, its second run `9760dfeb-3112-4b4f-b67f-5ae4daa7b2b1` remains
+`RUNNING` (unresumed and unabandoned), TS-110 remains `READY` with no runs, and
+the durable evidence for `RUN-20260928-000005` -- one `SUCCEEDED` attempt-1
+CODE `model_runs` row, four workflow checkpoints ending before the attempt-2
+provider call, `BUILD_FAILED`/`OUTCOME_RECORDED(in_progress, attempts=1)` in
+`run_events`, no attempt-2 `model_runs` row -- is exactly the pre-Concern 66
+signature. Under the new implementation a fresh worker would classify this run
+as resumable from checkpoint attempt 1, would not double-count the lost
+attempt-2 call, and would begin a new attempt-2 durably fenced by
+`require_in_flight`; the supported operator action is
+`POST /tasks/{TS-109}/resume`, which is documented here but deliberately not
+executed.
