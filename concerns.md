@@ -22,8 +22,9 @@ producing four accepted candidates that would not merge together.
 Resolved entries are kept in place and marked, rather than deleted or
 renumbered: the reasoning is referenced from code comments and tests, and the
 numbers are how they are referenced. **Resolved: 1–12, 16, 18–20, 22–29, 32–36,
-38–39, 41, 43, 46, 48–56, 58–64.** **Partly resolved: 30, 45** -- each says which half.
-**Open: 13, 14, 15, 17, 21, 31, 37, 40, 42, 44, 47.**
+38–39, 41, 43, 46, 48–56, 58–68, 70.** **Partly resolved: 30, 45** -- each says which half.
+**Open: 13, 14, 15, 17, 21, 31, 37, 40, 42, 44, 47.** 69 was a correction to
+concern 64's option text and is recorded in its own commit message.
 
 Every open entry is now a documented limitation rather than an unfinished fix.
 Nine of the eleven say so themselves -- 13, 14, 15, 17, 21, 31, 37, 40, 42 and
@@ -104,6 +105,13 @@ writable and refusing on any clipped item would refuse most tasks against a
 repository with large files. So the protection is something a task earns by
 saying what it changes. A larger per-item budget for writable files, or a
 patch-based edit mode, is still the better long-term answer.
+
+*Later.* The second half of that sentence arrived, in a form narrower than a
+patch: concern 70 added a `replace` operation that names a region of a file
+rather than rewriting it, so a coder working from a clipped file can now change
+the part it can see without re-sending the part it cannot. It does not let a
+coder edit a region it was never shown, so the gap above is narrowed rather than
+closed, and the token budget is unchanged.
 
 ## 2. The orchestrator cannot start workers from inside its own container — **resolved**
 
@@ -2223,6 +2231,12 @@ against a stale image, and section 64 records the campaign state after that run.
 TS-106 is now FAILED and escalation `deb00534` is RESOLVED; the run and the ref
 above did not change.)*
 
+*Later.* Section 70 left this function alone and added a second, differently
+shaped ceiling beside it: a flat 8,000 bytes on `oldText + newText` for the
+`replace` operation, with the resulting file bounded separately by
+`CONTEXT_MAX_FILE_BYTES`. So a task that wanted a small change to a large file no
+longer needs this ceiling raised to get it, and nothing here widened.
+
 ## 63. Stale container image defeated Concern 62 validation -- **resolved**
 
 Found after `RUN-20260927-000020`, the fourth TS-106 run. The investigation
@@ -3352,3 +3366,262 @@ TS-109 was never retried or abandoned, TS-110 was never started, TraceStack was
 never modified and `agent/integration` was never moved. Every fixture
 reproducing the run is synthetic, in a private database and a private repository
 under `tmp_path`.
+
+## 70. A small change to a large file had no safe way to be made -- **resolved**
+
+**Observed evidence.** `RUN-20260928-000007`
+(`eac296d6-f041-4fa3-abfd-44d1a15c4186`), TS-109, "Keep only the entries from one
+navigation source": add a public `filterBySource(source)` to `NavigationStack`
+and add tests for a match, no match, and `source` undefined. `max_diff_lines`
+150, `max_files_changed` 3. The file it needed to change,
+`src/test/navigation-stack.test.ts`, was 11,813 bytes and held 39 existing
+tests, none of them about `filterBySource`. Both attempts were refused, and they
+failed in opposite directions, which is what made the diagnosis unambiguous.
+
+**Attempt 1 did the right thing and was 340 bytes over.** The model added
+`filterBySource` to `navigation-stack.ts` (2,353 bytes) and the three new tests
+to the test file, taking it from 11,813 to 15,106 bytes. Recorded verbatim:
+
+```
+content is 15106 bytes, over the 14766-byte limit for one file
+```
+
+14,766 is `per_path_edit_allowance(11_813)`, so the refusal is arithmetically
+correct and the model had done nothing wrong. Three thousand bytes of new
+tests, against a ceiling the file's own size had set.
+
+**Attempt 2 was told to fit, and fitted by deleting the tests.** The fix-loop
+feedback was:
+
+```
+Return the complete new contents of every file you change, within the size limits.
+```
+
+The model complied. Attempt 2 wrote both files, passed the output ceiling, and
+was blocked by the scope guard on the diff instead -- 413 lines against a limit
+of 150. The patch is 98 additions and **315 deletions**, and every one of the 39
+tests that were in the file before is gone.
+
+This is the part worth recording. Every individual decision in that run was
+correct: the ceiling was computed right, the refusal was right, the feedback was
+right, and the scope guard caught the consequence. The failure was that the only
+feedback the model could be given was a size limit, and the cheapest way to
+satisfy a size limit on a whole-file edit is to delete the parts of the file the
+task said nothing about. The system did not fail open. It failed in a way that
+made the model actively worse, and then reported success for the fix attempt
+because the output ceiling was satisfied. A guard that a model can satisfy by
+removing the work is not a guard on the work.
+
+**Why this is a representation problem, not an allowance problem.** Concerns 61
+and 62 raised the ceiling and made rejections visible, and both were necessary.
+Neither made the *shape* of an edit changeable, so the model's only lever on
+size was content it had no reason to remove. To change one line in a file, the
+coder must return the file's entire new contents, so the emission ceiling is
+charged against the whole file rather than against the change. Measured with
+`per_path_edit_allowance` against the flat targeted ceiling this concern adds:
+
+| file size | whole-file allowance | targeted allowance | ratio |
+| --- | --- | --- | --- |
+| 1,486 | 8,000 | 8,000 | 1.0x |
+| 8,000 | 10,500 | 8,000 | 1.3x |
+| 11,813 | 14,766 | 8,000 | 1.8x |
+| 20,000 | 25,000 | 8,000 | 3.1x |
+| 60,000 | 75,000 | 8,000 | 9.4x |
+| 100,000 | 125,000 | 8,000 | 15.6x |
+
+At the low end the two are equal, so a small change to a small file was already
+affordable, and raising the whole-file ceiling would not have touched the
+campaign: the 15,106 bytes in attempt 1 are the 3,293 bytes of new tests plus
+the unchanged 11,813, and a larger allowance buys the unchanged 11,813 again on
+every future task. The cost is the growth term, `1.25 * source_bytes`, which
+prices a file by what it is rather than by what is being done to it, and the two
+failure modes above follow from having no other option:
+
+1. **The model drops something while retyping.** Re-emitting a 100KB file to
+   change one line makes every other line a chance to lose a test, a branch or an
+   import.
+2. **The model deletes something on purpose.** This is the one that actually
+   happened, and it is worse than the first because it is not an accident. The
+   prompt already warned "an omitted test is a deleted test", and attempt 2 read
+   that as permission.
+
+Neither is a bug in the allowance. The allowance is doing what it was built to
+do -- bound the worst case -- and the problem is that it was the *only* lever,
+so satisfying it and doing the task were the same instruction. Note also that
+concern 1 already named the long-term answer: "a larger per-item budget for
+writable files, or a patch-based edit mode, is still the better long-term
+answer." This is the second half of that, in a form that cannot misapply.
+
+**What was wrong.** The edit schema admitted exactly two operations, `create`
+and `update`, and `update` meant "here is the file's complete new contents".
+There was no third shape for "here is this text, replace it with that", so a
+change of any size was priced at the size of the file it landed in.
+
+**The fix.** A fourth operation, `replace`, that names a region instead of a
+file. `operation: "replace"`, `content: ""`, and `oldText`/`newText`:
+
+```json
+{
+  "path": "src/test/navigation-stack.test.ts",
+  "operation": "replace",
+  "content": "",
+  "oldText": "  it('should push entries', () => {\n",
+  "newText": "  it('filters by source', () => {\n    ...\n  });\n\n  it('should push entries', () => {\n"
+}
+```
+
+That is attempt 1 of the run above, minus the 3,293 bytes of unchanged test file
+the model was also made to re-send. The 39 existing tests are still in the
+file because nothing in the payload was asked to remove them, and the ceiling
+charged is the 3,293 bytes of new test rather than the 15,106-byte result.
+
+`EDIT_SCHEMA_VERSION` moves to `code-edits/3` and `CODER_PROMPT_VERSION` to
+`coder-prompt/2`. The prompt teaches the choice -- `replace` for a small change
+to an existing file, whole contents for a rewrite or a new file -- and states
+the rule that makes the two safe side by side.
+
+**Why the match is exact and why there is no fuzzy fallback.** `oldText` must
+occur in the file **exactly once**. Zero means the model's copy is not the file
+in the tree; two or more means there is no defensible choice between them, and
+picking the first makes the outcome depend on an unrelated copy of the same text
+elsewhere in the file. Both are refusals. A near match applied where the model
+did not mean is silent corruption; a near match refused is one line of feedback
+the next attempt can act on, so the fix loop gets a real second turn instead of a
+wrong first one. A 400-line region is 15 lines of `newText` and is accepted; a
+2-line typo in `oldText` is a refusal with a message naming the line to widen.
+That trade is the whole design: it makes a misapplied edit impossible rather
+than merely unlikely, at the cost of refusing edits the model could have
+approximated. The synthetic case at the end of this entry replays the run above
+and asserts both halves.
+
+**Why the ceiling is flat at 8,000 bytes and is checked twice.** Emission and
+result are different sizes and are bounded differently, which is the same
+distinction concern 56 drew for context. What the model *sends* is
+`oldText + newText`, charged at a flat `MAX_TARGETED_EDIT_PAYLOAD_BYTES = 8_000`
+that does not scale with the file -- a small change to a large file must stay
+cheap. What the file *becomes* is bounded separately by the existing
+`config.context_max_file_bytes`, so a legal 8KB replacement applied to a
+200KB file is still refused on its result. Neither limit can be reached by
+trading against the other.
+
+**Why a change set containing a targeted edit is planned in full first.** If any
+edit cannot be applied, nothing in the response is written and the refusal names
+every edit rather than the first. A model that returns three targeted edits and
+gets the third one wrong has proposed a change, not three changes, and applying
+two of them leaves a candidate that is internally consistent and wrong -- the
+worst outcome available, because it consumes a verification cycle to discover.
+Whole-file-only change sets keep their existing per-edit partial semantics, since
+concern 61's fail-closed guarantee is already carried by the parser for those and
+changing it would have altered reviewed behaviour for no gain.
+
+**Why `max_files_changed` counts distinct paths.** Three targeted edits to one
+file is one file. Counting entries would charge the model for choosing the
+representation rather than for the change it proposes, and the incentive that
+creates is the wrong one.
+
+**Everything else is unchanged, deliberately.** The path is still checked by the
+concern 61 parser before any content is looked at; scope is still decided on the
+resulting Git diff in `domain/scope.py`; protected and disallowed paths are still
+refused first; no shell, no patch dialect and no external diff tool was
+introduced; and the whole-file allowance in `per_path_edit_allowance` is
+untouched, so no existing ceiling moved.
+
+**Coverage.** 57 tests. The representation: `replace` accepted on an existing
+file; rejected on a path that does not exist; `oldText`/`newText` required;
+empty `oldText` rejected (it would match everywhere); `oldText`/`newText`
+rejected on a non-`replace` operation; `content` required to be empty; payload
+over 8,000 rejected and a payload of exactly 8,000 accepted; the ceiling pinned
+by literal so raising the constant fails the suite. The application: a targeted
+replacement writes only its region; the file is byte-identical to the starting
+commit apart from the named span; two targeted edits to one path are both
+counted and both written; three count as one file against `max_files_changed`; a
+later bad edit rolls the whole response back; a bad whole-file edit still stops
+a targeted one in the same response; a targeted edit after a whole-file edit of
+the same path matches the *staged* content rather than the file on disk, which
+is the overlay's reason for existing; zero and multiple matches are refused and
+write nothing; a result over `context_max_file_bytes` is refused; a payload over
+8,000 is refused at parse with no diff captured and no diff even measured; a
+refusal names every edit in the response; a targeted edit through a symlink and
+one outside the repository are both refused. The scope guards, each driven through
+`run_coding_attempt` so the whole path is real: outside the task allowance;
+over `max_diff_lines` with a 7,109-byte payload -- inside the 8,000-byte
+emission ceiling -- and a 301-line diff, which is the case that separates the
+two ceilings; over `max_files_changed`; a protected
+path. Whole-file behaviour: the per-path ceiling still refuses rather than
+truncating, and concern 61's malformed response is still
+`INVALID_MODEL_RESPONSE`. The prompt: both operations named, the preference
+stated, "occur exactly once" in both halves, the preservation rule in both halves
+compared case-insensitively because it starts a sentence in one and a bullet in
+the other, and the feedback a fix attempt receives advertising the same
+capability after a rejected response.
+
+**The two tests that were wrong before the mutation run.** Worth recording
+because both were green and both were asserting nothing. The emission-ceiling
+test built its payload from `MAX_TARGETED_EDIT_PAYLOAD_BYTES + 1`, so it passed
+unchanged when the constant was raised to 100,000 -- mutation C survived it, and
+the fix is `test_the_targeted_emission_ceiling_is_eight_kilobytes_of_old_text_plus_new_text`,
+which asserts the literal. And the RUN-000007 fixture wrote its 11,813-byte
+baseline into the worktree *after* `prepare_workspace`, so the diff the scope
+guard measured was the fixture's own 164 lines and the task was blocked for the
+wrong reason; the baseline is now committed into the repository before the
+workspace is prepared, so the diff the guard reads is the coder's change.
+
+**Mutation evidence.** Five controlled source mutations, each applied to the file
+and confirmed, each run against the concern 70 suite, each restored from a
+pre-mutation snapshot in `/tmp` followed by a green re-run and a clean
+`git diff --stat`. No result is counted from an edit that did not apply.
+
+| mutation | result |
+| --- | --- |
+| A -- `_resolve_targeted` takes the first match: `occurrences` forced to 1 and the multiple-match refusal removed | RED -- 6 tests, including both bad-match refusals, the rollback test, the refusal-accounting test, the fix-feedback test and the synthetic bad-match case |
+| B -- the `result_max_bytes` check short-circuited to `False` | RED -- `test_a_targeted_edit_past_the_result_ceiling_is_refused` |
+| C -- `MAX_TARGETED_EDIT_PAYLOAD_BYTES` raised from 8,000 to 100,000 | RED -- 4 tests, but **only after** the tautological test above was rewritten. First attempt: 56 passed, mutation undetected |
+| D -- `atomic = any(edit.is_targeted ...)` forced to `False`, i.e. targeted edits take the old partial path | RED -- 9 tests, including the atomicity pair and every fail-closed refusal |
+| E -- `proposed_paths` counts edit entries instead of distinct paths | RED -- `test_several_targeted_edits_to_one_file_count_as_one_file` |
+
+**Regression validation.** Concern 70 targeted: 57 passed in 1.25s. Concern
+70 under `pytest-randomly`: 57 passed in 1.65s. Concerns 61 and 62 plus
+`test_coding_agent.py`: 60 passed in 2.99s.
+`test_code_edits_contract.py` + `test_code_edits.py`: 36 passed in 0.14s.
+`test_scope_guard.py` + `test_architecture.py` + `test_migrations.py`: 77 passed in
+1.12s. Full SQLite suite, fixed order: 1484 passed in 109.39s. Randomized order
+(`pytest-randomly`): 1484 passed in 109.99s, and 1484 passed in 106.87s on a
+second seed, and a third at 110.70s. Full PostgreSQL 16 suite
+(`postgresql+psycopg://.../test_orchestrator`): 1484 passed in 127.34s.
+`ruff check .` clean. `ruff format` is not a gate in this repository and was not
+run: 74 of the 124 existing files under `apps/` are not in its output, so
+applying it would have reformatted unrelated code.
+
+The PostgreSQL run used the pre-existing empty `test_orchestrator` database and
+not `orchestrator`, which is deliberate and worth stating: the `engine` fixture
+in `tests/conftest.py` calls `Base.metadata.drop_all` at session teardown, so
+pointing `TEST_DATABASE_URL` at the live runtime database would have dropped the
+deployment's tables. Every other fixture owns a file or a scratch database under
+`tmp_path`, so there is no cross-test pollution, no stale worktree under
+`WORKTREE_ROOT` and no change to any managed repository.
+
+**Where the evidence above came from.** Every number in this entry was read out
+of the run's own records, not estimated: `run_events` for
+`eac296d6-f041-4fa3-abfd-44d1a15c4186` for the two `CODING_COMPLETED` payloads and
+the verbatim feedback strings, the stored `coder-response.txt` and
+`candidate.patch` for attempt 2's byte counts and its 315 deletions, and
+`context.md` for the baseline's 11,813 bytes and 39 tests. Those queries were
+`SELECT`s. TS-109's state is unchanged and is recorded as it was found: status
+`READY`, four `task_runs` rows, the last of them
+`RUN-20260928-000007` `FAILED` / `SCOPE_VIOLATION` at attempt 2. The live run
+records `prompt_version: "coder-prompt/1+code-edits/2"`, which is the pair this
+concern replaces.
+
+**Campaign preservation.** `POST /runs/{run_id}/recover` was never called against
+`RUN-20260928-000005`, TS-109 was never retried or abandoned, TS-110 was never
+started, TraceStack was never modified and `agent/integration` was never moved.
+The database was read and never written.
+
+Concern 70's RUN-000007 test fixture is not a replay of the live run and does
+not reuse any of its data. It is a reconstruction of the shape that failed, from
+constants measured off the real run and generated content from `tmp_path`: an
+11,813-byte file holding 39 tests, a 14,766-byte ceiling, a 3,293-byte addition
+that was 340 bytes over as a whole-file edit and comfortably under the flat
+8,000 ceiling as a targeted one. That difference -- 3,293 against 8,000, and
+15,106 against 14,766 -- is the entire claim of this concern, and the fixture
+asserts both sides of it.

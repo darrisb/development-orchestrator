@@ -18,6 +18,18 @@ evidence, and the coder is told exactly which edit was refused and why so the
 next attempt can be different. A refusal for a *scope* reason is a different
 matter and the caller escalates it -- see ``EditApplication.scope_refusals``.
 
+**Targeted edits and the absence of partial application (concern 70).** A
+change set containing a targeted ``replace`` is planned in full before any
+byte is written, and if any edit in it cannot be applied then *none* of it is.
+The reason is specific to this operation rather than a general tightening: a
+``replace`` is only meaningful against one known state of a file, so applying
+the first two of three edits to a file the third one does not match produces a
+candidate that is not the candidate the model described and that no reviewer
+can read. A whole-file edit does not have this property -- it applies to
+whatever the file happens to hold -- so a change set made only of those keeps
+the original per-edit semantics, where a refusal does not stop the edits after
+it.
+
 Nothing here executes anything. No command, no hook, no shell.
 """
 
@@ -57,6 +69,14 @@ class EditApplication:
     #: an edit that simply did not match the tree.
     refusal_kinds: tuple[ScopeFindingKind, ...] = ()
     warnings: tuple[str, ...] = ()
+    #: Paths changed by a targeted ``replace`` rather than by rewriting the
+    #: file (concern 70). Recorded so a reviewer and the completion report can
+    #: tell a three-line edit from a rewritten file that happens to have the
+    #: same resulting content.
+    targeted: tuple[str, ...] = ()
+    #: Whether the response was refused whole because one of its edits could
+    #: not be applied, leaving the worktree exactly as it was.
+    refused_whole: bool = False
 
     @property
     def applied_paths(self) -> tuple[str, ...]:
@@ -80,11 +100,17 @@ class EditApplication:
             "deleted": list(self.deleted),
             "rejected": [edit.describe() for edit in self.rejected],
             "warnings": list(self.warnings),
+            "targeted": list(self.targeted),
+            "refused_whole": self.refused_whole,
         }
 
 
 def apply_change_set(
-    change_set: CodeChangeSet, *, root: Path, policy: ScopePolicy
+    change_set: CodeChangeSet,
+    *,
+    root: Path,
+    policy: ScopePolicy,
+    result_max_bytes: int | None = None,
 ) -> EditApplication:
     """Write the permitted edits of ``change_set`` into ``root``.
 
@@ -93,24 +119,36 @@ def apply_change_set(
     edit reaches it the decision of where a run may write has already been made
     by ``services.workspace``.
 
-    Edits are applied in the order the coder gave them, and a refusal does not
-    stop the ones after it: a change set is not a transaction, and the
-    completion report plus the captured diff describe exactly what the tree
-    now holds.
+    Args:
+        result_max_bytes: ceiling on the *resulting* size of any file a targeted
+            ``replace`` produces. This is the safety bound that a targeted
+            edit does not get from the per-path output allowance, because that
+            allowance measures what the model sent and a targeted edit sends
+            only its region. The caller passes the largest file the context
+            builder will read into a prompt at all, so the bound is a number
+            the system already uses rather than a new allowance. ``None``
+            applies no separate ceiling, which is only correct for a whole-file
+            change set -- those are already bounded by their parsed content.
+
+    Edits are applied in the order the coder gave them. A change set that
+    contains a targeted edit is planned in full first and refused whole if any
+    part of it cannot be applied; see the module docstring for why that
+    boundary is drawn there and not everywhere.
     """
     resolved_root = root.expanduser().resolve()
-    written: list[str] = []
-    deleted: list[str] = []
-    rejected: list[RejectedEdit] = []
-    refusal_kinds: list[ScopeFindingKind] = []
-    warnings: list[str] = []
 
-    if len(change_set.edits) > policy.max_files_changed:
+    # Distinct paths, not edit entries: a change set of three targeted edits to
+    # one file is one file, and refusing it against max_files_changed would be
+    # measuring the model's chosen representation rather than the change it
+    # proposes. For a change set of whole-file edits this is the old count,
+    # because one path may appear only once there.
+    proposed_paths = tuple(dict.fromkeys(edit.path for edit in change_set.edits))
+    if len(proposed_paths) > policy.max_files_changed:
         # Refused as a whole rather than clipped: applying the first twelve of
         # thirty edits produces a half-implemented candidate that would waste a
         # verification cycle proving it does not work.
         reason = (
-            f"the change set edits {len(change_set.edits)} files; the task allows "
+            f"the change set edits {len(proposed_paths)} files; the task allows "
             f"{policy.max_files_changed}"
         )
         logger.warning("edits_refused_wholesale", root=str(resolved_root), reason=reason)
@@ -120,21 +158,58 @@ def apply_change_set(
                 for edit in change_set.edits
             ),
             refusal_kinds=(ScopeFindingKind.TOO_MANY_FILES,),
+            refused_whole=True,
         )
 
+    atomic = any(edit.is_targeted for edit in change_set.edits)
+    planned: list[_Planned] = []
+    rejected: list[RejectedEdit] = []
+    refusal_kinds: list[ScopeFindingKind] = []
+    warnings: list[str] = []
+    # Content staged by an earlier edit in this same change set, so a targeted
+    # edit that follows a create or a previous replace matches the text the
+    # model was looking at when it wrote it.
+    staged: dict[str, str] = {}
+
     for edit in change_set.edits:
-        outcome = _apply_one(edit, root=resolved_root, policy=policy)
+        outcome = _plan_one(
+            edit,
+            root=resolved_root,
+            policy=policy,
+            staged=staged,
+            result_max_bytes=result_max_bytes,
+        )
         if outcome.rejection is not None:
             rejected.append(outcome.rejection)
             if outcome.kind is not None:
                 refusal_kinds.append(outcome.kind)
+            if atomic:
+                return _refused_whole(
+                    change_set,
+                    root=resolved_root,
+                    rejected=rejected,
+                    refusal_kinds=refusal_kinds,
+                    warnings=warnings,
+                )
             continue
         if outcome.warning:
             warnings.append(outcome.warning)
-        if edit.operation is EditOperation.DELETE:
-            deleted.append(edit.path)
-        else:
-            written.append(edit.path)
+        if outcome.planned is not None:
+            planned.append(outcome.planned)
+
+    final = _final_per_path(planned)
+    for item in final.values():
+        _write(item)
+
+    written = tuple(
+        path for path, item in final.items() if item.edit.operation is not EditOperation.DELETE
+    )
+    deleted = tuple(
+        path for path, item in final.items() if item.edit.operation is EditOperation.DELETE
+    )
+    targeted = tuple(
+        dict.fromkeys(item.edit.path for item in planned if item.edit.is_targeted)
+    )
 
     logger.info(
         "edits_applied",
@@ -142,13 +217,76 @@ def apply_change_set(
         written=len(written),
         deleted=len(deleted),
         rejected=len(rejected),
+        targeted=len(targeted),
     )
     return EditApplication(
-        written=tuple(written),
-        deleted=tuple(deleted),
+        written=written,
+        deleted=deleted,
         rejected=tuple(rejected),
         refusal_kinds=tuple(dict.fromkeys(refusal_kinds)),
         warnings=tuple(warnings),
+        targeted=targeted,
+    )
+
+
+def _final_per_path(planned: list[_Planned]) -> dict[str, _Planned]:
+    """The last planned edit for each path, in first-mention order.
+
+    Several targeted edits to one file are the normal way to write one, so the
+    planned list holds one entry per edit while the filesystem is written once
+    per path. Every entry already carries the complete file as it stood after
+    that edit, so the last one for a path is its final state -- which is the
+    same answer as replaying the edits in order, arrived at without touching
+    the disk between them.
+    """
+    return {item.edit.path: item for item in planned}
+
+
+def _refused_whole(
+    change_set: CodeChangeSet,
+    *,
+    root: Path,
+    rejected: list[RejectedEdit],
+    refusal_kinds: list[ScopeFindingKind],
+    warnings: list[str],
+) -> EditApplication:
+    """Nothing is written, and every edit in the response is accounted for.
+
+    The failure that stopped the response is reported with its own reason; the
+    edits that would have succeeded get the reason they were not applied. Both
+    matter to the coder -- one is the thing to fix, the other is the assurance
+    that nothing was half-done -- and listing only the first would make a
+    refusal look like a smaller failure than it is.
+    """
+    failed_paths = {item.path for item in rejected}
+    companion = RejectedEdit(
+        path="",
+        operation="",
+        reason=(
+            "not applied, because another edit in this response could not be "
+            "applied, so the whole response was refused and nothing was written"
+        ),
+    )
+    every = [
+        *rejected,
+        *(
+            RejectedEdit(
+                path=edit.path, operation=edit.operation.value, reason=companion.reason
+            )
+            for edit in change_set.edits
+            if edit.path not in failed_paths
+        ),
+    ]
+    logger.warning(
+        "edits_refused_wholesale",
+        root=str(root),
+        reason=f"{rejected[-1].path}: {rejected[-1].reason}",
+    )
+    return EditApplication(
+        rejected=tuple(every),
+        refusal_kinds=tuple(dict.fromkeys(refusal_kinds)),
+        warnings=tuple(warnings),
+        refused_whole=True,
     )
 
 
@@ -157,9 +295,27 @@ class _Outcome:
     rejection: RejectedEdit | None = None
     kind: ScopeFindingKind | None = None
     warning: str | None = None
+    planned: _Planned | None = None
 
 
-def _apply_one(edit: FileEdit, *, root: Path, policy: ScopePolicy) -> _Outcome:
+@dataclass(frozen=True, slots=True)
+class _Planned:
+    """One edit that passed every gate, resolved to the bytes it will write."""
+
+    edit: FileEdit
+    target: Path
+    #: ``None`` for a delete; otherwise the complete resulting file contents.
+    content: str | None
+
+
+def _plan_one(
+    edit: FileEdit,
+    *,
+    root: Path,
+    policy: ScopePolicy,
+    staged: dict[str, str],
+    result_max_bytes: int | None,
+) -> _Outcome:
     def refuse(reason: str, kind: ScopeFindingKind | None = None) -> _Outcome:
         logger.warning(
             "edit_refused",
@@ -187,30 +343,102 @@ def _apply_one(edit: FileEdit, *, root: Path, policy: ScopePolicy) -> _Outcome:
         return refuse(containment)
 
     if edit.operation is EditOperation.DELETE:
-        if not target.is_file():
+        if edit.path not in staged and not target.is_file():
             return refuse("the file does not exist, so there is nothing to delete")
-        target.unlink()
-        return _Outcome()
-
-    if edit.operation is EditOperation.UPDATE and not target.is_file():
-        return refuse(
-            "the file does not exist; an update must name a file that is already "
-            "in the repository, and a new file needs operation 'create'"
-        )
+        staged.pop(edit.path, None)
+        return _Outcome(planned=_Planned(edit=edit, target=target, content=None))
 
     warning: str | None = None
-    if edit.operation is EditOperation.CREATE and target.is_file():
-        # Not a refusal: the path is inside the allowance either way, and a
-        # coder calling an overwrite a "create" is a labelling slip, not an
-        # attempt to reach somewhere it should not be.
-        warning = f"{edit.path} was created over an existing file"
+    if edit.operation is EditOperation.REPLACE:
+        content, reason = _resolve_targeted(
+            edit, target=target, staged=staged, result_max_bytes=result_max_bytes
+        )
+        if reason is not None:
+            return refuse(reason)
+        staged[edit.path] = content
+    else:
+        existing = edit.path in staged or target.is_file()
+        if edit.operation is EditOperation.UPDATE and not existing:
+            return refuse(
+                "the file does not exist; an update must name a file that is already "
+                "in the repository, and a new file needs operation 'create'"
+            )
+        if edit.operation is EditOperation.CREATE and existing:
+            # Not a refusal: the path is inside the allowance either way, and a
+            # coder calling an overwrite a "create" is a labelling slip, not an
+            # attempt to reach somewhere it should not be.
+            warning = f"{edit.path} was created over an existing file"
+        content = edit.content or ""
+        staged[edit.path] = content
 
-    target.parent.mkdir(parents=True, exist_ok=True)
+    return _Outcome(warning=warning, planned=_Planned(edit=edit, target=target, content=content))
+
+
+def _resolve_targeted(
+    edit: FileEdit, *, target: Path, staged: dict[str, str], result_max_bytes: int | None
+) -> tuple[str, str | None]:
+    """``(resulting content, refusal reason)`` for one targeted edit.
+
+    Exactly one match or nothing (concern 70). Zero means the model's copy of
+    the file is not the file in the tree, and multiple means there is no
+    defensible choice between them -- picking the first would make the outcome
+    depend on an unrelated copy of the same text elsewhere, which is how a
+    targeted edit becomes a patch with all the failure modes a patch has. Both
+    are refusals, and no fuzzy matching is offered as a way out: a near match
+    applied where the model did not mean is a silent corruption, while a near
+    match refused is one line of feedback the next attempt can act on.
+
+    A tuple rather than a bare string, and a reason that may be ``None``, so
+    that a replacement which legitimately empties a file is a result rather
+    than a failure. When the reason is set the content is ``""`` and is not
+    written.
+    """
+    if edit.old_text is None or edit.new_text is None:
+        return "", "a replace needs both 'oldText' and 'newText' and neither was supplied"
+
+    if edit.path in staged:
+        base = staged[edit.path]
+    elif target.is_file():
+        base = target.read_text(encoding="utf-8")
+    else:
+        return "", (
+            "the file does not exist, so there is no text in it to replace; "
+            "a new file needs operation 'create'"
+        )
+
+    occurrences = base.count(edit.old_text)
+    if occurrences == 0:
+        return "", (
+            f"'oldText' does not occur in {edit.path}. Copy it from the file's "
+            f"current contents exactly, including indentation and line endings."
+        )
+    if occurrences > 1:
+        return "", (
+            f"'oldText' occurs {occurrences} times in {edit.path}. Widen it with "
+            f"surrounding context so it matches exactly one place, or split this "
+            f"into one edit per place."
+        )
+
+    result = base.replace(edit.old_text, edit.new_text, 1)
+    if result_max_bytes is not None:
+        result_bytes = len(result.encode())
+        if result_bytes > result_max_bytes:
+            return "", (
+                f"the replacement would make {edit.path} {result_bytes} bytes, "
+                f"over the {result_max_bytes}-byte limit for one file"
+            )
+    return result, None
+
+
+def _write(item: _Planned) -> None:
+    if item.content is None:
+        item.target.unlink()
+        return
+    item.target.parent.mkdir(parents=True, exist_ok=True)
     # newline="" would pass "\r\n" through from a model that emitted Windows
     # line endings; writing text normally keeps the file in the repository's
     # own convention and keeps the diff readable.
-    target.write_text(edit.content or "", encoding="utf-8")
-    return _Outcome(warning=warning)
+    item.target.write_text(item.content, encoding="utf-8")
 
 
 def _containment_problem(target: Path, root: Path) -> str | None:

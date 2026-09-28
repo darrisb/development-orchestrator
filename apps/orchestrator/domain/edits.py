@@ -10,12 +10,34 @@ execute its own edits would own that decision by default.
 model fails often and fails silently-ish: a wrong hunk header or a
 miscounted line applies cleanly in the wrong place or not at all, and the
 model is then debugging a patch format instead of the task. Whole-file content
-either parses or does not, costs output tokens in proportion to the files the
-task declared, and makes the resulting Git diff -- which is what the verifier
-and the reviewer read -- a consequence of the file state rather than of the
-model's arithmetic. The cost is real: a small change to a large file rewrites
-the whole file, which is why ``MAX_EDIT_BYTES`` exists and why a task that
-declares its files gets a much cheaper attempt than one that does not.
+either parses or does not, and makes the resulting Git diff -- which is what
+the verifier and the reviewer read -- a consequence of the file state rather
+than of the model's arithmetic.
+
+**And why targeted replacement was added anyway (concern 70).** Whole-file
+content costs output tokens in proportion to the *baseline* being edited, not
+to the change: a seven-line edit to an 11KB file must return 11KB of unchanged
+source. That makes the model's output allowance a function of how large the
+repository's files happen to be, and it puts a coder that preserves the file
+correctly and a coder that silently deletes existing content in the same
+place. RUN-000007 showed both failure modes in two consecutive attempts, from
+the run's own records: attempt 1 returned a faithful 15,106-byte replacement
+and was refused at 340 bytes over its 14,766-byte allowance, and attempt 2 --
+told only "return the complete new contents ... within the size limits" -- fit
+by removing all 39 of the file's existing tests, producing a 413-line diff
+against a 150-line limit. Both refusals were correct. The representation was
+wrong, and the feedback it produced taught the model the one move that made
+things worse.
+
+So a fourth operation, ``replace``: ``oldText`` must occur exactly once in the
+file as it currently stands and is spliced out, ``newText`` is spliced in. No
+fuzzy matching, no line numbers, no hunk headers -- the properties that make a
+patch untrustworthy do not exist here. The model pays for the region it is
+changing rather than the file around it, and content it does not mention
+cannot be deleted by omission, because omission is now a *refusal* rather than
+a silent truncation. Every downstream guard is unchanged and still measures the
+resulting file: the resulting content, the diff, the scope policy, the
+reviewer.
 
 Pure: parsing and validation only. Writing files is ``services.code_edits``.
 """
@@ -31,13 +53,27 @@ from .scope import is_within_repository
 from .tokens import characters_for_tokens
 
 #: Bumped when the edit contract changes (section 34 attribution).
-EDIT_SCHEMA_VERSION = "code-edits/2"
+EDIT_SCHEMA_VERSION = "code-edits/3"
 
 #: Ceiling on one file's new content when nothing derives one. A model that
 #: returns a megabyte for one file has either pasted the wrong thing or is
 #: generating, not editing. Callers that know the context budget should derive
 #: the ceiling from it with ``max_edit_bytes_for_context`` instead.
 MAX_EDIT_BYTES = 8_000
+
+#: Ceiling on what a single ``replace`` edit may put on the wire: the matched
+#: ``oldText`` plus the ``newText`` replacing it (concern 70).
+#:
+#: This is the *emission* allowance, and it is deliberately flat rather than
+#: derived from the source file's size. The whole-file allowance has to scale
+#: with the file because the model must return the file; a targeted edit's cost
+#: is the region being changed, and deriving its ceiling from the size of the
+#: baseline would reintroduce exactly the pressure this operation exists to
+#: remove -- a 300KB file's two-line fix would be handed a 375KB budget, and a
+#: 400-byte file's two-line fix a 8KB one, for the same work. It is still
+#: bounded, and the resulting file is bounded separately (see
+#: ``services.code_edits``): the *emission* here, the *result* there.
+MAX_TARGETED_EDIT_PAYLOAD_BYTES = 8_000
 
 #: How much larger a rewritten file may be than the version the context budget
 #: was able to show (concern 11). Some headroom is necessary -- adding a guard
@@ -102,16 +138,28 @@ class EditOperation(StrEnum):
     CREATE = "create"
     UPDATE = "update"
     DELETE = "delete"
+    REPLACE = "replace"
 
     @property
     def needs_content(self) -> bool:
-        return self is not EditOperation.DELETE
+        """Whether this operation carries a whole file in ``content``.
+
+        A ``replace`` does not: its payload is ``old_text``/``new_text``, and a
+        whole file beside them would be a second, competing description of the
+        same file.
+        """
+        return self not in (EditOperation.DELETE, EditOperation.REPLACE)
+
+    @property
+    def is_targeted(self) -> bool:
+        """Whether this operation edits a region rather than the whole file."""
+        return self is EditOperation.REPLACE
 
 
 #: The JSON schema sent to the endpoint. ``content`` is required at the object
-#: level even for a delete, where it is the empty string: local endpoints with
-#: constrained decoding handle a uniformly shaped object far more reliably
-#: than a conditionally shaped one.
+#: level even for an operation that does not use it, where it is the empty
+#: string: local endpoints with constrained decoding handle a uniformly shaped
+#: object far more reliably than a conditionally shaped one.
 EDIT_SCHEMA: dict[str, object] = {
     "type": "object",
     "additionalProperties": False,
@@ -128,6 +176,11 @@ EDIT_SCHEMA: dict[str, object] = {
                     "path": {"type": "string"},
                     "operation": {"type": "string", "enum": [op.value for op in EditOperation]},
                     "content": {"type": "string"},
+                    # Only meaningful for operation "replace", and required
+                    # there. Absent on every other operation, where their
+                    # presence is a parse rejection rather than a hint.
+                    "oldText": {"type": "string"},
+                    "newText": {"type": "string"},
                 },
             },
         },
@@ -145,14 +198,36 @@ class MalformedChangeSet(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class FileEdit:
-    """One file the coder wants written, created or removed."""
+    """One file the coder wants written, created, removed or spliced.
+
+    ``content`` is the whole file for a create or an update. ``old_text`` and
+    ``new_text`` are the matched region and its replacement for a targeted
+    edit, and the two are never populated together: a response carrying both
+    is describing one file twice and is rejected rather than reconciled.
+    """
 
     path: str
     operation: EditOperation
     content: str | None = None
+    old_text: str | None = None
+    new_text: str | None = None
+
+    @property
+    def is_targeted(self) -> bool:
+        return self.operation.is_targeted
 
     @property
     def size_bytes(self) -> int:
+        """What this edit put on the wire (concern 70).
+
+        For a whole-file edit that is the file itself, which is what the
+        per-path output allowance has always measured. For a targeted edit it
+        is the region that was matched plus the region that replaced it --
+        which is the whole point of the operation, since the unchanged rest of
+        the file costs the model nothing and must not be charged to it.
+        """
+        if self.is_targeted:
+            return len((self.old_text or "").encode()) + len((self.new_text or "").encode())
         return len(self.content.encode()) if self.content else 0
 
     def describe(self) -> dict[str, object]:
@@ -262,7 +337,11 @@ class CodeChangeSet:
                 rejected.append(rejection)
             if edit is None:
                 continue
-            if edit.path in seen:
+            # Several targeted edits to one path compose in the order given --
+            # adding a function then a test to the same file is the normal way
+            # to write one, and there is no safe reading of a create and an
+            # update of the same file, so those still keep the first.
+            if edit.path in seen and not edit.is_targeted:
                 warnings.append(
                     f"edit {index}: {edit.path} is edited more than once; "
                     f"only the first edit was kept"
@@ -369,6 +448,61 @@ def _parse_edit(
 
     raw_content = entry.get("content")
     content = raw_content if isinstance(raw_content, str) else None
+    has_old = "oldText" in entry
+    has_new = "newText" in entry
+
+    if operation.is_targeted:
+        rejection = _reject_targeted_shapes(entry, index, path, operation, content)
+        if rejection is not None:
+            return None, None, rejection
+        old_text = str(entry["oldText"])
+        new_text = str(entry["newText"])
+        if not old_text:
+            return None, None, RejectedParseEdit(
+                path=path,
+                operation=operation.value,
+                reason=(
+                    f"edit {index} ({path}): a replace needs 'oldText', the exact "
+                    f"text to find in the file, and it may not be empty"
+                ),
+            )
+        payload_bytes = len(old_text.encode()) + len(new_text.encode())
+        if payload_bytes > MAX_TARGETED_EDIT_PAYLOAD_BYTES:
+            return None, None, RejectedParseEdit(
+                path=path,
+                operation=operation.value,
+                reason=(
+                    f"edit {index} ({path}): 'oldText' plus 'newText' is "
+                    f"{payload_bytes} bytes, over the "
+                    f"{MAX_TARGETED_EDIT_PAYLOAD_BYTES}-byte limit for one "
+                    f"targeted edit. Return the file's complete contents instead."
+                ),
+            )
+        return (
+            FileEdit(
+                path=path,
+                operation=operation,
+                content=None,
+                old_text=old_text,
+                new_text=new_text,
+            ),
+            None,
+            None,
+        )
+
+    if has_old or has_new:
+        named = " and ".join(
+            part for part, present in (("'oldText'", has_old), ("'newText'", has_new)) if present
+        )
+        return None, None, RejectedParseEdit(
+            path=path,
+            operation=operation.value,
+            reason=(
+                f"edit {index} ({path}): {named} belong to operation 'replace'; "
+                f"a {operation.value} is written from 'content'"
+            ),
+        )
+
     if operation.needs_content:
         if content is None:
             return None, None, RejectedParseEdit(
@@ -397,6 +531,56 @@ def _parse_edit(
     return FileEdit(path=path, operation=operation, content=None), warning, None
 
 
+def _reject_targeted_shapes(
+    entry: Mapping[str, object],
+    index: int,
+    path: str,
+    operation: EditOperation,
+    content: str | None,
+) -> RejectedParseEdit | None:
+    """A ``replace`` whose two halves are not one unambiguous instruction.
+
+    Two things are refused rather than reconciled, because either has more
+    than one plausible reading and the orchestrator has no basis for choosing:
+    a ``replace`` that also carries a whole file in ``content`` (two complete
+    descriptions of one file, and applying the wrong one rewrites the file the
+    model was not trying to change), and a ``replace`` missing or mistyping one
+    of its two halves (which leaves an edit whose intent cannot be
+    reconstructed).
+    """
+    if "oldText" not in entry or "newText" not in entry:
+        missing = " and ".join(
+            part for part in ("'oldText'", "'newText'") if part[1:-1] not in entry
+        )
+        return RejectedParseEdit(
+            path=path,
+            operation=operation.value,
+            reason=(
+                f"edit {index} ({path}): a replace needs both 'oldText' (the "
+                f"exact text to find, which may not be empty) and 'newText' (the "
+                f"text that replaces it; use '' to remove the matched text). "
+                f"Missing: {missing}."
+            ),
+        )
+    if not isinstance(entry["oldText"], str) or not isinstance(entry["newText"], str):
+        return RejectedParseEdit(
+            path=path,
+            operation=operation.value,
+            reason=f"edit {index} ({path}): 'oldText' and 'newText' must both be strings",
+        )
+    if content:
+        return RejectedParseEdit(
+            path=path,
+            operation=operation.value,
+            reason=(
+                f"edit {index} ({path}): a replace describes only the region it "
+                f"changes, so 'content' must be '' -- complete contents belong "
+                f"to a create or an update"
+            ),
+        )
+    return None
+
+
 def _strings(value: object) -> tuple[str, ...]:
     if isinstance(value, str):
         return (value.strip(),) if value.strip() else ()
@@ -410,6 +594,7 @@ __all__ = [
     "EDIT_SCHEMA_VERSION",
     "EDIT_SIZE_HEADROOM",
     "MAX_EDIT_BYTES",
+    "MAX_TARGETED_EDIT_PAYLOAD_BYTES",
     "CodeChangeSet",
     "EditOperation",
     "FileEdit",

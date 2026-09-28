@@ -42,6 +42,7 @@ from ..domain.edits import (
     EDIT_SCHEMA,
     EDIT_SCHEMA_VERSION,
     CodeChangeSet,
+    EditOperation,
     MalformedChangeSet,
     max_edit_bytes_for_context,
     per_path_edit_allowance,
@@ -337,8 +338,11 @@ async def run_coding_attempt(
             FailureReason.INVALID_MODEL_RESPONSE,
             feedback=(
                 f"Your previous answer could not be applied: {error}. Return one JSON "
-                f"object with an 'edits' array, and the complete new contents of every "
-                f"file you change."
+                f"object with an 'edits' array. For a small change to an existing file "
+                f"use operation 'replace' with 'oldText' copied exactly from the file "
+                f"and the 'newText' that replaces it; otherwise return the complete new "
+                f"contents of every file you change. An omitted test is a deleted test: "
+                f"keep the content the task did not ask you to remove."
             ),
             plan=plan,
             assessment=assessment,
@@ -364,8 +368,12 @@ async def run_coding_attempt(
             FailureReason.INVALID_MODEL_RESPONSE,
             feedback=(
                 "Your previous answer contained edits that could not be applied: "
-                f"{detail}. Return the complete new contents of every file you "
-                "change, within the size limits."
+                f"{detail}. For a small change to an existing file, use operation "
+                "'replace' with 'oldText' copied exactly from the file's current "
+                "contents and the 'newText' that replaces it, and leave 'content' as "
+                "an empty string. Otherwise return the complete new contents of every "
+                "file you change, within the size limits. Keep all the content the "
+                "task did not ask you to change: an omitted test is a deleted test."
             ),
             plan=plan,
             assessment=assessment,
@@ -374,7 +382,18 @@ async def run_coding_attempt(
             sink=sink,
         )
 
-    application = apply_change_set(change_set, root=workspace.path, policy=policy)
+    # Concern 70: the resulting size of a targeted edit is bounded by the
+    # largest file the context builder will read into a prompt at all. It is
+    # deliberately not the per-path output allowance above, which measures what
+    # the model *sent*; a faithful targeted edit sends only its region and
+    # still has to be allowed to leave a legitimately larger file behind. The
+    # resulting diff is bounded separately, by the scope guard.
+    application = apply_change_set(
+        change_set,
+        root=workspace.path,
+        policy=policy,
+        result_max_bytes=config.context_max_file_bytes,
+    )
     diff = capture_diff(workspace, max_bytes=MAX_DIFF_ARTIFACT_BYTES)
     scope = evaluate_scope(diff.summary, policy)
     report = build_completion_report(
@@ -659,10 +678,31 @@ def _judge(
         rejected = "; ".join(
             f"{edit.path}: {edit.reason}" for edit in application.rejected
         )
+        # Read from the refusals rather than from ``application.targeted``, which
+        # only lists what was actually written: the feedback that matters here is
+        # the one for a targeted edit that did not apply, and that edit is in
+        # ``rejected`` precisely because nothing was written.
+        asked_for_targeted = any(
+            edit.operation == EditOperation.REPLACE.value for edit in application.rejected
+        )
+        lead = (
+            "None of your edits could be applied, so nothing was written"
+            if application.refused_whole
+            else "None of your edits could be applied"
+        )
         return FailureReason.INVALID_MODEL_RESPONSE, (
-            "None of your edits could be applied"
+            f"{lead}"
             + (f": {rejected}." if rejected else ".")
             + " Name files that exist for 'update' and use 'create' for new ones."
+            + (
+                " For a small change to a file that already exists, prefer operation "
+                "'replace' with 'oldText' copied exactly from the file's current "
+                "contents -- it must occur exactly once -- and the 'newText' that "
+                "replaces it, with 'content' left as an empty string. That way the "
+                "rest of the file, including its existing tests, is preserved exactly."
+                if asked_for_targeted
+                else ""
+            )
         )
     if scope.decision is ScopePolicyDecision.BLOCK:
         return FailureReason.SCOPE_VIOLATION, (
