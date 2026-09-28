@@ -2003,3 +2003,117 @@ def test_the_postgres_recovery_reconstructs_to_attempt_two(
     assert report.next_attempt == 2
     assert report.attempts_started == 1
     assert report.max_attempts == 3
+
+
+# =============================================================================
+# 10. The artifact directory is evidence too, and it changes the answer.
+# =============================================================================
+#
+# Discovered by running the read-only eligibility endpoint against the real
+# RUN-20260928-000005 after deployment. The durable *rows* say attempt 1 was
+# the last one begun, and the fixture above reproduces exactly those rows. The
+# live run also has ``runs/RUN-20260928-000005/attempt-2-cycle-1/`` on disk,
+# holding the rendered prompt -- written before the provider was called, which
+# is the whole reason it is written there. So attempt 2 was begun: the model
+# was asked, the call cost provider time, and the only thing that did not
+# survive was its ``model_runs`` row.
+#
+# ``loop_recovery`` already says what to do about that, and these tests pin it:
+# an attempt is charged when a model is *asked*, and the directory is the
+# record that survives a rollback. Re-running as attempt 2 would overwrite the
+# evidence of the call that was made, which is precisely what a resume must not
+# do. The next durable coder execution is therefore attempt 3.
+
+
+def _begin_attempt_directory(signature: Signature, attempt: int, cycle: int) -> Path:
+    """The directory a turn writes before it calls a model."""
+    with signature.factory() as session:
+        run = signature.run(session)
+    root = artifact_store.run_directory(
+        run.external_run_id, settings=signature.settings
+    )
+    directory = root / f"attempt-{attempt}-cycle-{cycle}"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "prompt.txt").write_text("the prompt that was sent", "utf-8")
+    return directory
+
+
+def test_a_begun_attempt_with_no_row_is_still_charged(signature: Signature):
+    """The live RUN-20260928-000005 reading, reproduced.
+
+    Same rows as every test above; one more piece of durable evidence. The
+    answer moves from 2 to 3, and that is the correct answer rather than a
+    regression: a provider call that happened is a provider call that happened,
+    and the number it used is not handed back because the transaction that
+    would have recorded it died.
+    """
+    _begin_attempt_directory(signature, 2, 1)
+
+    with signature.factory() as session:
+        report = assess_recoverability(
+            session, signature.run_id, settings=signature.settings
+        )
+
+    assert report.next_attempt == 3
+    assert report.attempts_started == 2
+    assert report.reviews_completed == 0
+    assert report.max_attempts == 3
+    # Still recoverable: attempt 3 of at most 3 is the last one, not one too
+    # many, and recovery does not refuse work a task is still entitled to.
+    assert report.recoverable is True
+
+
+def test_the_last_attempt_is_recoverable_and_the_one_after_is_not(
+    signature: Signature,
+):
+    """The boundary, from both sides, with nothing else changed."""
+    _begin_attempt_directory(signature, 2, 1)
+    with signature.factory() as session:
+        last = assess_recoverability(
+            session, signature.run_id, settings=signature.settings
+        )
+    assert (last.next_attempt, last.recoverable) == (3, True)
+
+    _begin_attempt_directory(signature, 3, 1)
+    with signature.factory() as session:
+        spent = assess_recoverability(
+            session, signature.run_id, settings=signature.settings
+        )
+    assert spent.next_attempt == 4
+    assert spent.recoverable is False
+    assert {check.name for check in spent.refusals} == {
+        "attempt_accounting_reconstructable"
+    }
+
+
+def test_a_recovered_run_does_not_overwrite_a_begun_attempt_directory(
+    signature: Signature,
+):
+    """The consequence the accounting rule exists for.
+
+    If the reconstruction handed attempt 2 back, the next turn's artifacts
+    would land in a directory that already holds the prompt of the call that
+    was actually made -- destroying the only surviving evidence of why the run
+    stranded.
+    """
+    directory = _begin_attempt_directory(signature, 2, 1)
+    contents = (directory / "prompt.txt").read_text("utf-8")
+
+    with signature.factory.begin() as session:
+        authorization = recover_run(
+            session,
+            signature.run_id,
+            reason="stranded after the attempt-2 provider call",
+            settings=signature.settings,
+        )
+
+    assert authorization.next_attempt == 3
+    assert (directory / "prompt.txt").read_text("utf-8") == contents
+    with signature.factory() as session:
+        events = [
+            e
+            for e in RunEventRepository(session).list_for_run(signature.run_id)
+            if e.event_type == RunEventType.RUN_RECOVERY_AUTHORIZED
+        ]
+    assert events[0].payload["next_attempt"] == 3
+    assert events[0].payload["attempts_started"] == 2

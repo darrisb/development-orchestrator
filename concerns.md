@@ -3042,19 +3042,39 @@ different run -- so exposing it is necessary for safe operator run addressing
 rather than unrelated API work. It is an additive read-only field on the
 existing `TaskRunResponse`, with tests; the route stays unambiguous.
 
-**RUN-000005 reconstruction semantics.** An attempt is charged when a model is
-asked, because that left a recorded call and a directory; a review cycle is
-charged when a reviewer answers. Attempt 1 left a `CODE` `model_runs` row and a
-`CODING_STARTED` event, so it is spent and stays historical. The attempt-2
-provider call died with the transaction that would have recorded it, so it left
-neither and is not spent -- counting it would be inferring an event from the
-absence of evidence, and would burn a third of the task's budget on the
-inference. `loop_recovery.recover_loop_state` therefore yields
-`next_attempt = 2`, `attempts_started = 1`, `reviews_completed = 0`, against
-`max_attempts = 3`. The run keeps the same database id, the same `run_number`
-(2) and the same external `RUN-...` identity.
+**RUN-000005 reconstruction semantics, and a correction to the expected
+answer.** An attempt is charged when a model is *asked*; a review cycle is
+charged when a reviewer *answers*. Attempt 1 left a `CODE` `model_runs` row and
+a `CODING_STARTED` event, so it is spent and stays historical.
 
-**Tests.** `tests/integration/test_concern67.py`, 62 tests. The fixture rebuilds
+The attempt-2 call was expected to be uncharged, because it left no
+`model_runs` row -- the transaction that would have written one was killed by
+PostgreSQL. Read-only inspection of the deployed system against the real run
+shows that expectation was wrong, and wrong for a good reason. A turn writes
+its first artifact *before* it calls a model, exactly so that a turn unwound
+before it could write a row still leaves a record; `loop_recovery` reads those
+directories for precisely this case. `runs/RUN-20260928-000005/attempt-2-cycle-1/`
+exists on disk with its rendered `prompt.txt`. The model *was* asked, the call
+cost 600 seconds of provider time, and only its row was lost.
+
+So the correct reconstruction is `next_attempt = 3`, `attempts_started = 2`,
+`reviews_completed = 0`, against `max_attempts = 3` -- confirmed by
+`GET /runs/9760dfeb-3112-4b4f-b67f-5ae4daa7b2b1/recoverability` on the deployed
+Concern 67 build. Attempt 3 is the last one the task is entitled to, so the run
+is still recoverable. "Not double-counted" and "not counted" are different
+claims: the call is counted once, by the evidence that survived, and re-running
+it as attempt 2 would overwrite the only record of why the run stranded --
+which is the specific thing `loop_recovery` exists to prevent.
+
+Both readings are pinned by tests. The synthetic signature reproducing the
+durable *rows* alone yields attempt 2; adding the attempt-2 artifact directory
+-- the live shape -- yields attempt 3, refuses at attempt 4, and is shown not
+to overwrite the begun directory.
+
+The run keeps the same database id, the same `run_number` (2) and the same
+external `RUN-...` identity throughout.
+
+**Tests.** `tests/integration/test_concern67.py`, 65 tests. The fixture rebuilds
 the exact `RUN-20260928-000005` durable signature -- opened by `create_run`,
 walked through the real state machine, with the attempt-1 call, the three
 events, a checkpoint row, a real repository with `agent/integration`, and the
@@ -3103,10 +3123,10 @@ apply.
 | D -- reconstruction returns `run.attempt_number`, repeating historical attempt 1 | RED -- 5 tests, including the SQLite, subprocess, HTTP and PostgreSQL reconstructions: `next_attempt` observed as 1 |
 | E -- the terminal/abandoned recoverability guards always pass | RED -- 5 tests. Note the defence in depth this exposes: `acquire_execution` still refuses a terminal run, so the request is still a 409, but the *policy* layer no longer names the real reason and an abandoned run is no longer reported as abandoned -- which is exactly what the tests catch |
 
-**Regression validation.** Full SQLite suite: 1395 passed in 91.77s.
-Randomized order (`pytest-randomly`, seed 12345): 1395 passed in 91.59s. Full
-PostgreSQL 16 suite (`postgresql+psycopg://.../test_orchestrator`): 1395 passed
-in 104.60s. Concern 67 targeted: 62 passed in 9.45s. Concern 64/65/66
+**Regression validation.** Full SQLite suite: 1399 passed in 97.34s.
+Randomized order (`pytest-randomly`, seed 12345): 1399 passed in 96.38s. Full
+PostgreSQL 16 suite (`postgresql+psycopg://.../test_orchestrator`): 1399 passed
+in 110.42s. Concern 67 targeted: 65 passed in 10.59s. Concern 64/65/66
 regression (`test_concern64.py`, `test_concern65.py`,
 `test_fix_loop_resume.py`, `test_db_session_cleanup.py`): 128 passed in 22.44s.
 Phase M: 1 passed in 3.66s. Migrations: 10 passed in 0.82s. `ruff check .`
