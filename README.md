@@ -1072,6 +1072,16 @@ the cumulative task-run runtime budget. Runtime-budget exhaustion is reported
 as `RUNTIME_EXHAUSTED`; `RETRY_EXHAUSTED` remains reserved for attempt/review
 limits, and `MODEL_TIMEOUT` remains a provider-call failure.
 
+Provider timeout and database idle-transaction timeout are intentionally not
+ordered. Before calling either the coder or reviewer, the workflow durably
+checkpoints its prompt and counters and releases the transaction. After the
+call it starts a new transaction, locks and revalidates the run as in-flight,
+then records the answer or classified failure. Consequently a 600-second model
+timeout is safe with a 300-second `DB_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS`:
+there is no idle database transaction spanning those 600 seconds. Increasing
+the database timeout is not a repair for a provider call that crosses a
+transaction boundary.
+
 ## Tests
 
 ```bash

@@ -1292,21 +1292,11 @@ def test_a_late_worker_cannot_resurrect_an_abandoned_run(
     writing down, because it is a property of the orchestrator and not of the
     test.
 
-    **The operator's write waits, and that is the design.** A loop turn is one
-    transaction (concern 36), and it has already written the run row by the time
-    the coder is called -- the run's external id and artifact path are recorded
-    first. PostgreSQL therefore holds that row for the duration of the call, and
-    the operator's ``UPDATE`` blocks behind it. The test asserts the block
-    rather than routing around it: an operator's request is not a signal the
-    worker can be interrupted with, and pretending otherwise would be asserting
-    a concurrency the system does not have.
-
-    So the interleaving the database actually allows is: the call returns, the
-    turn commits, and *then* the operator's write lands. From that point on the
-    workflow is genuinely late -- it holds a session whose copy of the task is
-    older than the operator's decision, and it carries on regardless. The
-    guards have to stop it there, and they are what the assertions below are
-    about.
+    Concern 66 commits the pre-call checkpoint before entering the provider.
+    The operator therefore does not wait behind an idle workflow transaction:
+    abandonment commits while the call is still in flight.  When the late
+    answer returns, the fresh locking fence must observe that decision and
+    refuse every post-call write.
 
     **Why PostgreSQL.** SQLite cannot express any of this: it serializes
     writers, so a second transaction's write fails with ``database is locked``
@@ -1358,10 +1348,19 @@ def _drive_the_race(
 
     # 1-2. Execution genuinely began, and is now stalled with the call open.
     assert entered.wait(timeout=60), "the workflow never reached the model call"
+    with engine.connect() as observer:
+        states = list(
+            observer.scalars(
+                text(
+                    "SELECT state FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+                )
+            )
+        )
+    assert "idle in transaction" not in states, states
 
-    # 3. The operator abandons from a different session and a different
-    #    transaction, while that call is still open. It is expected to block:
-    #    the turn holds the run row for the length of the call.
+    # 3. The operator abandons from a different session and transaction while
+    #    that call is still open. Concern 66 requires this to complete promptly.
     operator = sessionmaker(bind=engine, expire_on_commit=False)
     operator_done = threading.Event()
 
@@ -1384,22 +1383,15 @@ def _drive_the_race(
     requester = threading.Thread(target=operate, name="operator", daemon=True)
     requester.start()
 
-    # The request is waiting on the workflow, not racing past it. Asserted, not
-    # assumed: a test that let the abandon through while the turn was open would
-    # be testing an interleaving the database does not permit.
-    assert not operator_done.wait(timeout=5), (
-        "the operator's write went through while the loop turn held the run row"
+    assert operator_done.wait(timeout=5), (
+        "the model call held a database transaction open and blocked abandonment"
     )
-    with operator() as reader:
-        assert TaskRunRepository(reader).get(run_id).status is RunStatus.RUNNING
-
-    # 4-6. The blocked call is released, the late answer returns, the turn
-    #      commits, and the operator's waiting write lands on top of it.
-    release.set()
-    assert operator_done.wait(timeout=120), "the operator's abandon never completed"
     assert abandon_failures == [], f"the abandon raised: {abandon_failures[0]!r}"
     with operator() as reader:
         assert TaskRunRepository(reader).get(run_id).status is RunStatus.ABANDONED
+
+    # 4-6. The call is released and its late answer reaches the post-call fence.
+    release.set()
 
     # 7. The workflow carries on from its stale copy of the task and tries to
     #    make the turn durable. It is refused, and which guard refuses depends on
@@ -1445,16 +1437,10 @@ def _drive_the_race(
     assert RunEventType.INTEGRATION_ADVANCED not in types
     assert RunEventType.TASK_COMPLETED not in types
 
-    # The late model call is still on the record. The durable guard stops the
-    # outcome from changing; it does not make the attempt not have happened, and
-    # a table holding only the calls that mattered would not be an audit trail.
-    #
-    # The coder's call is the one that matters here, and it survives because it
-    # was committed by its own checkpoint -- which is the whole reason a model
-    # call is checkpointed as it is made rather than at the end of the turn.
-    assert [m for m in model_runs if m.purpose == ModelPurpose.CODE], (
-        "the in-flight coder call was not preserved as evidence"
-    )
+    # The late answer is not persisted as an accepted model result. Its prompt
+    # artifact was checkpointed before the call, which is sufficient for
+    # recovery accounting without writing through the abandonment fence.
+    assert not [m for m in model_runs if m.purpose == ModelPurpose.CODE]
     # What the guard rolled back is everything the turn claimed afterwards. The
     # turn's own event for finishing the coding attempt is not on the record,
     # because the attempt was not finished: the run was abandoned while the

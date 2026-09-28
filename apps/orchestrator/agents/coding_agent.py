@@ -767,10 +767,20 @@ async def _generate_recorded(
     reconstruction reads this row to know an attempt was really made.
     """
     sink.text(prompt_artifact, _render_prompt(request))
+    # Concern 66: no database transaction may remain open across a model-provider
+    # call. Commit the pre-call work now so the transaction is closed while we
+    # wait for the external operation.
+    if checkpoint_call is not None:
+        checkpoint_call()
+    else:
+        session.commit()
     started = monotonic()
     try:
         response = await provider.generate(request)
     except Exception as error:
+        # Re-open a fresh transaction for post-failure persistence. The run may
+        # have been abandoned or finished while we were waiting, so fence first.
+        TaskRunRepository(session).require_in_flight(task_run_id)
         record_model_call(
             session,
             task_run_id=task_run_id,
@@ -786,7 +796,13 @@ async def _generate_recorded(
         )
         if checkpoint_call is not None:
             checkpoint_call()
+        else:
+            session.commit()
         raise
+    # Concern 66: after a possibly slow external call, revalidate ownership
+    # before committing model results. A late answer must not resurrect an
+    # abandoned or terminal run.
+    TaskRunRepository(session).require_in_flight(task_run_id)
     sink.text(response_artifact, response.raw_text)
     record_response(
         session,
@@ -802,6 +818,8 @@ async def _generate_recorded(
     )
     if checkpoint_call is not None:
         checkpoint_call()
+    else:
+        session.commit()
     return response
 
 

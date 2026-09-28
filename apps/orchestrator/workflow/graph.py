@@ -15,7 +15,9 @@ from langgraph.graph import END, START, StateGraph
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..agents.fix_loop import LoopOutcome, durable_checkpoint, run_fix_loop
+from ..config.logging import get_logger
 from ..config.settings import Settings, get_settings
+from ..db.session import rollback_preserving_original
 from ..domain.enums import EscalationStatus, ModelRole, RunStatus, TaskStatus
 from ..domain.escalation import EscalationIntent
 from ..domain.workflow import WorkflowOutcome, WorkflowPhase
@@ -37,6 +39,8 @@ from ..services.workspace import attach_workspace, load_run_context, prepare_wor
 from ..services.worktrees import release_for_run
 from .checkpoints import SqlAlchemyCheckpointSaver
 from .recovery import RecoveryDisposition, inspect_incomplete_runs
+
+logger = get_logger(__name__)
 
 
 class WorkflowState(TypedDict):
@@ -389,19 +393,31 @@ class WorkflowRunner:
                 "task_status": result.task_status.value,
                 "escalation_id": str(result.escalation.id) if result.escalation else "",
             }
-        except Exception:
-            session.rollback()
+        except Exception as original:
+            rollback_preserving_original(session, original)
+            # Runtime cleanup must not depend on the Session which handled the
+            # external call.  If PostgreSQL invalidated that connection, a new
+            # Session gives recovery metadata an independent transaction.
             try:
-                run, task, _ = load_run_context(session, UUID(state["run_id"]))
-                end_active_runtime(
-                    session,
-                    run.id,
-                    task.limits,
-                    worker_timeout_seconds=self.settings.worker_timeout_seconds,
-                )
-                session.commit()
+                with self.session_factory.begin() as recovery_session:
+                    run, task, _ = load_run_context(
+                        recovery_session, UUID(state["run_id"])
+                    )
+                    end_active_runtime(
+                        recovery_session,
+                        run.id,
+                        task.limits,
+                        worker_timeout_seconds=self.settings.worker_timeout_seconds,
+                    )
             except Exception:
-                session.rollback()
+                # Preserve the workflow failure.  Recovery accounting can be
+                # reconstructed from the active interval if this independent
+                # transaction also fails.
+                logger.exception(
+                    "workflow_runtime_cleanup_failed",
+                    run_id=state["run_id"],
+                    original_exception=type(original).__name__,
+                )
             raise
         finally:
             session.close()

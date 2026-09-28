@@ -457,10 +457,20 @@ async def _review_recorded(
     until its timeout is distinguishable from one that was refused instantly.
     """
     request = ReviewRequest(package=package, cycle=cycle)
+    # Concern 66: close the transaction before the external review call so a
+    # slow reviewer cannot hold a database transaction idle. The review prompt
+    # artifact is produced by the provider, so it is written after the call.
+    if checkpoint_call is not None:
+        checkpoint_call()
+    else:
+        session.commit()
     started = monotonic()
     try:
         call = await provider.review(request)
     except Exception as error:
+        # Fence before persisting the failure: abandonment during the call must
+        # not leave a record that resurrects a terminal run.
+        TaskRunRepository(session).require_in_flight(run.id)
         record_model_call(
             session,
             task_run_id=run.id,
@@ -475,7 +485,11 @@ async def _review_recorded(
         )
         if checkpoint_call is not None:
             checkpoint_call()
+        else:
+            session.commit()
         raise
+    # Concern 66: a late reviewer answer must not overwrite an abandoned run.
+    TaskRunRepository(session).require_in_flight(run.id)
     sink.text(REVIEW_PROMPT_ARTIFACT, call.prompt_text)
     sink.text(REVIEW_RESPONSE_ARTIFACT, call.raw_response)
     record_model_call(
@@ -494,6 +508,8 @@ async def _review_recorded(
     )
     if checkpoint_call is not None:
         checkpoint_call()
+    else:
+        session.commit()
     return call
 
 

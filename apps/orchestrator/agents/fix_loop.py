@@ -288,13 +288,11 @@ def durable_checkpoint(
 ) -> Callable[[], None]:
     """The turn-boundary checkpoint, guarded by the run row (concern 64).
 
-    A turn is made durable at two points: after every model call, so a provider
-    failure cannot roll away the record of the call that failed, and after every
-    turn. Both are places where the workflow is about to make its work
-    permanent, which is exactly where an operator's abandonment has to be able
-    to stop it -- the workflow holds one transaction open across a model call
-    and writes the task several times inside it, and a status read at the start
-    of the turn says nothing about what is true now.
+    A turn is made durable at three points: immediately before an external
+    model call, after that call is recorded, and after every turn.  The first
+    boundary is Concern 66's transaction-lifetime invariant; the latter two
+    keep the evidence durable.  Every durable boundary is also where an
+    operator's abandonment has to be able to stop the workflow.
 
     So the barrier runs immediately before the commit, inside the same
     transaction: ``TaskRunRepository.require_in_flight`` locks the run row and

@@ -2739,3 +2739,74 @@ manifest was re-imported, no model or context configuration was changed, and no
 direct database mutation was performed. Escalation
 `deb00534-4521-416b-ad0f-75e6d1266e3c` remains RESOLVED. `agent/integration`
 remains `a2e40f226146feb723658b5eae0c7dac3635cf7e`.
+
+## 66. A slow provider call outlived its database transaction -- **resolved**
+
+**Observed evidence.** In project `d98cb1e7-75e4-401a-8b21-d0965b0b3115`,
+TS-109 run `RUN-20260928-000005`
+(`9760dfeb-3112-4b4f-b67f-5ae4daa7b2b1`) failed deterministic verification on
+attempt 1 with `BUILD_FAILED` and correctly routed `SEND_TO_CODER`. Attempt 2
+entered its model request at `2026-09-28T11:07:34.541897Z`. The provider's
+600-second timeout exceeded PostgreSQL's 300-second
+`idle_in_transaction_session_timeout`; PostgreSQL terminated the idle
+transaction, the model later raised `ModelTimeout`, and rollback raised
+`psycopg.errors.IdleInTransactionSessionTimeout`. The durable run remained
+RUNNING, TS-109 remained VERIFYING, integration stayed at
+`fc6abc579cee88f821c5f72f00162872b2dc8326`, and TS-110 never started.
+
+**Root cause and invariant.** A fix-loop turn used one transaction across model
+inference. The database was therefore both a lock holder and an idle connection
+for an operation whose timeout was deliberately longer than the database's
+safety timeout. Cleanup then reused that dead Session and allowed rollback to
+replace the provider exception. The invariant is now structural: persist and
+commit everything needed for the request; perform every coder/reviewer call
+with no transaction open; begin a new transaction after it returns; lock and
+revalidate that the run is still in flight; only then persist the result or
+failure. Timeout alignment remains defense in depth, never the mechanism.
+
+**Implementation.** Both recorded provider boundaries checkpoint before
+awaiting the external call. The post-call transaction executes
+`TaskRunRepository.require_in_flight`, whose `SELECT ... FOR UPDATE` predicate
+refuses abandoned, superseded, or terminal runs before recording a response.
+The same sequence applies to failure records, so `ModelTimeout` remains the
+existing `MODEL_TIMEOUT -> RETRY` policy and is made durable without inventing
+a new outcome. The graph releases active-runtime accounting through a new
+Session after failure rather than relying on the Session that crossed the
+external wait. `session_scope` uses SQLAlchemy invalidation when rollback says
+the DBAPI connection is invalid; it preserves the original exception only for
+that classified condition and still propagates unrelated rollback errors.
+
+Concern 64's fencing is preserved but its concurrency is intentionally
+improved: an operator abandonment no longer waits behind inference. It commits
+while the provider is in flight, and the late answer loses at the post-call
+locking fence. Durable attempt accounting and reconstruction still derive from
+the pre-call prompt/checkpoint and the recorded failed call.
+
+**Regression coverage.** `tests/integration/test_fix_loop_resume.py` now
+asserts that neither coder nor reviewer sees an open transaction; simulates a
+provider wait longer than the configured idle limit without a long sleep;
+persists `ModelTimeout` with `MODEL_TIMEOUT -> RETRY`; invalidates the pre-call
+Session and proves post-call persistence gets a valid checkout; preserves
+attempt accounting and reconstruction; and reproduces `BUILD_FAILED ->
+SEND_TO_CODER -> slow attempt 2 -> ModelTimeout` with a durable resumable
+state. The real PostgreSQL race in `test_concern64.py` now requires operator
+abandonment to commit while the provider is blocked and requires the late
+answer to be fenced. `tests/unit/test_db_session_cleanup.py` proves an
+invalidated rollback cannot mask the original model failure and that an
+unrelated rollback error is not blindly suppressed. Existing restart/process
+tests continue to prove reconstruction from committed rows and artifacts.
+
+**Mutation evidence.** Three controlled source mutations were confirmed to
+apply, run, fail for the intended reason, and were reversed before validation:
+
+| mutation | result |
+| --- | --- |
+| remove the coder's pre-provider checkpoint, leaving its transaction open | RED -- `test_model_wait_has_no_open_database_transaction` observed `session.in_transaction() is True` inside the provider |
+| remove the successful-call `require_in_flight` validation | RED -- `test_a_late_model_answer_is_refused_before_it_is_recorded` found a committed SUCCEEDED model row after abandonment |
+| omit SQLAlchemy `Session.invalidate()` after an invalidated rollback | RED -- `test_invalidated_rollback_does_not_mask_the_model_failure` observed that the dead Session was not discarded |
+
+The restored-source discrimination run passed all five directly affected
+tests. No mutation result was counted from an edit that failed to apply.
+
+**Validation and deployment.** Recorded after the complete acceptance run and
+fresh deployment in this repair.

@@ -71,13 +71,17 @@ from apps.orchestrator.db.base import Base
 from apps.orchestrator.db.session import create_db_engine
 from apps.orchestrator.domain.enums import (
     Complexity,
+    FailureAction,
     FailureReason,
     ModelRole,
+    RunEventType,
     RunStatus,
     TaskStatus,
     VerificationStatus,
     WorkerProfile,
 )
+from apps.orchestrator.domain.errors import AbandonedRunError
+from apps.orchestrator.domain.failure_policy import action_for
 from apps.orchestrator.domain.models import Project, Task, TaskLimits, TaskRun
 from apps.orchestrator.domain.verification import VerificationProfile
 from apps.orchestrator.providers import OpenAICompatibleProvider, ProviderConfig
@@ -87,10 +91,12 @@ from apps.orchestrator.repositories import (
     ModelRunRepository,
     ProjectRepository,
     ReviewRepository,
+    RunEventRepository,
     TaskRepository,
     TaskRunRepository,
     VerificationRunRepository,
 )
+from apps.orchestrator.services.abandon import abandon_run
 from apps.orchestrator.services.runs import create_run
 from apps.orchestrator.services.workspace import attach_workspace, prepare_workspace
 from tests.conftest import run_git
@@ -1215,3 +1221,174 @@ def test_a_process_restart_resumes_the_interrupted_correction(tmp_path: Path, en
             assert _MISSING_GUARD["requiredFix"] in third
     finally:
         engine.dispose()
+
+
+# ---------------------------------------------------------------- Concern 66
+
+
+@pytest.mark.asyncio
+async def test_model_wait_has_no_open_database_transaction(world: _World):
+    """The provider boundary is outside the transaction, not just a fast wait."""
+    session, settings = world.session, world.settings
+    run = world.make_run()
+
+    class TransactionProbe(ScriptedModel):
+        async def generate(self, request):  # type: ignore[no-untyped-def]
+            assert not session.in_transaction(), (
+                "a database transaction crossed the model-provider boundary"
+            )
+            return await super().generate(request)
+
+    scripted_reviewer = reviewer(_APPROVED)
+
+    class ReviewTransactionProbe:
+        config = scripted_reviewer.config
+
+        async def review(self, request):  # type: ignore[no-untyped-def]
+            assert not session.in_transaction(), (
+                "a database transaction crossed the review-provider boundary"
+            )
+            return await scripted_reviewer.review(request)
+
+    result = await run_fix_loop(
+        session,
+        prepare_workspace(session, run.id, settings=settings),
+        coder=TransactionProbe(_FIRST_CANDIDATE),
+        reviewer=ReviewTransactionProbe(),  # type: ignore[arg-type]
+        settings=settings,
+        checkpoint_turn=session.commit,
+    )
+
+    assert result.outcome is LoopOutcome.APPROVED
+    assert [call.status.value for call in _calls(session, run)] == ["SUCCEEDED"]
+
+
+@pytest.mark.asyncio
+async def test_invalidating_the_pre_call_session_cannot_lose_the_model_result(
+    world: _World,
+):
+    """Post-call work starts on a valid checkout after a stale one is discarded."""
+    session, settings = world.session, world.settings
+    run = world.make_run()
+
+    class InvalidatingCoder(ScriptedModel):
+        async def generate(self, request):  # type: ignore[no-untyped-def]
+            assert not session.in_transaction()
+            session.invalidate()
+            return await super().generate(request)
+
+    result = await run_fix_loop(
+        session,
+        prepare_workspace(session, run.id, settings=settings),
+        coder=InvalidatingCoder(_FIRST_CANDIDATE),
+        reviewer=reviewer(_APPROVED),
+        settings=settings,
+        checkpoint_turn=session.commit,
+    )
+
+    assert result.outcome is LoopOutcome.APPROVED
+    assert TaskRunRepository(session).get(run.id).attempt_number == 1
+    assert [call.status.value for call in _calls(session, run)] == ["SUCCEEDED"]
+
+
+@pytest.mark.asyncio
+async def test_a_late_model_answer_is_refused_before_it_is_recorded(world: _World):
+    """The post-call fence, independently of the turn checkpoint fence."""
+    session, settings = world.session, world.settings
+    run = world.make_run()
+    concurrent = sessionmaker(bind=session.get_bind(), expire_on_commit=False)
+
+    class AbandonWhileCalled(ScriptedModel):
+        async def generate(self, request):  # type: ignore[no-untyped-def]
+            assert not session.in_transaction()
+            with concurrent.begin() as operator:
+                abandon_run(operator, run.id, reason="stop the in-flight model")
+            return await super().generate(request)
+
+    with pytest.raises(AbandonedRunError):
+        await run_fix_loop(
+            session,
+            prepare_workspace(session, run.id, settings=settings),
+            coder=AbandonWhileCalled(_FIRST_CANDIDATE),
+            reviewer=reviewer(_APPROVED),
+            settings=settings,
+            # Deliberately unguarded: this test pins _generate_recorded's own
+            # post-call validation rather than durable_checkpoint's duplicate.
+            checkpoint_turn=session.commit,
+        )
+    session.rollback()
+
+    assert TaskRunRepository(session).get(run.id).status is RunStatus.ABANDONED
+    assert _calls(session, run) == []
+
+
+@pytest.mark.asyncio
+async def test_timeout_longer_than_idle_limit_is_durable_without_a_long_sleep(
+    world: _World,
+):
+    """A simulated 600s call outlives the DB limit while no transaction is idle."""
+    session = world.session
+    settings = world.settings.model_copy(
+        update={"db_idle_in_transaction_timeout_seconds": 0.001}
+    )
+    run = world.make_run()
+
+    class LongTimeout(ScriptedModel):
+        async def generate(self, request):  # type: ignore[no-untyped-def]
+            assert not session.in_transaction()
+            raise _timeout()
+
+    with pytest.raises(ModelTimeout) as caught:
+        await run_fix_loop(
+            session,
+            prepare_workspace(session, run.id, settings=settings),
+            coder=LongTimeout(),
+            reviewer=reviewer(_APPROVED),
+            settings=settings,
+            checkpoint_turn=session.commit,
+        )
+    session.rollback()
+
+    assert caught.value.reason is FailureReason.MODEL_TIMEOUT
+    assert action_for(caught.value.reason) is FailureAction.RETRY
+    failed = _calls(session, run)
+    assert len(failed) == 1 and failed[0].status is RunStatus.FAILED
+    assert recover_loop_state(session, run, settings=settings).next_attempt == 2
+
+
+@pytest.mark.asyncio
+async def test_build_failure_then_slow_second_call_timeout_is_recoverable(
+    world: _World,
+):
+    """Regression for RUN-20260928-000005, with bounded deterministic timing."""
+    session, settings = world.session, world.settings
+    run = world.make_run()
+
+    class SlowSecondCall(ScriptedModel):
+        async def generate(self, request):  # type: ignore[no-untyped-def]
+            if len(self.answers) == 1:
+                assert not session.in_transaction()
+                await asyncio.sleep(0.02)
+            return await super().generate(request)
+
+    with pytest.raises(ModelTimeout):
+        await run_fix_loop(
+            session,
+            prepare_workspace(session, run.id, settings=settings),
+            coder=SlowSecondCall(_code("SYNTAX ERROR\n"), _timeout()),
+            reviewer=reviewer(_APPROVED),
+            settings=settings,
+            checkpoint_turn=session.commit,
+        )
+    session.rollback()
+
+    events = RunEventRepository(session).list_for_run(run.id)
+    assert RunEventType.BUILD_FAILED in [event.event_type for event in events]
+    assert action_for(FailureReason.BUILD_FAILED) is FailureAction.SEND_TO_CODER
+    calls = _calls(session, run)
+    assert [call.attempt for call in calls] == [1, 2]
+    assert [call.status for call in calls] == [RunStatus.SUCCEEDED, RunStatus.FAILED]
+    recovered = recover_loop_state(session, run, settings=settings)
+    assert recovered.attempts_started == 2
+    assert recovered.next_attempt == 3
+    assert recovered.interrupted_attempt == 2

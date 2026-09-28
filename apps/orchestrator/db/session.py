@@ -11,10 +11,14 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 from sqlalchemy import Engine, create_engine, event
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..config import get_settings
+from ..config.logging import get_logger
 from ..services.errors import LockWaitTimeout
+
+logger = get_logger(__name__)
 
 #: PostgreSQL ``lock_not_available``: a statement gave up waiting for a lock
 #: because ``lock_timeout`` expired. Matched on SQLSTATE rather than on message
@@ -26,13 +30,24 @@ _session_factory: sessionmaker[Session] | None = None
 
 
 def _apply_sqlite_pragmas(engine: Engine) -> None:
-    """SQLite ignores foreign keys unless asked; the tests rely on them."""
+    """Configure SQLite's test-only connection and transaction semantics.
+
+    The stdlib driver otherwise defers ``BEGIN`` and can let releasing a nested
+    savepoint commit the whole connection.  Explicit BEGIN makes the test
+    suite's outer transaction real, so the production-like checkpoints added
+    by Concern 66 remain isolated by fixture rollback.
+    """
 
     @event.listens_for(engine, "connect")
     def _set_pragma(dbapi_connection, _record):  # type: ignore[no-untyped-def]
+        dbapi_connection.isolation_level = None
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
+
+    @event.listens_for(engine, "begin")
+    def _begin(connection) -> None:  # type: ignore[no-untyped-def]
+        connection.exec_driver_sql("BEGIN")
 
 
 def _apply_postgresql_timeouts(engine: Engine, settings) -> None:  # type: ignore[no-untyped-def]
@@ -115,15 +130,47 @@ def get_session_factory() -> sessionmaker[Session]:
     return _session_factory
 
 
+def rollback_preserving_original(session: Session, original: BaseException) -> None:
+    """Roll back without replacing ``original`` with a dead-connection error.
+
+    SQLAlchemy marks a :class:`DBAPIError` as ``connection_invalidated`` when
+    the DBAPI connection cannot be reused.  That is the one cleanup failure we
+    can safely absorb: invalidating the Session discards the connection and a
+    later operation must use a new checkout.  Any other rollback error is a
+    separate database failure and is deliberately allowed to propagate.
+    """
+    try:
+        session.rollback()
+    except DBAPIError as rollback_error:
+        if not rollback_error.connection_invalidated:
+            raise
+        logger.warning(
+            "session_rollback_connection_invalidated",
+            error=str(rollback_error),
+            original_exception=type(original).__name__,
+        )
+        # ``invalidate`` is SQLAlchemy's supported way to discard every
+        # connection currently owned by a Session.  Do not replace this with a
+        # blanket exception suppression: an unrelated cleanup fault matters.
+        session.invalidate()
+
+
 @contextmanager
 def session_scope() -> Iterator[Session]:
-    """Transactional scope: commit on success, roll back on any exception."""
+    """Transactional scope: commit on success, roll back on any exception.
+
+    If the underlying connection has been invalidated by the server (for
+    example, PostgreSQL's ``idle_in_transaction_session_timeout``), the
+    rollback itself can fail.  The original exception is preserved and
+    re-raised; the dead session is closed so a caller can persist recovery
+    state through a fresh one.
+    """
     session = get_session_factory()()
     try:
         yield session
         session.commit()
-    except Exception:
-        session.rollback()
+    except Exception as original:
+        rollback_preserving_original(session, original)
         raise
     finally:
         session.close()

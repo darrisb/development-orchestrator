@@ -265,12 +265,10 @@ class TaskRunRepository(Repository[TaskRunRow, TaskRun]):
 
         Concern 64, and the companion to :meth:`finish`. ``finish`` guards one
         write -- the terminal status -- and that is not the same question as
-        "may this workflow keep going". A loop turn holds one transaction open
-        across a model call, and inside it the task moves several times and the
-        loop writes artifacts, model records and events. The graph's own fence
-        is a status read in an earlier node, so everything the turn writes after
-        that read happens with no further check at all, and the operator's
-        transaction can commit in the middle of it.
+        "may this workflow keep going". Concern 66 commits before every model
+        call, so an operator can commit while the external operation is in
+        flight. The graph's own fence is a status read in an earlier node, so
+        everything after that read needs this fresh, locking validation.
 
         This is where that window is closed. ``SELECT ... FOR UPDATE`` with the
         in-flight predicate, so the database evaluates the predicate while it
