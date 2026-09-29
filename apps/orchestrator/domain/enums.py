@@ -340,6 +340,14 @@ class RunEventType(StrEnum):
     #: generation that was fenced and the one that was taken, so a later reader
     #: can tell which durable work belongs to which executor.
     RUN_RECOVERY_AUTHORIZED = "RUN_RECOVERY_AUTHORIZED"
+    #: The request that started an in-flight run was cancelled, so the run was
+    #: settled deterministically instead of being left to unwind (concern 71).
+    #:
+    #: About a *run*, and automatic where ``RUN_ABANDONED`` is a person's
+    #: decision: the client is gone, but the run is still a durable fact and
+    #: the reason it stopped is worth one append-only line next to the attempt
+    #: that was interrupted. Exactly one of these is written per settlement.
+    RUN_CANCELLED = "RUN_CANCELLED"
 
 
 class WorkerProfile(StrEnum):

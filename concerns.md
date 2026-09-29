@@ -3628,3 +3628,250 @@ that was 340 bytes over as a whole-file edit and comfortably under the flat
 8,000 ceiling as a targeted one. That difference -- 3,293 against 8,000, and
 15,106 against 14,766 -- is the entire claim of this concern, and the fixture
 asserts both sides of it.
+
+---
+
+## Concern 71 — Request cancellation must not strand durable workflow state
+
+**Status.** Implemented and validated.
+
+**The problem.** When an HTTP client disconnects during a long-running workflow,
+the workflow can be left in a stranded state: the run remains RUNNING, the task
+remains CODING, and no terminal settlement occurs. `asyncio.CancelledError` is
+a `BaseException`, so it is not caught by the `except Exception` clause in
+`WorkflowRunner._execute` and unwinds straight past the durable state.
+
+**Correction, added by validation.** RUN-000008 is *not* evidence for this
+concern, and the original entry was wrong to treat it as such. Its complete
+durable record is:
+
+- one `model_runs` row, `purpose=CODE`, `status=FAILED`,
+  `error_detail='ModelTimeout: ... did not respond to generate within 600s'`,
+  `duration_ms=600019`;
+- the run remained `RUNNING`, and was not completed;
+- the task remained `CODING`;
+- the execution lease was acquired (`execution_generation=1`) and released
+  (`execution_owner IS NULL`);
+- the run is therefore recoverable under Concern 67 -- `inspect_incomplete_runs`
+  reports it, and an operator may resume it.
+
+Nothing in that record establishes that the run received
+`asyncio.CancelledError`. `ModelTimeout` is an ordinary `Exception`, so it took
+the `except Exception` path, which already finalizes runtime accounting; the
+cancellation was inferred, not observed. An ordinary provider `Exception` is
+distinct from the cancellation this concern reproduces, and RUN-000008's row is
+not a reproduction of it.
+
+RUN-000008 is therefore an ownerless in-flight run whose dispatch ended without
+terminal settlement -- the Concern 67 recoverability case -- rather than a
+Concern 71 cancellation. RUN-000005 carries a `ModelTimeout` row too and settled
+normally as `RETRY_EXHAUSTED`, which is what the same failure does when the
+loop is still alive to handle it; it is not claimed to have involved client
+cancellation either.
+
+The defect described below is real, and it is now fixed and tested against a
+workflow that *is* observed to receive `asyncio.CancelledError`. That is the
+case Concern 71 governs, and it is reproduced independently by the tests in
+this entry. **Concern 71 does not retroactively settle, repair, or reclassify
+RUN-000008.** The run remains untouched by this concern -- not recovered,
+retried, abandoned or otherwise dispatched -- and still requires the supported
+Concern 67 recovery path if an operator chooses to resume it.
+
+**Root cause.** The mechanism below is a general property of the workflow and
+is reproduced by the tests in this entry; it is not a diagnosis of any specific
+run, and in particular not of RUN-000008. The workflow's `_execute` method in
+`workflow/graph.py` catches
+`Exception` but not `BaseException`. In Python 3.8+, `asyncio.CancelledError`
+inherits from `BaseException`, not `Exception`, so it bypasses the normal
+exception handling path. When the HTTP client disconnects, FastAPI/Starlette
+cancels the awaiting coroutine, raising `asyncio.CancelledError`, which
+propagates up through the workflow without performing the settlement logic that
+would transition the run to a terminal state.
+
+**The invariant.** Once a durable TaskRun has been created and execution has
+begun, loss or cancellation of the initiating HTTP request must not leave that
+TaskRun indefinitely RUNNING solely because the client disappeared. A client
+connection is not execution ownership. HTTP request lifetime must not determine
+whether durable workflow state is eventually continued or deterministically
+settled.
+
+**The fix.** `WorkflowRunner._execute` catches `asyncio.CancelledError` by name
+and delegates to `WorkflowRunner._settle_cancelled_run`, which is deliberately
+synchronous, before re-raising the cancellation.
+
+1. The interrupted session is rolled back first, so the settlement is not
+   competing with this very workflow for a lock it is still holding.
+2. A fresh session opens one transaction. The run is transitioned to FAILED
+   with `failure_reason = WORKFLOW_CANCELLED` if it is still in flight and
+   still at the execution generation this dispatch took.
+3. The task is transitioned to FAILED, but only when the state machine permits
+   it, so a task the loop already failed does not roll the run's settlement
+   back with it.
+4. One `RUN_CANCELLED` run event is appended, in the same transaction, with the
+   machine reason and the attempt that was interrupted.
+5. Active runtime accounting is finalized, and the cancellation is re-raised.
+
+The handler is named rather than broad. A `except BaseException` clause that
+settles only `CancelledError` still *catches* `SystemExit`, `KeyboardInterrupt`
+and `GeneratorExit`, and any future edit that settles them writes
+`WORKFLOW_CANCELLED` onto a run for a shutdown or a Ctrl-C -- a statement about
+a request nobody made. `tests/integration/test_concern_71_cancellation.py`
+pins that those three are not recorded, in an isolated event loop for the first
+two because `asyncio.Task.__step` re-raises them out of the loop regardless of
+what the coroutine does with them.
+
+**Distinction from other concerns.**
+
+- **Concern 66** (no long-running transactions): Not violated in RUN-000008 --
+  the transaction was committed before the provider call and the failed
+  `model_runs` row was persisted durably. That is as far as the evidence goes,
+  and it is not a Concern 71 observation. RUN-000008's recorded failure is a
+  `ModelTimeout`, an ordinary `Exception`; the entry does not claim, and the
+  record does not establish, that a cancellation ever followed it.
+
+- **Concern 67** (execution ownership): Not violated in RUN-000008, and
+  RUN-000008 is not evidence for Concern 71. The run is ownerless because its
+  dispatch ended without terminal settlement and the cause is not otherwise
+  established; that is the Concern 67 recoverability case, and Concern 67
+  governs it. Concern 71 governs the separate, independently reproduced case
+  where an executing workflow actually receives `asyncio.CancelledError`.
+  Absence of an execution owner does not establish cancellation, and this
+  concern does not retroactively settle, repair, or reclassify RUN-000008.
+
+- **Concern 68** (recoverable settlement): Concern 71 does not replace or
+  weaken Concern 68. A cancelled run is transitioned to FAILED, which is a
+  terminal state that can be inspected and recovered if needed. The settlement
+  is deterministic and does not depend on the client remaining connected.
+
+- **Concern 70** (targeted edits): Unrelated. Concern 70 is about the edit
+  protocol and output limits. Concern 71 is about workflow lifecycle under
+  cancellation. RUN-000008's model timed out before producing any output, so
+  Concern 70 was never exercised.
+
+**Tests.** Thirteen integration tests in
+`tests/integration/test_concern_71_cancellation.py`, rewritten during
+validation. Every race is gated by an `asyncio.Event` set by the code under
+test, or by a SQLAlchemy `before_cursor_execute` hook that delivers a
+cancellation at a named write; no test sleeps or polls.
+
+1. `test_cancellation_during_the_provider_wait_settles_the_run`: the shape
+   RUN-000008 was *assumed* to have. This concern does not claim it had it --
+   the test constructs a dispatch that verifiably does receive a
+   `CancelledError`, which is the distinction the Correction above turns on.
+   Run FAILED/`WORKFLOW_CANCELLED`, task FAILED, one `RUN_CANCELLED` event,
+   ownership released, no candidate, no review, integration baseline unmoved,
+   no model call recorded for the cancelled attempt, and the run no longer
+   recoverable.
+2. `test_cancellation_after_a_durable_provider_failure_does_not_bypass_settlement`
+3. `test_cancellation_with_attempts_remaining_does_not_reset_the_budget`
+4. `test_cancellation_on_the_final_attempt_settles_the_same_way`
+5. `test_a_second_cancellation_cannot_interrupt_the_settlement`: a second
+   cancellation delivered inside the open settlement transaction, between the
+   terminal `UPDATE` and its `COMMIT`.
+6. `test_ownership_is_released_exactly_once_when_cancelled_during_the_release`
+7. `test_a_generator_exit_is_not_recorded_as_a_cancellation`
+8. `test_an_interrupt_or_exit_is_not_recorded_as_a_cancellation`
+   (`KeyboardInterrupt`, `SystemExit`; run in a thread with its own loop)
+9. `test_a_provider_failure_is_not_a_cancellation`: a `ModelTimeout` is an
+   `Exception` and leaves the run recoverable, per Concern 67. This is the
+   distinction the Correction above is about, pinned in both directions.
+10. `test_a_task_the_state_machine_will_not_move_does_not_strand_the_run`
+11. `test_a_cancellation_never_overwrites_an_operator_abandonment`: Concern 64
+    still wins.
+12. `test_a_superseded_dispatch_cannot_settle_a_recovered_run`: a cancellation
+    from a dispatch that has since been fenced by a recovery settles nothing.
+13. (counted above) the event and reason invariants on every path.
+
+**Correcting an earlier claim.** An earlier version of this entry said "all
+three tests fail on baseline 2404c60 (demonstrating the defect)". That was
+false. On the exact baseline, `test_ownership_released_on_cancellation`
+**passes**: ownership was already released by `WorkflowRunner.run`'s `finally`,
+independently of cancellation. Only the two settlement tests failed. The three
+tests now here were, for the same reason, not sufficient: they used sleeps, and
+the second one asserted "after a model failure" without causing one.
+
+On baseline `2404c60`, 7 of these 13 tests fail -- the six settlement tests and
+the state-machine one -- and 6 pass. The 6 that pass are the ones that pin
+behaviour that must *not* change, plus `test_a_superseded_dispatch_cannot_settle_a_recovered_run`,
+which is satisfied on the baseline for the wrong reason: the baseline settles
+nothing at all, so there is no stale write to fence. Mutation F below is what
+proves that fence is load-bearing.
+
+**Correcting the "925 vs 1484" counts.** An earlier version of this entry
+reported "925 passed" for integration tests and, elsewhere, "1484" for a full
+suite, as if they described the same run. They do not, and neither number was
+wrong on its own:
+
+- `925 passed` + `1 failed` = **926 collected** = `pytest tests/integration` on
+  the baseline, which then contained 923 integration tests plus the 3 tests
+  this entry previously shipped. The one failure is
+  `test_concern68.py::test_the_settlement_keeps_the_same_task_run`.
+- **1484** = `923 + 561`: the full suite, `pytest` with no path argument, unit
+  tests included, SQLite.
+
+`pytest -m integration` is a third number again -- 839 of 1487 on the baseline
+-- and is not what either figure came from. After the rewrite the counts are
+1497 full, 936 integration, 561 unit, 849 by marker.
+
+**Regression validation.** Full suite, `pytest`, 1497 collected: **1496 passed,
+1 failed** in 111.95s. The single failure is the pre-existing date-sensitive
+`test_concern68.py::test_the_settlement_keeps_the_same_task_run`, reproduced
+unchanged on the exact baseline:
+
+```
+git worktree add --detach /tmp/baseline-2404c60 2404c60
+cd /tmp/baseline-2404c60
+PYTHONPATH=/tmp/baseline-2404c60 pytest \
+  "tests/integration/test_concern68.py::test_the_settlement_keeps_the_same_task_run" -v -p no:randomly
+1 failed in 1.01s
+E   AssertionError: assert 'RUN-20260929-000001' == 'RUN-20260928-000001'
+```
+
+The test hard-codes a `RUN-...` identity built from today's date, so it fails
+whenever the date rolls over. It is unrelated to this concern and is not fixed
+here.
+
+Repeated with `pytest-randomly` at seeds 1, 2 and 3: 1496 passed, the same one
+failure, every time. Repeated against PostgreSQL 16 on a dedicated
+`test_c71_validation` database -- never the live `orchestrator` one, because
+`tests/conftest.py`'s `engine` fixture calls `Base.metadata.drop_all` on
+teardown: 1496 passed, same one failure, again at all three seeds.
+`alembic upgrade head` reaches `a1f47b0c93d2` and `alembic check` reports no new
+operations; `RunEventType` is a Python enum, so this concern adds no migration.
+`ruff check .` passes on the change and on the baseline.
+
+**Mutations.** Each applied to a pristine copy, run, and restored:
+
+| # | Mutation | Result |
+|---|---|---|
+| A | Delete the cancellation handler | 6 failed -- caught |
+| B | Skip settlement when the loop already recorded an attempt | 3 failed -- caught |
+| C | Skip the ownership release on the cancellation path | 4 failed -- caught |
+| D | Consume the remaining attempt budget in the settlement | 3 failed -- caught |
+| E | Drop the rollback before the settlement | **13 passed -- not caught** |
+| F | Drop the generation fence from the settlement | 1 failed -- caught |
+
+Mutation E is reported rather than hidden. The rollback cannot be observed,
+because no suspension point in this workflow has a transaction open: concern 66
+guarantees the provider boundary is transaction-free, `verify_candidate` is
+synchronous so nothing can be delivered during verification, and the review
+boundary was measured and commits before it awaits. The call is kept as
+defensive symmetry with the `except Exception` handler above it, not because a
+test fails without it.
+
+**Campaign preservation.** Verified read-only against the live database after
+the change. RUN-000008 is still `RUNNING`, attempt 1, review_cycle 0, no
+candidate commit, no `execution_owner`, generation 1, not completed, with its
+single `ModelTimeout` model row. RUN-000004 through 000007 are unchanged
+(`SCOPE_VIOLATION`, `SCOPE_VIOLATION`, `RETRY_EXHAUSTED`, `RETRY_EXHAUSTED`) and
+all still start from integration baseline
+`fc6abc579cee88f821c5f72f00162872b2dc8326`. TraceStack TS-109 is `CODING` with
+5 runs and 1 running; TraceStack TS-110 is `READY` with 0 runs; the other
+projects' TS-109 and TS-110 rows are untouched. No recovery, retry, abandonment
+or dispatch was performed on any historical run.
+
+**Commit.** `apps/orchestrator/workflow/graph.py` (the handler and
+`_settle_cancelled_run`), `apps/orchestrator/repositories/task_runs.py`
+(`finish(..., expected_generation=...)`, the fence the settlement needs),
+`apps/orchestrator/domain/enums.py` (`RunEventType.RUN_CANCELLED`), and
+`tests/integration/test_concern_71_cancellation.py`.

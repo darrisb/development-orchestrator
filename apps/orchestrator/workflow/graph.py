@@ -7,6 +7,7 @@ serializable facts used only for conditional edges.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime
 from typing import NotRequired, TypedDict
@@ -23,16 +24,21 @@ from ..domain.enums import (
     IN_FLIGHT_RUN_STATUSES,
     EscalationStatus,
     ModelRole,
+    RunEventType,
     RunStatus,
     TaskStatus,
 )
+from ..domain.errors import AbandonedRunError, RunOwnershipLostError
 from ..domain.escalation import EscalationIntent
+from ..domain.models import RunEvent
+from ..domain.state_machine import can_transition
 from ..domain.workflow import WorkflowOutcome, WorkflowPhase
 from ..providers import ModelProvider, build_provider, build_review_provider
 from ..providers.review import ReviewProvider
 from ..repositories import (
     EscalationRepository,
     PauseRequestRepository,
+    RunEventRepository,
     TaskRepository,
     TaskRunRepository,
 )
@@ -48,6 +54,15 @@ from .checkpoints import SqlAlchemyCheckpointSaver
 from .recovery import RecoveryDisposition, inspect_incomplete_runs
 
 logger = get_logger(__name__)
+
+#: The machine code written to ``task_runs.failure_reason`` when a run is
+#: closed because the request that started it was cancelled (concern 71).
+#:
+#: A code rather than prose, like every other value on that column, so a
+#: reader can group cancellations without matching on English. The prose
+#: reason belongs in the event, which is written next to it in the same
+#: transaction.
+CANCELLATION_FAILURE_REASON = "WORKFLOW_CANCELLED"
 
 
 class WorkflowState(TypedDict):
@@ -495,7 +510,7 @@ class WorkflowRunner:
                     run.id,
                     session.commit,
                     # Concern 67: the token this dispatch acquired. Every turn
-                    # boundary quotes it back, so an executor recovered out
+                    # boundary quotes it back to the database, so an executor recovered out
                     # from under itself cannot commit what it was doing.
                     expected_generation=state.get("execution_generation"),
                 ),
@@ -539,8 +554,147 @@ class WorkflowRunner:
                     original_exception=type(original).__name__,
                 )
             raise
+        except asyncio.CancelledError as cancellation:
+            # Concern 71. CancelledError is a BaseException, so the handler
+            # above never sees it: an HTTP client that disconnects while this
+            # run waits on a model provider unwinds straight past the workflow
+            # and leaves a run RUNNING, a task mid-flight, and nothing left
+            # that will ever settle either. The client is gone; the durable
+            # records are not.
+            #
+            # Named rather than caught as BaseException. The settlement below
+            # is only correct for a cancellation, and a broad handler would
+            # route SystemExit, KeyboardInterrupt and GeneratorExit through it
+            # as well: a Ctrl-C would be recorded on the run as
+            # WORKFLOW_CANCELLED, which is a statement about a request nobody
+            # made. Those keep unwinding untouched, as they did before.
+            #
+            # The rollback comes first and for the same reason it does in the
+            # Exception handler: this session may still hold the transaction
+            # that was open when the cancellation arrived, and settlement runs
+            # on a second connection. Leaving it open would have the settlement
+            # wait on -- or lose the race for -- a lock this very workflow is
+            # holding, and a lost race is a settlement that never happened.
+            rollback_preserving_original(session, cancellation)
+            self._settle_cancelled_run(state)
+            raise
         finally:
             session.close()
+
+    def _settle_cancelled_run(self, state: WorkflowState) -> None:
+        """Close the run a cancellation interrupted, deterministically.
+
+        Concern 71. The run, its task, the reason and the runtime accounting
+        are written together or not at all, so there is no interleaving in which
+        the run is terminal and the task is not. The reason is a machine code
+        like every other one on the column, and the event carries the same fact
+        on the run's own history, exactly once, next to the attempt that was
+        interrupted.
+
+        The task is moved only when the state machine permits it. A task that
+        is already FAILED -- the loop's own settlement can land first -- has
+        nowhere to go, and raising here would roll back the run's settlement
+        with it and strand the run for the sake of a bookkeeping move that had
+        nothing left to say. A COMPLETE task is left alone for the same reason
+        concern 64 leaves it: its work is delivered and in the baseline.
+
+        The write is fenced by the execution generation this dispatch took, so
+        an executor that has been superseded settles nothing at all -- not the
+        run, not the event, not the runtime interval. Concern 64's abandonment
+        and concern 66's fence are the two things that can invalidate a
+        cancellation's settlement, and a run that is neither still in flight nor
+        still ours to close is not this method's to close.
+
+        The whole method is synchronous on purpose. It is reached by unwinding
+        a cancelled task, and an ``await`` anywhere in it would be a place a
+        *second* cancellation could be delivered -- which would abandon a
+        half-written settlement and leave exactly the strand this closes. With
+        no await there is nowhere for a second cancellation to land until the
+        transaction has committed.
+
+        Best effort, like the cleanup above it: a settlement that fails must
+        not replace the cancellation the caller is owed. It is logged, because
+        the alternative is a strand nobody can see.
+        """
+        try:
+            with self.session_factory.begin() as settlement:
+                run, task, project = load_run_context(
+                    settlement, UUID(state["run_id"])
+                )
+                if run.status in IN_FLIGHT_RUN_STATUSES:
+                    # Concern 64's compare-and-swap still guards this write, so
+                    # a run an operator abandoned while the provider was being
+                    # waited on stays ABANDONED. That refusal is not a failure
+                    # of the settlement: the run is already terminal, and only
+                    # the accounting below is left to do.
+                    #
+                    # The generation rides along on the same statement, for the
+                    # reason concern 66 gave the column: a recovery resumes the
+                    # *same* run, so an executor that has been superseded is not
+                    # writing to a run nobody wants, it is writing over the work
+                    # that replaced it. Its cancellation is a true statement
+                    # about a request that has gone; it is not a decision about
+                    # the successor's run, and settling that FAILED would end
+                    # live work and leave its owner holding a terminal row.
+                    try:
+                        TaskRunRepository(settlement).finish(
+                            run.id,
+                            RunStatus.FAILED,
+                            CANCELLATION_FAILURE_REASON,
+                            expected_generation=state.get("execution_generation"),
+                        )
+                    except AbandonedRunError:
+                        logger.info(
+                            "workflow_cancellation_found_abandoned_run",
+                            run_id=str(run.id),
+                        )
+                    except RunOwnershipLostError as lost:
+                        # Superseded. The successor owns every remaining write
+                        # on this run -- the terminal status, the event, and the
+                        # runtime interval -- and a stale executor writing to
+                        # any of them is the same defect concern 66 fenced.
+                        logger.info(
+                            "workflow_cancellation_found_superseded_run",
+                            run_id=str(run.id),
+                            held_generation=lost.held,
+                            current_generation=lost.current,
+                        )
+                        return
+                    else:
+                        if task.status is not TaskStatus.FAILED and can_transition(
+                            task.status, TaskStatus.FAILED
+                        ):
+                            TaskRepository(settlement).transition(
+                                task.id, TaskStatus.FAILED
+                            )
+                        RunEventRepository(settlement).append(
+                            RunEvent(
+                                task_run_id=run.id,
+                                project_id=project.id,
+                                task_id=task.id,
+                                event_type=RunEventType.RUN_CANCELLED,
+                                attempt=run.attempt_number,
+                                payload={
+                                    "failure_reason": CANCELLATION_FAILURE_REASON,
+                                    "attempt": run.attempt_number,
+                                    "task_status": task.status.value,
+                                    "execution_generation": (
+                                        state.get("execution_generation")
+                                    ),
+                                },
+                            )
+                        )
+                end_active_runtime(
+                    settlement,
+                    run.id,
+                    task.limits,
+                    worker_timeout_seconds=self.settings.worker_timeout_seconds,
+                )
+        except Exception:
+            logger.exception(
+                "workflow_cancellation_settlement_failed",
+                run_id=state["run_id"],
+            )
 
     def _after_execute(self, state: WorkflowState) -> str:
         # Concern 64: if the run was abandoned, go to terminal.

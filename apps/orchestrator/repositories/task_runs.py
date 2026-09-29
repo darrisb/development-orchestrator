@@ -173,7 +173,12 @@ class TaskRunRepository(Repository[TaskRunRow, TaskRun]):
         return self._to_domain(row) if row is not None else None
 
     def finish(
-        self, run_id: UUID, status: RunStatus, failure_reason: str | None = None
+        self,
+        run_id: UUID,
+        status: RunStatus,
+        failure_reason: str | None = None,
+        *,
+        expected_generation: int | None = None,
     ) -> TaskRun:
         """Close a run, durably refusing to move one an operator abandoned.
 
@@ -200,10 +205,20 @@ class TaskRunRepository(Repository[TaskRunRow, TaskRun]):
         only ``ABANDONED`` is protected, because it is the only status whose
         loss is silent.
 
+        Args:
+            expected_generation: the execution generation this executor was
+                dispatched at. Given, it is part of the same guarded statement,
+                so an executor that has been superseded finds no row to write --
+                the same fence :meth:`require_in_flight` applies to every other
+                durable checkpoint. Omitted, the write is unfenced as before.
+
         Raises:
             LookupError: no such run.
             AbandonedRunError: the run was abandoned by an operator. The write
                 did not happen.
+            RunOwnershipLostError: the run moved to a newer execution
+                generation, so this executor no longer owns it. The write did
+                not happen.
         """
         if status is RunStatus.ABANDONED:
             # The operator path has the mirror-image predicate, and it is the
@@ -213,12 +228,25 @@ class TaskRunRepository(Repository[TaskRunRow, TaskRun]):
                 return abandoned
             row = self._require_row(run_id)
             raise AbandonedRunError(row.id)
-        finished = self._try_finish(
-            run_id, status, failure_reason, TaskRunRow.status != RunStatus.ABANDONED
-        )
+        conditions: list[ColumnElement[bool]] = [
+            TaskRunRow.status != RunStatus.ABANDONED
+        ]
+        if expected_generation is not None:
+            conditions.append(
+                TaskRunRow.execution_generation == expected_generation
+            )
+        finished = self._try_finish(run_id, status, failure_reason, *conditions)
         if finished is not None:
             return finished
         row = self._require_row(run_id)
+        if expected_generation is not None and (
+            row.execution_generation != expected_generation
+        ):
+            raise RunOwnershipLostError(
+                row.id,
+                held=expected_generation,
+                current=row.execution_generation,
+            )
         raise AbandonedRunError(row.id)
 
     def abandon(self, run_id: UUID, *, failure_reason: str | None = None) -> TaskRun | None:
