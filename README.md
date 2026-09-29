@@ -230,9 +230,21 @@ runtime `orchestrator` database. Use a dedicated test database like
 
 The runtime PostgreSQL database is backed up with `pg_dump` custom format into
 `data/backups/`. Backups are host files, not rows in the database they protect.
+The backup script first uses host PostgreSQL client binaries when `pg_dump` or
+`pg_restore` are available on `PATH`. In the Docker Compose development
+deployment, host client tools are optional: if a host binary is missing, the
+script runs the matching client inside the configured `postgres` Compose
+service. Start that service before running backup commands:
+
+```bash
+docker compose up -d postgres
+```
+
 The dump contains database contents only; the database password is passed to
 PostgreSQL tools through `PGPASSWORD` and is not written to the command line,
-metadata, or backup file by the backup script.
+metadata, or backup file by the backup script. The Docker fallback passes
+`PGPASSWORD` through the subprocess environment and `docker compose exec -e
+PGPASSWORD`, never as `PGPASSWORD=value` in argv.
 
 Create a runtime backup:
 
@@ -255,9 +267,14 @@ guard.
 
 The metadata records creation time, source database identity, source revision,
 dirty flag, Alembic revision, PostgreSQL version, backup filename, size,
-SHA-256 checksum, row counts, and restore-check results after verification.
-Use the checksum in the metadata to confirm a copied backup is byte-for-byte the
-same file.
+SHA-256 checksum, row counts, the client execution mode used for backup and
+restore, and restore-check results after verification. Use the checksum in the
+metadata to confirm a copied backup is byte-for-byte the same file.
+
+If neither the local PostgreSQL client binary nor the configured `postgres`
+Compose service can provide the required tool, the command fails closed. The
+fallback is deliberately tied to the project Compose service and does not scan
+for arbitrary PostgreSQL containers.
 
 Retention is deliberately simple for this development deployment: keep the
 latest seven verified backups. Unverified backups never evict a verified

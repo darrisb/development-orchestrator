@@ -35,7 +35,9 @@ from tests.db_safety import (
     drop_test_database,
 )
 
-Runner = Callable[..., subprocess.CompletedProcess[str]]
+Runner = Callable[..., subprocess.CompletedProcess[Any]]
+
+POSTGRES_COMPOSE_SERVICE = "postgres"
 
 
 class BackupError(RuntimeError):
@@ -47,6 +49,14 @@ class BackupResult:
     backup_path: Path
     metadata_path: Path
     metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _ToolInvocation:
+    mode: str
+    command: list[str]
+    env: dict[str, str]
+    version_command: list[str]
 
 
 def default_backup_dir(settings: Settings | None = None) -> Path:
@@ -85,22 +95,16 @@ def backup_database(
     ) as tmp:
         tmp_path = Path(tmp.name)
 
-    command = ["pg_dump", "--format=custom", "--file", str(tmp_path), _pg_url(database_url)]
     try:
-        completed = runner(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=_pg_env(database_url),
-        )
+        dump_tool = _resolve_pg_tool("pg_dump", database_url, runner=runner)
+        _run_pg_dump(dump_tool, database_url, tmp_path, runner=runner)
+        dump_version = _read_tool_version(dump_tool, runner=runner)
+    except BackupError:
+        _unlink_missing_ok(tmp_path)
+        raise
     except FileNotFoundError as exc:
         _unlink_missing_ok(tmp_path)
-        raise BackupError("pg_dump was not found on PATH") from exc
-
-    if completed.returncode != 0:
-        _unlink_missing_ok(tmp_path)
-        raise BackupError(_command_failure("pg_dump failed", completed))
+        raise BackupError("pg_dump was not found in any supported execution path") from exc
 
     if not tmp_path.exists() or tmp_path.stat().st_size <= 0:
         _unlink_missing_ok(tmp_path)
@@ -122,6 +126,11 @@ def backup_database(
         "size_bytes": backup_path.stat().st_size,
         "sha256": checksum,
         "source_counts": source_counts,
+        "backup_tool": {
+            "binary": "pg_dump",
+            "mode": dump_tool.mode,
+            "version": dump_version,
+        },
     }
     _write_json_atomic(metadata_path, metadata)
     _apply_retention(destination, retain_verified=retention)
@@ -155,27 +164,12 @@ def verify_restore(
 
     restored = False
     try:
-        command = [
-            "pg_restore",
-            "--clean",
-            "--if-exists",
-            "--no-owner",
-            "--dbname",
-            _pg_url(verify_url),
-            str(backup_path),
-        ]
         try:
-            completed = runner(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                env=_pg_env(verify_url),
-            )
+            restore_tool = _resolve_pg_tool("pg_restore", verify_url, runner=runner)
+            _run_pg_restore(restore_tool, verify_url, backup_path, runner=runner)
+            restore_version = _read_tool_version(restore_tool, runner=runner)
         except FileNotFoundError as exc:
-            raise BackupError("pg_restore was not found on PATH") from exc
-        if completed.returncode != 0:
-            raise BackupError(_command_failure("pg_restore failed", completed))
+            raise BackupError("pg_restore was not found in any supported execution path") from exc
         restored = True
 
         checks = _verify_restored_database(verify_url, metadata)
@@ -183,6 +177,11 @@ def verify_restore(
         metadata["verified_at"] = verified_at
         metadata["verified_database"] = _identity_payload(identity)
         metadata["restore_checks"] = checks
+        metadata["restore_tool"] = {
+            "binary": "pg_restore",
+            "mode": restore_tool.mode,
+            "version": restore_version,
+        }
         _write_json_atomic(metadata_path, metadata)
         _apply_retention(metadata_path.parent)
         return {
@@ -256,6 +255,152 @@ def _pg_url(database_url: str) -> str:
     auth = f"{user}@" if user else ""
     port = f":{parsed.port}" if parsed.port else ""
     return urlunsplit(SplitResult(scheme, f"{auth}{host}{port}", parsed.path, parsed.query, ""))
+
+
+def _resolve_pg_tool(
+    binary: str,
+    database_url: str,
+    *,
+    runner: Runner,
+) -> _ToolInvocation:
+    local = [binary]
+    if _command_available(local, runner=runner):
+        return _ToolInvocation(
+            mode="local",
+            command=local,
+            env=_pg_env(database_url),
+            version_command=[binary, "--version"],
+        )
+
+    container = [
+        "docker",
+        "compose",
+        "exec",
+        "-T",
+        "-e",
+        "PGPASSWORD",
+        POSTGRES_COMPOSE_SERVICE,
+        binary,
+    ]
+    if _command_available(container, runner=runner):
+        return _ToolInvocation(
+            mode=f"docker-compose:{POSTGRES_COMPOSE_SERVICE}",
+            command=container,
+            env=_pg_env(database_url),
+            version_command=[*container, "--version"],
+        )
+
+    raise BackupError(
+        f"{binary} is unavailable: install PostgreSQL client tools on PATH or start "
+        f"the configured Docker Compose {POSTGRES_COMPOSE_SERVICE!r} service"
+    )
+
+
+def _command_available(command: list[str], *, runner: Runner) -> bool:
+    try:
+        completed = runner(
+            [*command, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return False
+    return completed.returncode == 0
+
+
+def _run_pg_dump(
+    tool: _ToolInvocation,
+    database_url: str,
+    output_path: Path,
+    *,
+    runner: Runner,
+) -> None:
+    if tool.mode == "local":
+        command = [
+            *tool.command,
+            "--format=custom",
+            "--file",
+            str(output_path),
+            _pg_url(database_url),
+        ]
+        completed = runner(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=tool.env,
+        )
+        if completed.returncode != 0:
+            raise BackupError(_command_failure("pg_dump failed", completed))
+        return
+
+    command = [*tool.command, "--format=custom", "--dbname", _pg_url(database_url)]
+    completed = runner(
+        command,
+        check=False,
+        capture_output=True,
+        text=False,
+        env=tool.env,
+    )
+    if completed.returncode != 0:
+        raise BackupError(_command_failure("pg_dump failed", completed))
+    output_path.write_bytes(completed.stdout or b"")
+
+
+def _run_pg_restore(
+    tool: _ToolInvocation,
+    database_url: str,
+    backup_path: Path,
+    *,
+    runner: Runner,
+) -> None:
+    command = [
+        *tool.command,
+        "--clean",
+        "--if-exists",
+        "--no-owner",
+        "--dbname",
+        _pg_url(database_url),
+    ]
+    if tool.mode == "local":
+        completed = runner(
+            [*command, str(backup_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=tool.env,
+        )
+    else:
+        completed = runner(
+            command,
+            input=backup_path.read_bytes(),
+            check=False,
+            capture_output=True,
+            text=False,
+            env=tool.env,
+        )
+    if completed.returncode != 0:
+        raise BackupError(_command_failure("pg_restore failed", completed))
+
+
+def _read_tool_version(tool: _ToolInvocation, *, runner: Runner) -> str | None:
+    try:
+        completed = runner(
+            tool.version_command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=tool.env,
+        )
+    except FileNotFoundError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return (
+        _process_output_text(completed.stdout or completed.stderr).strip()
+        or None
+    )
 
 
 def _pg_env(database_url: str) -> dict[str, str]:
@@ -383,11 +528,19 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _command_failure(prefix: str, completed: subprocess.CompletedProcess[str]) -> str:
-    stderr = (completed.stderr or "").strip()
-    stdout = (completed.stdout or "").strip()
+def _command_failure(prefix: str, completed: subprocess.CompletedProcess[Any]) -> str:
+    stderr = _process_output_text(completed.stderr).strip()
+    stdout = _process_output_text(completed.stdout).strip()
     detail = stderr or stdout or f"exit code {completed.returncode}"
     return f"{prefix}: {detail}"
+
+
+def _process_output_text(output: str | bytes | None) -> str:
+    if output is None:
+        return ""
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return output
 
 
 def _apply_retention(destination: Path, *, retain_verified: int = 7) -> None:
