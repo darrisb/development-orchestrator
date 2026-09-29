@@ -3875,3 +3875,62 @@ or dispatch was performed on any historical run.
 (`finish(..., expected_generation=...)`, the fence the settlement needs),
 `apps/orchestrator/domain/enums.py` (`RunEventType.RUN_CANCELLED`), and
 `tests/integration/test_concern_71_cancellation.py`.
+
+## Concern 72 — Declare targeted-edit limits before generation
+
+**Observed evidence.** RUN-000008 recovery attempt 2 used
+`coder-prompt/2+code-edits/3`. It spent 399,372 ms, 6,013 input tokens and
+6,073 output tokens before returning two targeted `replace` edits. The second
+edit named `src/test/navigation-stack.test.ts` and carried 11,813 bytes of
+`oldText` plus 3,734 bytes of `newText`: 15,547 bytes in total. The parser
+correctly rejected it against the existing 8,000-byte targeted-edit ceiling.
+The response was rejected atomically and no partial edit was applied. That
+rejection and the ceiling were correct; the defect was that the coder learned
+the hard limit only in rejection feedback, after consuming the attempt.
+RUN-000008 remains evidence and was not recovered or modified.
+
+**Audit.** The pre-generation representation constraints are the operation
+shape, exact and unique `oldText`, the per-edit UTF-8 byte size of `oldText +
+newText`, and the whole-file output allowance for `create`/`update`. These are
+facts the coder can obey while constructing its answer. The whole-file
+allowances derived by `per_path_edit_allowance` and capped by
+`context_max_file_bytes` were already rendered per path before generation.
+The resulting targeted-file ceiling (`context_max_file_bytes`), distinct paths
+against `max_files_changed`, and resulting additions plus deletions against
+`max_diff_lines` are application/scope constraints: they depend on staged file
+content or the repository diff and remain downstream guards. They were not
+indiscriminately copied into the prompt.
+
+**Repair.** `render_coding_instructions` now reads
+`domain.edits.MAX_TARGETED_EDIT_PAYLOAD_BYTES`, the same authoritative constant
+read by `CodeChangeSet.from_payload`. It tells the coder that every individual
+`replace` is charged
+`len(oldText.encode('utf-8')) + len(newText.encode('utf-8'))`, asks for the
+smallest sufficiently unique exact `oldText`, forbids placeholder/ellipsis
+claims such as `// ... existing tests unchanged ...`, and retains whole-file
+`update`/`create` as the existing alternative when a targeted replacement
+cannot fit. `CODER_PROMPT_VERSION` is now `coder-prompt/3`; the edit schema
+remains `code-edits/3`. No payload, result, scope, diff, attempt, or timeout
+limit was raised or weakened.
+
+**Tests and contract mutations.** `tests/unit/test_concern72.py` was added
+first and produced six failures against the baseline prompt. Its focused tests
+cover exact value disclosure, per-edit scope, UTF-8 accounting, minimal unique
+fragments, placeholder prohibition, whole-file alternatives, and shared-source
+behavior. Changing the authoritative constant to 37 changes both the rendered
+prompt and parser boundary automatically. Removing the disclosure, the
+minimal-fragment guidance, or the placeholder prohibition independently makes
+the corresponding focused test fail. Changing validator accounting away from
+the documented combined UTF-8 sizes makes the shared contract test fail.
+
+**Regression validation.** Concern 70, Concern 71, coder prompt/construction,
+edit parsing/application, fix-loop, and workflow-graph coverage: 171 passed
+(one existing GeneratorExit warning). Full SQLite without random ordering:
+1,502 passed and the one known Concern 68 date-sensitive failure. Fixed
+`pytest-randomly` seeds 1, 2, and 3 each produced the same 1,502 passes and the
+same single Concern 68 failure. Full PostgreSQL 16 against the isolated
+`test_c72_validation` database also produced 1,502 passes and only that known
+failure. `alembic upgrade head` reached `a1f47b0c93d2`, `alembic check` found no
+new operations, and `ruff check .` passed. The Concern 68 failure still expects
+`RUN-20260928-000001` while the current date correctly creates
+`RUN-20260929-000001`; it was not changed here.

@@ -29,11 +29,12 @@ that produced it (section 34).
 
 from __future__ import annotations
 
+from ..domain import edits
 from ..domain.models import Task
 from ..domain.plan import CodingPlan
 
 #: Bumped on any change to the strings below.
-CODER_PROMPT_VERSION = "coder-prompt/2"
+CODER_PROMPT_VERSION = "coder-prompt/3"
 
 _SHARED_RULES = """\
 You are a senior software engineer working inside an automated orchestrator on
@@ -184,6 +185,24 @@ def render_coding_instructions(
             "shorter is never the right trade.\n"
             "- Write or update tests when the task asks for them.\n"
             "- Keep the change as small as the task allows; stop when the goal is met."
+        ),
+        (
+            "Targeted 'replace' output limit:\n"
+            f"- Each 'replace' edit has a {edits.MAX_TARGETED_EDIT_PAYLOAD_BYTES}-byte "
+            "ceiling on the combined UTF-8 byte length of 'oldText' plus "
+            "'newText': len(oldText.encode('utf-8')) + "
+            "len(newText.encode('utf-8')).\n"
+            "- 'oldText' must identify the exact text being replaced. Use the "
+            "smallest sufficiently unique exact fragment; include only enough "
+            "surrounding text to make it occur once. Do not copy the entire file "
+            "into 'oldText'.\n"
+            "- Never use placeholder or ellipsis text such as "
+            "'// ... existing tests unchanged ...'. Placeholders do not preserve "
+            "content and are treated as literal replacement text.\n"
+            "- If a replacement cannot fit within this targeted limit, use "
+            "operation 'update' for an existing file or operation 'create' for a "
+            "new file and return its complete new contents, subject to the "
+            "whole-file byte limit listed below when one is provided."
         ),
     ]
     if path_output_limits:

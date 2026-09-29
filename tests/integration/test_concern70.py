@@ -990,7 +990,7 @@ def test_the_schema_advertises_the_targeted_operation():
 
 def test_the_edit_schema_version_records_the_contract_change():
     assert EDIT_SCHEMA_VERSION == "code-edits/3"
-    assert CODER_PROMPT_VERSION == "coder-prompt/2"
+    assert CODER_PROMPT_VERSION == "coder-prompt/3"
 
 
 # ===========================================================================
