@@ -1,0 +1,485 @@
+{
+  "canonical_backup": {
+    "metadata": "data/backups/orchestrator-20260929T215328Z-9f6fdd4a.json",
+    "path": "data/backups/orchestrator-20260929T215328Z-9f6fdd4a.dump",
+    "sha256": "e64a0e42fa4d7995794fb475d59f2fa6cbc691ad6ad3206abb818731b3a79bf8"
+  },
+  "derivation_rules": {
+    "ts109_run_number": "Assign 1..7 by evidenced chronological artifact order RUN-20260928-000004 through RUN-20260929-000002, cross-checked against surviving agent/TS-109-...-run1 through run7 refs.",
+    "ts109_run_terminal_state": "status/attempt/review_cycle/failure_reason/starting_commit/candidate_commit read from each run's surviving outcome.json and cross-checked before insert; never normalized from memory.",
+    "ts110_uuid": "UUIDv5 namespace 9b1b9d5b-1f77-4b43-9f35-9e8f0dff4b6d with name \"d98cb1e7-75e4-401a-8b21-d0965b0b3115:TS-110\"; synthetic and not claimed original.",
+    "task_fields": "title/instructions/complexity/risk/depends_on/files/limits extracted deterministically from workspace/tracestack-clean/build.tasks.yaml at insert time, not paraphrased."
+  },
+  "escalation": {
+    "evidence": {
+      "escalation_txt": "data/runs/RUN-20260929-000002/attempt-3-cycle-1/escalation.txt",
+      "fix_loop": "data/runs/RUN-20260929-000002/fix-loop.json"
+    },
+    "field_provenance": {
+      "human_commit": "DERIVED",
+      "id": "EVIDENCED",
+      "reason": "EVIDENCED",
+      "resolution": "MISSING",
+      "resolution_intent": "DERIVED",
+      "resolved_at": "MISSING",
+      "status": "DERIVED",
+      "summary": "EVIDENCED",
+      "task_id": "EVIDENCED",
+      "task_run_id": "EVIDENCED"
+    },
+    "human_commit": null,
+    "id": "fc9bf9b0-9683-41fa-aaa8-f8f53567b92a",
+    "identity_provenance": "EVIDENCED",
+    "reason": "RETRY_EXHAUSTED",
+    "resolution": null,
+    "resolution_intent": "COMPLETED_BY_HAND",
+    "resolved_at": null,
+    "status": "RESOLVED",
+    "summary_source": "data/runs/RUN-20260929-000002/attempt-3-cycle-1/escalation.txt",
+    "task_id": "006950fe-2cdf-4624-a40a-eb8e2f1c1e1d",
+    "task_run_id": "0a77bbb6-68ca-4e84-9572-5e37552387bf"
+  },
+  "expected_alembic_head": "e8a3c7f21d49",
+  "incident_id": "campaign-recovery-20260929-tracestack-clean",
+  "importer_source": "apps/orchestrator/services/reconstruction_importer.py",
+  "omitted_history": [
+    "model_runs",
+    "run_events",
+    "reviews",
+    "review_issues",
+    "verification_runs",
+    "training_examples",
+    "lessons",
+    "workflow_checkpoints",
+    "workflow_writes",
+    "exact original timestamps",
+    "execution ownership history",
+    "interim TS-109 escalations evidenced in artifacts but outside the approved minimum row set (RUN-20260928-000005 db31dd2e-b5f7-43e4-8b88-01bc82679f68, RUN-20260928-000006 311977f7-f466-4c96-b1f5-4e756f4d4708, RUN-20260928-000008 7206ec24-e542-4346-8bab-2ee4d98838f0, RUN-20260929-000001 da9e450b-09a3-41da-92d5-2de066c96cbf)",
+    "successful TS-101..TS-108 task run history (only the seven failed/escalated TS-109 runs are inside the approved row set)"
+  ],
+  "project": {
+    "external_project_id": "tracestack-clean",
+    "id": "d98cb1e7-75e4-401a-8b21-d0965b0b3115",
+    "identity_provenance": "EVIDENCED",
+    "name": "TraceStack",
+    "repository_path": "/home/darri/development-orchestrator/workspace/tracestack-clean",
+    "status": "REGISTERED"
+  },
+  "repository": {
+    "default_branch": "master",
+    "expected_integration_sha": "fc6abc579cee88f821c5f72f00162872b2dc8326",
+    "human_commit": "cbff2c4bd919b860c73e3cb061bccff11789c37a",
+    "integration_ref": "agent/integration",
+    "manifest_path": "workspace/tracestack-clean/build.tasks.yaml",
+    "path": "/home/darri/development-orchestrator/workspace/tracestack-clean",
+    "ts109_run_ref_pattern": "refs/heads/agent/TS-109-*-run[1-7]",
+    "ts109_run_ref_count_expected": 7
+  },
+  "schema_version": 1,
+  "statement": "RECONSTRUCTED STATE -- NOT ORIGINAL DATABASE HISTORY. Original PostgreSQL campaign history was lost; rows inserted from this manifest are reconstructed from surviving durable artifacts.",
+  "synthetic_identities": [
+    {
+      "classification": "SYNTHETIC",
+      "entity": "task",
+      "external_task_id": "TS-110",
+      "id": "4abc278d-57c4-515a-baef-874e1c89aa7a"
+    }
+  ],
+  "task_definition_source": {
+    "expected_task_ids": [
+      "TS-101",
+      "TS-102",
+      "TS-103",
+      "TS-104",
+      "TS-105",
+      "TS-106",
+      "TS-107",
+      "TS-108",
+      "TS-109",
+      "TS-110"
+    ],
+    "path": "workspace/tracestack-clean/build.tasks.yaml",
+    "source_project_id": "tracestack"
+  },
+  "tasks": [
+    {
+      "definition_source": "workspace/tracestack-clean/build.tasks.yaml",
+      "external_task_id": "TS-101",
+      "field_provenance": {
+        "definition": "EVIDENCED",
+        "id": "EVIDENCED",
+        "integrated_commit": "EVIDENCED",
+        "section": "DERIVED",
+        "status": "DERIVED"
+      },
+      "id": "9d70004c-1a2f-4249-b788-a4c3d59cb8c7",
+      "identity_provenance": "EVIDENCED",
+      "integrated_commit": "6d5de163856ee874655b3ae12bbc11bc8e071788",
+      "section": 1,
+      "status": "COMPLETE"
+    },
+    {
+      "definition_source": "workspace/tracestack-clean/build.tasks.yaml",
+      "external_task_id": "TS-102",
+      "field_provenance": {
+        "definition": "EVIDENCED",
+        "id": "EVIDENCED",
+        "integrated_commit": "EVIDENCED",
+        "section": "DERIVED",
+        "status": "DERIVED"
+      },
+      "id": "7d86b61d-4c5b-4546-9784-6ec4c1b17927",
+      "identity_provenance": "EVIDENCED",
+      "integrated_commit": "613f311eb0d0f4405fbd393449d563585db6b8a7",
+      "section": 2,
+      "status": "COMPLETE"
+    },
+    {
+      "definition_source": "workspace/tracestack-clean/build.tasks.yaml",
+      "external_task_id": "TS-103",
+      "field_provenance": {
+        "definition": "EVIDENCED",
+        "id": "EVIDENCED",
+        "integrated_commit": "EVIDENCED",
+        "section": "DERIVED",
+        "status": "DERIVED"
+      },
+      "id": "b0a78620-ff9a-4ab3-85af-84247810fd10",
+      "identity_provenance": "EVIDENCED",
+      "integrated_commit": "02b3342af528dc13e239f41685acde2c0e02bdab",
+      "section": 3,
+      "status": "COMPLETE"
+    },
+    {
+      "definition_source": "workspace/tracestack-clean/build.tasks.yaml",
+      "external_task_id": "TS-104",
+      "field_provenance": {
+        "definition": "EVIDENCED",
+        "id": "EVIDENCED",
+        "integrated_commit": "EVIDENCED",
+        "section": "DERIVED",
+        "status": "DERIVED"
+      },
+      "id": "8de351c3-ef37-418f-b88a-bc169a1812f5",
+      "identity_provenance": "EVIDENCED",
+      "integrated_commit": "f6eaa232767268571cfd6de2b25f2e34ed44226c",
+      "section": 4,
+      "status": "COMPLETE"
+    },
+    {
+      "definition_source": "workspace/tracestack-clean/build.tasks.yaml",
+      "external_task_id": "TS-105",
+      "field_provenance": {
+        "definition": "EVIDENCED",
+        "id": "EVIDENCED",
+        "integrated_commit": "EVIDENCED",
+        "section": "DERIVED",
+        "status": "DERIVED"
+      },
+      "id": "1cab29b9-1f45-4951-88f9-961780738bb4",
+      "identity_provenance": "EVIDENCED",
+      "integrated_commit": "a2e40f226146feb723658b5eae0c7dac3635cf7e",
+      "section": 5,
+      "status": "COMPLETE"
+    },
+    {
+      "definition_source": "workspace/tracestack-clean/build.tasks.yaml",
+      "external_task_id": "TS-106",
+      "field_provenance": {
+        "definition": "EVIDENCED",
+        "id": "EVIDENCED",
+        "integrated_commit": "EVIDENCED",
+        "section": "DERIVED",
+        "status": "DERIVED"
+      },
+      "id": "1f82323a-351b-4c31-b41d-a01fcc501e55",
+      "identity_provenance": "EVIDENCED",
+      "integrated_commit": "ae5b28dafd80a57c6ad1f2a85093645e05c06612",
+      "section": 6,
+      "status": "COMPLETE"
+    },
+    {
+      "definition_source": "workspace/tracestack-clean/build.tasks.yaml",
+      "external_task_id": "TS-107",
+      "field_provenance": {
+        "definition": "EVIDENCED",
+        "id": "EVIDENCED",
+        "integrated_commit": "EVIDENCED",
+        "section": "DERIVED",
+        "status": "DERIVED"
+      },
+      "id": "f37247b9-d84a-4701-95f5-af2f1638bd13",
+      "identity_provenance": "EVIDENCED",
+      "integrated_commit": "50f9b5b6917962068e7638a728a0bc1a6828f00f",
+      "section": 7,
+      "status": "COMPLETE"
+    },
+    {
+      "definition_source": "workspace/tracestack-clean/build.tasks.yaml",
+      "external_task_id": "TS-108",
+      "field_provenance": {
+        "definition": "EVIDENCED",
+        "id": "EVIDENCED",
+        "integrated_commit": "EVIDENCED",
+        "section": "DERIVED",
+        "status": "DERIVED"
+      },
+      "id": "f71b5250-8bc5-4c20-835c-328c94f81fab",
+      "identity_provenance": "EVIDENCED",
+      "integrated_commit": "fc6abc579cee88f821c5f72f00162872b2dc8326",
+      "section": 8,
+      "status": "COMPLETE"
+    },
+    {
+      "definition_source": "workspace/tracestack-clean/build.tasks.yaml",
+      "external_task_id": "TS-109",
+      "field_provenance": {
+        "definition": "EVIDENCED",
+        "id": "EVIDENCED",
+        "integrated_commit": "MISSING",
+        "section": "DERIVED",
+        "status": "DERIVED"
+      },
+      "id": "006950fe-2cdf-4624-a40a-eb8e2f1c1e1d",
+      "identity_provenance": "EVIDENCED",
+      "integrated_commit": null,
+      "section": 9,
+      "status": "COMPLETE"
+    },
+    {
+      "definition_source": "workspace/tracestack-clean/build.tasks.yaml",
+      "external_task_id": "TS-110",
+      "field_provenance": {
+        "definition": "EVIDENCED",
+        "id": "SYNTHETIC",
+        "integrated_commit": "MISSING",
+        "section": "DERIVED",
+        "status": "DERIVED"
+      },
+      "id": "4abc278d-57c4-515a-baef-874e1c89aa7a",
+      "identity_provenance": "SYNTHETIC",
+      "integrated_commit": null,
+      "section": 10,
+      "status": "READY"
+    }
+  ],
+  "ts109_runs": [
+    {
+      "artifact_path": "runs/RUN-20260928-000004",
+      "attempt_number": 2,
+      "candidate_commit": null,
+      "evidence": {
+        "fix_loop": "data/runs/RUN-20260928-000004/fix-loop.json",
+        "outcome": "data/runs/RUN-20260928-000004/outcome.json"
+      },
+      "external_run_id": "RUN-20260928-000004",
+      "failure_reason": "SCOPE_VIOLATION",
+      "field_provenance": {
+        "artifact_path": "DERIVED",
+        "attempt_number": "EVIDENCED",
+        "candidate_commit": "EVIDENCED",
+        "external_run_id": "EVIDENCED",
+        "failure_reason": "EVIDENCED",
+        "id": "EVIDENCED",
+        "review_cycle": "EVIDENCED",
+        "run_number": "DERIVED",
+        "starting_commit": "EVIDENCED",
+        "status": "EVIDENCED",
+        "task_id": "EVIDENCED"
+      },
+      "id": "25a2f61b-9f9f-4a59-82e9-0499037fb096",
+      "review_cycle": 0,
+      "run_number": 1,
+      "run_number_provenance": "DERIVED",
+      "starting_commit": "fc6abc579cee88f821c5f72f00162872b2dc8326",
+      "status": "FAILED",
+      "task_id": "006950fe-2cdf-4624-a40a-eb8e2f1c1e1d"
+    },
+    {
+      "artifact_path": "runs/RUN-20260928-000005",
+      "attempt_number": 3,
+      "candidate_commit": null,
+      "evidence": {
+        "fix_loop": "data/runs/RUN-20260928-000005/fix-loop.json",
+        "outcome": "data/runs/RUN-20260928-000005/outcome.json"
+      },
+      "external_run_id": "RUN-20260928-000005",
+      "failure_reason": "RETRY_EXHAUSTED",
+      "field_provenance": {
+        "artifact_path": "DERIVED",
+        "attempt_number": "EVIDENCED",
+        "candidate_commit": "EVIDENCED",
+        "external_run_id": "EVIDENCED",
+        "failure_reason": "EVIDENCED",
+        "id": "EVIDENCED",
+        "review_cycle": "EVIDENCED",
+        "run_number": "DERIVED",
+        "starting_commit": "EVIDENCED",
+        "status": "EVIDENCED",
+        "task_id": "EVIDENCED"
+      },
+      "id": "9760dfeb-3112-4b4f-b67f-5ae4daa7b2b1",
+      "review_cycle": 0,
+      "run_number": 2,
+      "run_number_provenance": "DERIVED",
+      "starting_commit": "fc6abc579cee88f821c5f72f00162872b2dc8326",
+      "status": "FAILED",
+      "task_id": "006950fe-2cdf-4624-a40a-eb8e2f1c1e1d"
+    },
+    {
+      "artifact_path": "runs/RUN-20260928-000006",
+      "attempt_number": 3,
+      "candidate_commit": null,
+      "evidence": {
+        "fix_loop": "data/runs/RUN-20260928-000006/fix-loop.json",
+        "outcome": "data/runs/RUN-20260928-000006/outcome.json"
+      },
+      "external_run_id": "RUN-20260928-000006",
+      "failure_reason": "RETRY_EXHAUSTED",
+      "field_provenance": {
+        "artifact_path": "DERIVED",
+        "attempt_number": "EVIDENCED",
+        "candidate_commit": "EVIDENCED",
+        "external_run_id": "EVIDENCED",
+        "failure_reason": "EVIDENCED",
+        "id": "EVIDENCED",
+        "review_cycle": "EVIDENCED",
+        "run_number": "DERIVED",
+        "starting_commit": "EVIDENCED",
+        "status": "EVIDENCED",
+        "task_id": "EVIDENCED"
+      },
+      "id": "9b02fdc5-aa38-46a4-b993-9046490a8e99",
+      "review_cycle": 0,
+      "run_number": 3,
+      "run_number_provenance": "DERIVED",
+      "starting_commit": "fc6abc579cee88f821c5f72f00162872b2dc8326",
+      "status": "FAILED",
+      "task_id": "006950fe-2cdf-4624-a40a-eb8e2f1c1e1d"
+    },
+    {
+      "artifact_path": "runs/RUN-20260928-000007",
+      "attempt_number": 2,
+      "candidate_commit": null,
+      "evidence": {
+        "fix_loop": "data/runs/RUN-20260928-000007/fix-loop.json",
+        "outcome": "data/runs/RUN-20260928-000007/outcome.json"
+      },
+      "external_run_id": "RUN-20260928-000007",
+      "failure_reason": "SCOPE_VIOLATION",
+      "field_provenance": {
+        "artifact_path": "DERIVED",
+        "attempt_number": "EVIDENCED",
+        "candidate_commit": "EVIDENCED",
+        "external_run_id": "EVIDENCED",
+        "failure_reason": "EVIDENCED",
+        "id": "EVIDENCED",
+        "review_cycle": "EVIDENCED",
+        "run_number": "DERIVED",
+        "starting_commit": "EVIDENCED",
+        "status": "EVIDENCED",
+        "task_id": "EVIDENCED"
+      },
+      "id": "eac296d6-f041-4fa3-abfd-44d1a15c4186",
+      "review_cycle": 0,
+      "run_number": 4,
+      "run_number_provenance": "DERIVED",
+      "starting_commit": "fc6abc579cee88f821c5f72f00162872b2dc8326",
+      "status": "FAILED",
+      "task_id": "006950fe-2cdf-4624-a40a-eb8e2f1c1e1d"
+    },
+    {
+      "artifact_path": "runs/RUN-20260928-000008",
+      "attempt_number": 3,
+      "candidate_commit": null,
+      "evidence": {
+        "fix_loop": "data/runs/RUN-20260928-000008/fix-loop.json",
+        "outcome": "data/runs/RUN-20260928-000008/outcome.json"
+      },
+      "external_run_id": "RUN-20260928-000008",
+      "failure_reason": "RETRY_EXHAUSTED",
+      "field_provenance": {
+        "artifact_path": "DERIVED",
+        "attempt_number": "EVIDENCED",
+        "candidate_commit": "EVIDENCED",
+        "external_run_id": "EVIDENCED",
+        "failure_reason": "EVIDENCED",
+        "id": "EVIDENCED",
+        "review_cycle": "EVIDENCED",
+        "run_number": "DERIVED",
+        "starting_commit": "EVIDENCED",
+        "status": "EVIDENCED",
+        "task_id": "EVIDENCED"
+      },
+      "id": "857cc797-cdad-424a-8aa6-0eb6beecee06",
+      "review_cycle": 0,
+      "run_number": 5,
+      "run_number_provenance": "DERIVED",
+      "starting_commit": "fc6abc579cee88f821c5f72f00162872b2dc8326",
+      "status": "FAILED",
+      "task_id": "006950fe-2cdf-4624-a40a-eb8e2f1c1e1d"
+    },
+    {
+      "artifact_path": "runs/RUN-20260929-000001",
+      "attempt_number": 3,
+      "candidate_commit": null,
+      "evidence": {
+        "fix_loop": "data/runs/RUN-20260929-000001/fix-loop.json",
+        "outcome": "data/runs/RUN-20260929-000001/outcome.json"
+      },
+      "external_run_id": "RUN-20260929-000001",
+      "failure_reason": "RETRY_EXHAUSTED",
+      "field_provenance": {
+        "artifact_path": "DERIVED",
+        "attempt_number": "EVIDENCED",
+        "candidate_commit": "EVIDENCED",
+        "external_run_id": "EVIDENCED",
+        "failure_reason": "EVIDENCED",
+        "id": "EVIDENCED",
+        "review_cycle": "EVIDENCED",
+        "run_number": "DERIVED",
+        "starting_commit": "EVIDENCED",
+        "status": "EVIDENCED",
+        "task_id": "EVIDENCED"
+      },
+      "id": "23fa67a0-072f-4ca4-8ac9-4ccd903ffaea",
+      "review_cycle": 1,
+      "run_number": 6,
+      "run_number_provenance": "DERIVED",
+      "starting_commit": "fc6abc579cee88f821c5f72f00162872b2dc8326",
+      "status": "FAILED",
+      "task_id": "006950fe-2cdf-4624-a40a-eb8e2f1c1e1d"
+    },
+    {
+      "artifact_path": "runs/RUN-20260929-000002",
+      "attempt_number": 3,
+      "candidate_commit": null,
+      "evidence": {
+        "fix_loop": "data/runs/RUN-20260929-000002/fix-loop.json",
+        "outcome": "data/runs/RUN-20260929-000002/outcome.json"
+      },
+      "external_run_id": "RUN-20260929-000002",
+      "failure_reason": "RETRY_EXHAUSTED",
+      "field_provenance": {
+        "artifact_path": "DERIVED",
+        "attempt_number": "EVIDENCED",
+        "candidate_commit": "EVIDENCED",
+        "external_run_id": "EVIDENCED",
+        "failure_reason": "EVIDENCED",
+        "id": "EVIDENCED",
+        "review_cycle": "EVIDENCED",
+        "run_number": "DERIVED",
+        "starting_commit": "EVIDENCED",
+        "status": "EVIDENCED",
+        "task_id": "EVIDENCED"
+      },
+      "id": "0a77bbb6-68ca-4e84-9572-5e37552387bf",
+      "review_cycle": 0,
+      "run_number": 7,
+      "run_number_provenance": "DERIVED",
+      "starting_commit": "fc6abc579cee88f821c5f72f00162872b2dc8326",
+      "status": "FAILED",
+      "task_id": "006950fe-2cdf-4624-a40a-eb8e2f1c1e1d"
+    }
+  ]
+}
