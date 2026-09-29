@@ -183,6 +183,7 @@ def assert_test_database_safe(
         "lock_",
         "recover_",
         "settle_",
+        "verify_",
         "c64_",
         "c65_",
         "c67_",

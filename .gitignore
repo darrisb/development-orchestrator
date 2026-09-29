@@ -7,6 +7,7 @@ __pycache__/
 *.egg-info/
 workspace/*
 data/artifacts/*
+data/backups/*
 data/runs/*
 data/training/*
 !data/**/.gitkeep

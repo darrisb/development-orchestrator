@@ -226,6 +226,58 @@ harness creates and drops schema. Never point `TEST_DATABASE_URL` at the
 runtime `orchestrator` database. Use a dedicated test database like
 `orchestrator_test` or a database name starting with `test_`.
 
+## Database backups
+
+The runtime PostgreSQL database is backed up with `pg_dump` custom format into
+`data/backups/`. Backups are host files, not rows in the database they protect.
+The dump contains database contents only; the database password is passed to
+PostgreSQL tools through `PGPASSWORD` and is not written to the command line,
+metadata, or backup file by the backup script.
+
+Create a runtime backup:
+
+```bash
+./scripts/dev.sh backup
+```
+
+Verify a backup by restoring it into an isolated disposable database:
+
+```bash
+./scripts/dev.sh verify-backup data/backups/orchestrator-YYYYMMDDTHHMMSSZ-xxxxxxxx.dump
+```
+
+**A BACKUP IS NOT A VERIFIED RECOVERY POINT UNTIL RESTORE VERIFICATION
+SUCCEEDS.** The backup command writes a `.dump` and adjacent `.json` metadata,
+but `verified_at` remains `null` until `verify-backup` restores the dump,
+checks the schema, checks the Alembic revision, compares recorded row counts,
+and drops the disposable `verify_*` database through the Concern 74 safety
+guard.
+
+The metadata records creation time, source database identity, source revision,
+dirty flag, Alembic revision, PostgreSQL version, backup filename, size,
+SHA-256 checksum, row counts, and restore-check results after verification.
+Use the checksum in the metadata to confirm a copied backup is byte-for-byte the
+same file.
+
+Retention is deliberately simple for this development deployment: keep the
+latest seven verified backups. Unverified backups never evict a verified
+recovery point, and retention never deletes the only known-good verified
+backup.
+
+Recommended schedule: run `./scripts/dev.sh backup` daily, followed immediately
+by `./scripts/dev.sh verify-backup <new dump>`. A cron entry on the host is
+enough; do not add a scheduler to the application just to run backups.
+
+Disaster recovery is an operator action, not the default verification path.
+Routine verification always restores into a disposable database and must never
+overwrite `orchestrator`. If the runtime database is genuinely lost, first
+choose the newest backup whose metadata has `verified_at` set, stop the
+orchestrator, create a fresh runtime database, and manually run `pg_restore`
+against `orchestrator` only after confirming the target is the intended runtime
+database. Then run Alembic/health checks before resuming work. Do not use
+`verify-backup` for runtime overwrite restoration; its job is proof of
+recoverability, not disaster execution.
+
 ## Managing a project
 
 Each managed repository carries a `build.tasks.yaml` manifest (build.md

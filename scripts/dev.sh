@@ -12,6 +12,8 @@ case "${1:-help}" in
   test)    "$VENV/bin/python" -m pytest "${@:2}" ;;
   lint)    "$VENV/bin/ruff" check . "${@:2}" ;;
   migrate) "$VENV/bin/alembic" upgrade head ;;
+  backup)  "$VENV/bin/python" scripts/database_backup.py backup "${@:2}" ;;
+  verify-backup) "$VENV/bin/python" scripts/database_backup.py verify-restore "${@:2}" ;;
   revision)
     [ -n "${2:-}" ] || { echo "usage: dev.sh revision <message>" >&2; exit 2; }
     "$VENV/bin/alembic" revision --autogenerate -m "$2"
@@ -29,7 +31,7 @@ case "${1:-help}" in
     "$VENV/bin/uvicorn" apps.orchestrator.main:app --reload --port "${PORT:-8000}"
     ;;
   *)
-    echo "usage: dev.sh {setup|test|lint|migrate|revision <msg>|workers [profile...]|serve}" >&2
+    echo "usage: dev.sh {setup|test|lint|migrate|backup|verify-backup <dump>|revision <msg>|workers [profile...]|serve}" >&2
     exit 2
     ;;
 esac
