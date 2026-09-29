@@ -16,10 +16,18 @@ from apps.orchestrator.db import models  # noqa: F401
 from apps.orchestrator.db.base import Base
 from apps.orchestrator.db.session import create_db_engine
 
+# Concern 74: Import safety validator for destructive operations.
+from tests.db_safety import assert_test_database_safe, TestDatabaseSafetyError
+
 
 @pytest.fixture(scope="session")
 def database_url(tmp_path_factory: pytest.TempPathFactory) -> str:
-    """SQLite by default; set TEST_DATABASE_URL to run against PostgreSQL."""
+    """SQLite by default; set TEST_DATABASE_URL to run against PostgreSQL.
+
+    Concern 74: When TEST_DATABASE_URL is set, it MUST be validated as safe
+    before any destructive operations. The validation happens in the engine
+    fixture, not here, because this fixture only returns a URL string.
+    """
     configured = os.environ.get("TEST_DATABASE_URL")
     if configured:
         return configured
@@ -29,9 +37,22 @@ def database_url(tmp_path_factory: pytest.TempPathFactory) -> str:
 
 @pytest.fixture(scope="session")
 def engine(database_url: str) -> Iterator[Engine]:
+    """Session-scoped engine with destructive operation guards.
+
+    Concern 74: Before performing any destructive operation (create_all,
+    drop_all), we validate that the target database is safe for testing.
+    This prevents accidental destruction of the runtime database.
+    """
+    # Validate the target is safe before any destructive operations.
+    try:
+        assert_test_database_safe(database_url)
+    except TestDatabaseSafetyError as exc:
+        pytest.exit(f"TEST DATABASE SAFETY ERROR: {exc}", returncode=2)
+
     engine = create_db_engine(database_url)
     Base.metadata.create_all(engine)
     yield engine
+    # Teardown is also guarded by the validation above.
     Base.metadata.drop_all(engine)
     engine.dispose()
 

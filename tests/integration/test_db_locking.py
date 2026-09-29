@@ -30,6 +30,11 @@ from apps.orchestrator.config.settings import Settings
 from apps.orchestrator.db import models  # noqa: F401
 from apps.orchestrator.db.base import Base
 from apps.orchestrator.db.session import create_db_engine
+
+# Concern 74: Safety guard for destructive operations.
+from tests.db_safety import assert_test_database_safe
+from apps.orchestrator.db.base import Base
+from apps.orchestrator.db.session import create_db_engine
 from apps.orchestrator.domain.models import Project, Task, TaskRun
 from apps.orchestrator.repositories import (
     ProjectRepository,
@@ -106,6 +111,8 @@ def lock_database(lock_settings: Settings) -> Iterator[str]:
 def lock_engine(
     lock_database: str, lock_settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[Engine]:
+    # Concern 74: Validate the scratch database is safe before destructive ops.
+    assert_test_database_safe(lock_database)
     monkeypatch.setattr("apps.orchestrator.db.session.get_settings", lambda: lock_settings)
     engine = create_db_engine(lock_database)
     Base.metadata.create_all(engine)

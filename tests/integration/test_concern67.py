@@ -123,6 +123,8 @@ from apps.orchestrator.services.run_recovery import (
 from apps.orchestrator.services.runs import create_run
 from apps.orchestrator.services.workspace import workspace_path
 from tests.conftest import run_git
+# Concern 74: Safety guard for destructive operations.
+from tests.db_safety import assert_test_database_safe
 
 # =============================================================================
 # 0. The durable signature of RUN-20260928-000005, rebuilt honestly.
@@ -1843,6 +1845,8 @@ class PgSignature:
 @pytest.fixture
 def pg_signature(tmp_path: Path) -> Iterator[PgSignature]:
     with _scratch_postgres() as url:
+        # Concern 74: Validate the scratch database is safe before destructive ops.
+        assert_test_database_safe(url)
         engine = create_db_engine(url)
         Base.metadata.create_all(engine)
         factory = sessionmaker(bind=engine, expire_on_commit=False)

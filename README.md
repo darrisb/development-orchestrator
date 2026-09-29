@@ -217,9 +217,14 @@ a test convenience only; PostgreSQL is the supported runtime backend. To run
 the tests against PostgreSQL instead:
 
 ```bash
-TEST_DATABASE_URL=postgresql+psycopg://orchestrator:orchestrator@localhost:5432/orchestrator \
+TEST_DATABASE_URL=postgresql+psycopg://orchestrator:orchestrator@localhost:5432/orchestrator_test \
   ./scripts/dev.sh test
 ```
+
+**WARNING:** Test fixtures are destructive to their target database. The test
+harness creates and drops schema. Never point `TEST_DATABASE_URL` at the
+runtime `orchestrator` database. Use a dedicated test database like
+`orchestrator_test` or a database name starting with `test_`.
 
 ## Managing a project
 

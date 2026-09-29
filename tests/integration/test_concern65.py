@@ -110,6 +110,8 @@ from apps.orchestrator.services.workspace import prepare_workspace
 from apps.orchestrator.workflow import WorkflowRunner
 from apps.orchestrator.workflow.recovery import inspect_incomplete_runs
 from tests.conftest import run_git
+# Concern 74: Safety guard for destructive operations.
+from tests.db_safety import assert_test_database_safe
 from tests.integration.test_fix_loop import (
     PYTHON,
     STUB,
@@ -1416,6 +1418,8 @@ def scratch_postgres() -> Iterator[tuple[str, Engine, sessionmaker]]:
     it rather than substituting a session of its own.
     """
     with _scratch_postgres() as url:
+        # Concern 74: Validate the scratch database is safe before destructive ops.
+        assert_test_database_safe(url)
         engine = create_db_engine(url)
         Base.metadata.create_all(engine)
         try:
