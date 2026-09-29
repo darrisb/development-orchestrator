@@ -110,8 +110,13 @@ from apps.orchestrator.services.workspace import prepare_workspace
 from apps.orchestrator.workflow import WorkflowRunner
 from apps.orchestrator.workflow.recovery import inspect_incomplete_runs
 from tests.conftest import run_git
+
 # Concern 74: Safety guard for destructive operations.
-from tests.db_safety import assert_test_database_safe
+from tests.db_safety import (
+    assert_test_database_safe,
+    drop_all_tables_for_test,
+    drop_test_database,
+)
 from tests.integration.test_fix_loop import (
     PYTHON,
     STUB,
@@ -1396,14 +1401,7 @@ def _scratch_postgres() -> Iterator[str]:
     try:
         yield server.rsplit("/", 1)[0] + f"/{name}"
     finally:
-        with admin.connect() as connection:
-            connection.execute(
-                text(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = :name"
-                ),
-                {"name": name},
-            )
-            connection.execute(text(f'DROP DATABASE IF EXISTS "{name}"'))
+        drop_test_database(server, name)
         admin.dispose()
 
 
@@ -1425,7 +1423,7 @@ def scratch_postgres() -> Iterator[tuple[str, Engine, sessionmaker]]:
         try:
             yield url, engine, sessionmaker(bind=engine, expire_on_commit=False)
         finally:
-            Base.metadata.drop_all(engine)
+            drop_all_tables_for_test(engine, url)
             engine.dispose()
 
 

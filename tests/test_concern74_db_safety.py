@@ -11,13 +11,20 @@ destructive SQL.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from tests.db_safety import (
     DatabaseIdentity,
     TestDatabaseSafetyError,
     assert_test_database_safe,
+    drop_all_tables_for_test,
+    drop_test_database,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestDatabaseIdentityParsing:
@@ -229,3 +236,55 @@ class TestPortComparison:
         runtime_url = "postgresql://u:p@localhost:5432/test_db"
         with pytest.raises(TestDatabaseSafetyError):
             assert_test_database_safe(test_url, runtime_url=runtime_url)
+
+
+class TestTeardownGuards:
+    """Teardown must revalidate immediately before destructive operations."""
+
+    def test_drop_all_refuses_unsafe_target_before_destructive_call(self, monkeypatch):
+        called = False
+
+        def drop_all(_engine):
+            nonlocal called
+            called = True
+
+        from apps.orchestrator.db.base import Base
+
+        monkeypatch.setattr(Base.metadata, "drop_all", drop_all)
+
+        with pytest.raises(TestDatabaseSafetyError, match="runtime database"):
+            drop_all_tables_for_test(
+                object(),
+                "postgresql://u:p@localhost:5432/orchestrator",
+            )
+
+        assert called is False
+
+    def test_drop_database_refuses_unsafe_target_before_engine_creation(
+        self, monkeypatch
+    ):
+        def create_engine(*_args, **_kwargs):
+            raise AssertionError("create_engine must not be reached")
+
+        import sqlalchemy
+
+        monkeypatch.setattr(sqlalchemy, "create_engine", create_engine)
+
+        with pytest.raises(TestDatabaseSafetyError, match="runtime database"):
+            drop_test_database(
+                "postgresql://u:p@localhost:5432/postgres",
+                "orchestrator",
+            )
+
+
+class TestReadmeDatabaseSafety:
+    """The documented PostgreSQL test command must not point at runtime DB."""
+
+    def test_readme_test_database_url_example_is_safe(self):
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        match = re.search(r"TEST_DATABASE_URL=([^ \\\n]+)", readme)
+
+        assert match is not None
+        assert match.group(1).endswith("/orchestrator_test")
+        assert not match.group(1).endswith("/orchestrator")
+        assert_test_database_safe(match.group(1))

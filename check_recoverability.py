@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Check recoverability for TS-109 RUN 6."""
 
-import sys
 import json
 from uuid import UUID
+
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
@@ -37,7 +37,7 @@ def main():
             print(f"ERROR: Run {RUN_ID} not found")
             return
         
-        print(f"\n--- RUN DETAILS ---")
+        print("\n--- RUN DETAILS ---")
         print(f"Run ID: {run.id}")
         print(f"External Run ID: {run.external_run_id}")
         print(f"Run Number: {run.run_number}")
@@ -58,7 +58,7 @@ def main():
             WHERE id = :task_id
         """), {"task_id": str(TASK_ID)}).fetchone()
         
-        print(f"\n--- TASK DETAILS ---")
+        print("\n--- TASK DETAILS ---")
         print(f"Task ID: {task.id}")
         print(f"External Task ID: {task.external_task_id}")
         print(f"Task Status: {task.status}")
@@ -73,7 +73,7 @@ def main():
             ORDER BY run_number
         """), {"task_id": str(TASK_ID)}).fetchall()
         
-        print(f"\n--- ALL RUNS FOR TS-109 ---")
+        print("\n--- ALL RUNS FOR TS-109 ---")
         for r in runs:
             print(f"  RUN #{r.run_number}: {r.external_run_id} - Status: {r.status}, "
                   f"Attempt: {r.attempt_number}, Gen: {r.execution_generation}, "
@@ -88,7 +88,7 @@ def main():
             ORDER BY attempt, created_at
         """), {"run_id": str(RUN_ID)}).fetchall()
         
-        print(f"\n--- MODEL CALLS FOR RUN 6 ---")
+        print("\n--- MODEL CALLS FOR RUN 6 ---")
         for mc in model_calls:
             print(f"  Attempt {mc.attempt}: {mc.purpose} - {mc.provider}/{mc.model}")
             print(f"    Status: {mc.status}, Error: {mc.error_type}")
@@ -103,9 +103,10 @@ def main():
             ORDER BY created_at
         """), {"run_id": str(RUN_ID)}).fetchall()
         
-        print(f"\n--- RUN EVENTS ---")
+        print("\n--- RUN EVENTS ---")
         for e in events:
-            print(f"  {e.event_type} (attempt {e.attempt}): {json.dumps(e.payload, indent=2)[:200]}...")
+            payload = json.dumps(e.payload, indent=2)[:200]
+            print(f"  {e.event_type} (attempt {e.attempt}): {payload}...")
         
         # Check workflow checkpoints
         checkpoints = session.execute(text("""
@@ -116,7 +117,7 @@ def main():
             LIMIT 5
         """), {"run_id": str(RUN_ID)}).fetchall()
         
-        print(f"\n--- WORKFLOW CHECKPOINTS ---")
+        print("\n--- WORKFLOW CHECKPOINTS ---")
         for cp in checkpoints:
             print(f"  {cp.checkpoint_id} - {cp.created_at}")
         
@@ -127,7 +128,7 @@ def main():
             WHERE task_run_id = :run_id AND attempt >= 2
         """), {"run_id": str(RUN_ID)}).fetchone()
         
-        print(f"\n--- ATTEMPT 2+ EVIDENCE ---")
+        print("\n--- ATTEMPT 2+ EVIDENCE ---")
         print(f"Model calls with attempt >= 2: {attempt2_calls.cnt}")
         
         # Check for edit applications
@@ -165,7 +166,7 @@ def main():
             ORDER BY run_number
         """)).fetchall()
         
-        print(f"\n--- TS-110 STATE ---")
+        print("\n--- TS-110 STATE ---")
         if ts110_runs:
             for r in ts110_runs:
                 print(f"  {r.external_run_id}: {r.status}")
@@ -179,8 +180,8 @@ def main():
             WHERE task_id = :task_id AND run_number = 6
         """), {"task_id": str(TASK_ID)}).fetchone()
         
-        print(f"\n--- INTEGRATION ---")
-        print(f"Expected integration: fc6abc579cee88f821c5f72f00162872b2dc8326")
+        print("\n--- INTEGRATION ---")
+        print("Expected integration: fc6abc579cee88f821c5f72f00162872b2dc8326")
         print(f"Run starting commit: {integration.starting_commit if integration else 'N/A'}")
         
         session.close()

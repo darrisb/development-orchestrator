@@ -30,11 +30,6 @@ from apps.orchestrator.config.settings import Settings
 from apps.orchestrator.db import models  # noqa: F401
 from apps.orchestrator.db.base import Base
 from apps.orchestrator.db.session import create_db_engine
-
-# Concern 74: Safety guard for destructive operations.
-from tests.db_safety import assert_test_database_safe
-from apps.orchestrator.db.base import Base
-from apps.orchestrator.db.session import create_db_engine
 from apps.orchestrator.domain.models import Project, Task, TaskRun
 from apps.orchestrator.repositories import (
     ProjectRepository,
@@ -42,6 +37,13 @@ from apps.orchestrator.repositories import (
     TaskRunRepository,
 )
 from apps.orchestrator.services.errors import LockWaitTimeout
+
+# Concern 74: Safety guard for destructive operations.
+from tests.db_safety import (
+    assert_test_database_safe,
+    drop_all_tables_for_test,
+    drop_test_database,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -95,15 +97,7 @@ def lock_database(lock_settings: Settings) -> Iterator[str]:
     try:
         yield url
     finally:
-        with admin.connect() as connection:
-            connection.execute(
-                text(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                    "WHERE datname = :name"
-                ),
-                {"name": name},
-            )
-            connection.execute(text(f'DROP DATABASE IF EXISTS "{name}"'))
+        drop_test_database(server, name)
         admin.dispose()
 
 
@@ -117,7 +111,7 @@ def lock_engine(
     engine = create_db_engine(lock_database)
     Base.metadata.create_all(engine)
     yield engine
-    Base.metadata.drop_all(engine)
+    drop_all_tables_for_test(engine, lock_database)
     engine.dispose()
 
 

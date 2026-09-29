@@ -62,6 +62,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -133,6 +134,7 @@ from apps.orchestrator.services.workspace import workspace_path
 from apps.orchestrator.workflow import WorkflowRunner
 from apps.orchestrator.workflow.checkpoints import SqlAlchemyCheckpointSaver
 from tests.conftest import run_git
+from tests.db_safety import drop_test_database
 
 # =============================================================================
 # 0. Providers that fail the test if they are asked anything.
@@ -804,7 +806,8 @@ async def test_the_settlement_keeps_the_same_task_run(settled: Settled):
     # The external identity the earlier run never needed and this one allocated
     # on its first artifact write. Unchanged by the settlement, which is the
     # claim: an operator who asks about RUN-... afterwards finds the same run.
-    assert run.external_run_id == "RUN-20260928-000001"
+    assert run.external_run_id is not None
+    assert re.fullmatch(r"RUN-\d{8}-000001", run.external_run_id)
     assert len(runs_of_task) == 2
     assert total == 2
 
@@ -1312,15 +1315,7 @@ def _scratch_postgres() -> Iterator[str]:
     try:
         yield server.rsplit("/", 1)[0] + f"/{name}"
     finally:
-        with admin.connect() as connection:
-            connection.execute(
-                text(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                    "WHERE datname = :name"
-                ),
-                {"name": name},
-            )
-            connection.execute(text(f'DROP DATABASE IF EXISTS "{name}"'))
+        drop_test_database(server, name)
         admin.dispose()
 
 

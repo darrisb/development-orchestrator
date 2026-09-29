@@ -123,8 +123,12 @@ from apps.orchestrator.services.run_recovery import (
 from apps.orchestrator.services.runs import create_run
 from apps.orchestrator.services.workspace import workspace_path
 from tests.conftest import run_git
+
 # Concern 74: Safety guard for destructive operations.
-from tests.db_safety import assert_test_database_safe
+from tests.db_safety import (
+    assert_test_database_safe,
+    drop_test_database,
+)
 
 # =============================================================================
 # 0. The durable signature of RUN-20260928-000005, rebuilt honestly.
@@ -1820,15 +1824,7 @@ def _scratch_postgres() -> Iterator[str]:
     try:
         yield server.rsplit("/", 1)[0] + f"/{name}"
     finally:
-        with admin.connect() as connection:
-            connection.execute(
-                text(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                    "WHERE datname = :name"
-                ),
-                {"name": name},
-            )
-            connection.execute(text(f'DROP DATABASE IF EXISTS "{name}"'))
+        drop_test_database(server, name)
         admin.dispose()
 
 

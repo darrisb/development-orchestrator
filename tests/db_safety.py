@@ -182,6 +182,7 @@ def assert_test_database_safe(
         "race_",
         "lock_",
         "recover_",
+        "settle_",
         "c64_",
         "c65_",
         "c67_",
@@ -238,6 +239,16 @@ def assert_test_database_safe(
         )
 
     return test_identity
+
+
+def drop_all_tables_for_test(engine, database_url: str | None = None) -> None:
+    """Drop all mapped tables after revalidating the actual teardown target."""
+    from apps.orchestrator.db.base import Base
+
+    if database_url is None:
+        database_url = engine.url.render_as_string(hide_password=False)
+    assert_test_database_safe(database_url)
+    Base.metadata.drop_all(engine)
 
 
 def get_safe_test_database_url(

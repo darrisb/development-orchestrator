@@ -17,7 +17,11 @@ from apps.orchestrator.db.base import Base
 from apps.orchestrator.db.session import create_db_engine
 
 # Concern 74: Import safety validator for destructive operations.
-from tests.db_safety import assert_test_database_safe, TestDatabaseSafetyError
+from tests.db_safety import (
+    TestDatabaseSafetyError,
+    assert_test_database_safe,
+    drop_all_tables_for_test,
+)
 
 
 @pytest.fixture(scope="session")
@@ -52,8 +56,7 @@ def engine(database_url: str) -> Iterator[Engine]:
     engine = create_db_engine(database_url)
     Base.metadata.create_all(engine)
     yield engine
-    # Teardown is also guarded by the validation above.
-    Base.metadata.drop_all(engine)
+    drop_all_tables_for_test(engine, database_url)
     engine.dispose()
 
 
