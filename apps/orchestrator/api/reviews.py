@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from ..db.session import get_db
 from ..schemas.reviews import (
     EscalationResponse,
+    ReconcileHumanCommitRequest,
     ResolveEscalationRequest,
     ReviewResponse,
 )
@@ -48,5 +49,30 @@ def resolve_escalation(
             resolution=payload.resolution,
             status=payload.status,
             option_key=payload.option_key,
+            human_commit=payload.human_commit,
+        )
+    )
+
+
+@router.post(
+    "/escalations/{escalation_id}/reconcile-human-commit",
+    response_model=EscalationResponse,
+)
+def reconcile_human_commit(
+    escalation_id: UUID,
+    payload: ReconcileHumanCommitRequest,
+    session: Session = Depends(get_db),
+) -> EscalationResponse:
+    """Reconcile a historical COMPLETED_BY_HAND escalation with a human commit.
+
+    For escalations resolved before concern 73, where the human commit was not
+    recorded or integrated. This endpoint integrates the commit through the
+    canonical mechanism and updates the escalation record.
+    """
+    return EscalationResponse.from_domain(
+        review_service.reconcile_human_commit(
+            session,
+            escalation_id,
+            human_commit=payload.human_commit,
         )
     )

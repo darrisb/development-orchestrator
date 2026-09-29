@@ -757,11 +757,230 @@ def _escalate_integration(
     return escalation
 
 
+def integrate_human_commit(
+    session: Session,
+    project: Project,
+    task: Task,
+    commit_sha: str,
+    *,
+    task_run_id: UUID | None = None,
+    settings: Settings | None = None,
+) -> Integration:
+    """Merge a human-produced commit into the baseline (concern 73).
+
+    Used when an operator resolves a ``COMPLETED_BY_HAND`` escalation with a
+    Git commit. The commit is validated, merged, and verified through the same
+    cumulative gate as an automated candidate. If the merge or verification
+    fails, the function raises so the caller can roll back the escalation
+    resolution.
+
+    Raises:
+        EntityNotFound: the commit does not exist in the repository.
+        MergeConflict: the commit cannot be merged into the baseline.
+        EntityConflict: cumulative verification failed.
+        GitError: the repository itself could not be operated on.
+    """
+    from .errors import EntityNotFound
+
+    config = settings or get_settings()
+    repository = GitService(
+        project.repository_path,
+        default_branch=project.default_branch,
+        settings=config,
+    )
+
+    try:
+        repository.resolve_sha(commit_sha)
+    except Exception as exc:
+        raise EntityNotFound(
+            "Commit", f"{commit_sha} in repository {project.repository_path}"
+        ) from exc
+
+    previous = ensure_integration_branch(repository, project)
+
+    if repository.contains_commit(commit_sha, ref=INTEGRATION_BRANCH):
+        TaskRepository(session).record_integration(task.id, unintegrated_commit=None)
+        if task_run_id is not None:
+            RunEventRepository(session).append(
+                RunEvent(
+                    task_run_id=task_run_id,
+                    project_id=project.id,
+                    task_id=task.id,
+                    event_type=RunEventType.INTEGRATION_ADVANCED,
+                    attempt=1,
+                    payload={
+                        "branch": INTEGRATION_BRANCH,
+                        "previous_sha": previous,
+                        "baseline_sha": previous,
+                        "candidate_sha": commit_sha,
+                        "integrated_sha": commit_sha,
+                        "resolved_by": "operator",
+                        "provenance": "human",
+                        "commands_run": 0,
+                    },
+                )
+            )
+        logger.info(
+            "human_commit_already_integrated",
+            task=task.external_task_id,
+            commit_sha=commit_sha,
+            baseline_sha=previous,
+        )
+        return Integration(
+            advanced=True,
+            previous_sha=previous,
+            baseline_sha=previous,
+            merged_sha=None,
+            integrated_sha=commit_sha,
+        )
+
+    worktree = _integration_worktree(repository, project, previous, config=config)
+    try:
+        merged = worktree.merge(
+            commit_sha,
+            message=(
+                f"Integrate {task.external_task_id}: {task.title}\n\n"
+                f"Human commit {commit_sha} integrated by operator."
+            ),
+        )
+    except MergeConflict as conflict:
+        raise MergeConflict(conflict.path, conflict.paths) from None
+
+    failed, ran = _verify_cumulative_human(
+        session,
+        project,
+        task,
+        task_run_id,
+        worktree_path=worktree.path,
+        settings=config,
+    )
+    if failed:
+        raise EntityConflict(
+            f"Human commit {commit_sha} failed cumulative verification: "
+            f"{', '.join(failed)}"
+        )
+
+    advanced = repository.force_branch(INTEGRATION_BRANCH, merged)
+    TaskRepository(session).record_integration(task.id, unintegrated_commit=None)
+    if task_run_id is not None:
+        RunEventRepository(session).append(
+            RunEvent(
+                task_run_id=task_run_id,
+                project_id=project.id,
+                task_id=task.id,
+                event_type=RunEventType.INTEGRATION_ADVANCED,
+                attempt=1,
+                payload={
+                    "branch": INTEGRATION_BRANCH,
+                    "previous_sha": previous,
+                    "baseline_sha": advanced,
+                    "candidate_sha": commit_sha,
+                    "integrated_sha": commit_sha,
+                    "provenance": "human",
+                    "commands_run": ran,
+                },
+            )
+        )
+    logger.info(
+        "human_commit_integrated",
+        task=task.external_task_id,
+        commit_sha=commit_sha,
+        previous_sha=previous,
+        baseline_sha=advanced,
+        commands_run=ran,
+    )
+    return Integration(
+        advanced=True,
+        previous_sha=previous,
+        baseline_sha=advanced,
+        merged_sha=merged,
+        commands_run=ran,
+        integrated_sha=commit_sha,
+    )
+
+
+def _verify_cumulative_human(
+    session: Session,
+    project: Project,
+    task: Task,
+    task_run_id: UUID | None,
+    *,
+    worktree_path: Path,
+    settings: Settings,
+) -> tuple[tuple[str, ...], int]:
+    """Run cumulative verification for a human commit.
+
+    Similar to ``_verify_cumulative`` but does not require a TaskRun. If
+    ``task_run_id`` is None, verification runs are not recorded but the
+    commands still execute.
+    """
+    profile = project.verification
+    if profile.is_empty:
+        logger.warning(
+            "cumulative_verification_skipped",
+            project_id=str(project.id),
+            task=task.external_task_id,
+            detail="the project declares no verification commands",
+        )
+        return (), 0
+
+    types = {
+        category: _INTEGRATION_TYPES.get(category, VerificationType.INTEGRATION_TESTS)
+        for category in COMMAND_CATEGORIES
+    }
+    verifications = VerificationRunRepository(session) if task_run_id else None
+    failures: list[str] = []
+    ran = 0
+    with worker_session(
+        worktree_path, profile=project.worker_profile, settings=settings
+    ) as worker:
+        for category in COMMAND_CATEGORIES:
+            commands = profile.commands_for(category)
+            if not commands:
+                continue
+            executions = execute_commands(
+                session,
+                worker,
+                task_run_id,
+                commands,
+                category=f"integration-{category.value.casefold()}",
+                prefix="integration/",
+                settings=settings,
+                stop_on_failure=True,
+                record_logs=True,
+            )
+            ran += len(executions)
+            for execution in executions:
+                if verifications is not None:
+                    verifications.add(
+                        VerificationRun(
+                            task_run_id=task_run_id,
+                            verification_type=types[category],
+                            command=execution.result.command.source,
+                            status=(
+                                VerificationStatus.PASSED
+                                if execution.succeeded
+                                else VerificationStatus.FAILED
+                            ),
+                            exit_code=execution.result.exit_code,
+                            stdout_artifact=execution.log_artifact,
+                            duration_ms=execution.result.duration_ms,
+                        )
+                    )
+                if not execution.succeeded:
+                    failures.append(execution.result.command.source)
+            if failures:
+                break
+    session.flush()
+    return tuple(failures), ran
+
+
 __all__ = [
     "INTEGRATION_ESCALATION_ARTIFACT",
     "Integration",
     "ensure_integration_branch",
     "integrate_candidate",
+    "integrate_human_commit",
     "integration_baseline",
     "integration_worktree_path",
     "retry_integration",

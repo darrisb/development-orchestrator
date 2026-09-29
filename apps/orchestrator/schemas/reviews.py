@@ -88,6 +88,10 @@ class EscalationResponse(BaseModel):
     option_intents: dict[str, EscalationIntent]
     status: EscalationStatus
     resolution: str | None
+    #: The Git commit SHA the operator supplied for a ``COMPLETED_BY_HAND``
+    #: resolution (concern 73). ``None`` for all other intents and for the
+    #: explicit no-code completion path.
+    human_commit: str | None
     created_at: datetime | None
     resolved_at: datetime | None
 
@@ -107,6 +111,7 @@ class EscalationResponse(BaseModel):
             },
             status=escalation.status,
             resolution=escalation.resolution,
+            human_commit=escalation.human_commit,
             created_at=escalation.created_at,
             resolved_at=escalation.resolved_at,
         )
@@ -131,3 +136,24 @@ class ResolveEscalationRequest(BaseModel):
     ] = None
     #: ``DISMISSED`` for an escalation that turned out not to need an answer.
     status: EscalationStatus = EscalationStatus.RESOLVED
+    #: The Git commit SHA the operator produced by hand, for a
+    #: ``COMPLETED_BY_HAND`` resolution (concern 73). When supplied, the
+    #: orchestrator validates the commit and integrates it through the
+    #: canonical mechanism before marking the task COMPLETE. When absent, the
+    #: resolution is treated as an explicit no-code completion.
+    human_commit: Annotated[
+        str | None, StringConstraints(strip_whitespace=True, min_length=7, max_length=64)
+    ] = None
+
+
+class ReconcileHumanCommitRequest(BaseModel):
+    """Reconcile a historical COMPLETED_BY_HAND escalation with a human commit.
+
+    For escalations resolved before concern 73, where the human commit was not
+    recorded or integrated. This endpoint integrates the commit through the
+    canonical mechanism and updates the escalation record.
+    """
+
+    human_commit: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=7, max_length=64)
+    ]

@@ -13,7 +13,7 @@ from ..domain.workflow import effect_of
 from ..repositories import EscalationRepository, TaskRepository
 from ..services.delivery import complete_by_hand, deliver_escalated_candidate
 from ..services.errors import EntityConflict, EntityNotFound
-from ..services.integration import retry_integration
+from ..services.integration import integrate_human_commit, retry_integration
 from ..services.workspace import attach_workspace
 from ..services.worktrees import release_for_run
 
@@ -25,6 +25,7 @@ def apply_escalation_answer(
     resolution: str,
     intent: EscalationIntent | None,
     status: EscalationStatus = EscalationStatus.RESOLVED,
+    human_commit: str | None = None,
     settings: Settings | None = None,
 ):
     """Record an answer and perform exactly the selected option's effect.
@@ -32,6 +33,12 @@ def apply_escalation_answer(
     Dismissing an escalation has no intent and therefore no side effect. A
     resolved answer must select an option that was actually offered; accepting
     a rolled-back candidate can never be smuggled in through the API.
+
+    ``human_commit`` is the Git SHA an operator supplied for a
+    ``COMPLETED_BY_HAND`` resolution (concern 73). If provided, the commit is
+    validated and integrated through the canonical mechanism before the task
+    is marked COMPLETE. If integration fails, the entire resolution is rolled
+    back.
     """
     config = settings or get_settings()
     escalations = EscalationRepository(session)
@@ -51,26 +58,40 @@ def apply_escalation_answer(
             f"Escalation {escalation_id} did not offer {intent.value}"
         )
 
+    if intent is not EscalationIntent.COMPLETED_BY_HAND and human_commit is not None:
+        raise EntityConflict(
+            "human_commit is only valid with COMPLETED_BY_HAND intent"
+        )
+
+    task = TaskRepository(session).get(existing.task_id)
+    if task is None:
+        raise EntityNotFound("Task", existing.task_id)
+
+    if intent is EscalationIntent.COMPLETED_BY_HAND and human_commit is not None:
+        project = _load_project(session, task.project_id)
+        integrate_human_commit(
+            session,
+            project,
+            task,
+            human_commit,
+            task_run_id=existing.task_run_id,
+            settings=config,
+        )
+
     answered = escalations.resolve(
         escalation_id,
         resolution=resolution,
         status=status,
         intent=intent,
+        human_commit=human_commit,
     )
     if intent is None:
         return answered
 
-    task = TaskRepository(session).get(existing.task_id)
-    if task is None:
-        raise EntityNotFound("Task", existing.task_id)
     effect = effect_of(intent)
     run_id = existing.task_run_id
 
     if effect.retry_integration:
-        # The task is already COMPLETE and stays so, whether this succeeds or
-        # not (concern 51). What the answer authorises is one more attempt at the
-        # cumulative gate; if it fails again, `integrate_candidate` blocks again
-        # and opens a new escalation, so the condition never disappears quietly.
         if run_id is None:
             raise EntityConflict(
                 "This escalation has no run, so there is no candidate to integrate"
@@ -92,6 +113,15 @@ def apply_escalation_answer(
     if effect.release_worktree and run_id is not None and not effect.commit_candidate:
         release_for_run(session, run_id, settings=config)
     return answered
+
+
+def _load_project(session: Session, project_id: UUID):
+    from ..repositories import ProjectRepository
+
+    project = ProjectRepository(session).get(project_id)
+    if project is None:
+        raise EntityNotFound("Project", project_id)
+    return project
 
 
 def intent_for_key(escalation, key: str) -> EscalationIntent:

@@ -35,6 +35,7 @@ class EscalationRepository(Repository[HumanEscalationRow, HumanEscalation]):
             resolution_intent=(
                 EscalationIntent(row.resolution_intent) if row.resolution_intent else None
             ),
+            human_commit=row.human_commit,
             created_at=row.created_at,
             resolved_at=row.resolved_at,
         )
@@ -55,6 +56,7 @@ class EscalationRepository(Repository[HumanEscalationRow, HumanEscalation]):
             resolution_intent=(
                 escalation.resolution_intent.value if escalation.resolution_intent else None
             ),
+            human_commit=escalation.human_commit,
         )
         self.session.add(row)
         self.session.flush()
@@ -90,11 +92,16 @@ class EscalationRepository(Repository[HumanEscalationRow, HumanEscalation]):
         resolution: str,
         status: EscalationStatus = EscalationStatus.RESOLVED,
         intent: EscalationIntent | None = None,
+        human_commit: str | None = None,
     ) -> HumanEscalation:
         """Close an escalation with a human's answer.
 
         ``intent`` is the option they chose; a dismissal has none, because
         dismissing is an answer that asks for nothing to happen.
+
+        ``human_commit`` is the Git SHA the operator supplied for a
+        ``COMPLETED_BY_HAND`` resolution (concern 73). ``None`` means no code
+        change was needed.
 
         Raises:
             LookupError: no such escalation.
@@ -105,6 +112,7 @@ class EscalationRepository(Repository[HumanEscalationRow, HumanEscalation]):
         row.status = status
         row.resolution = resolution
         row.resolution_intent = intent.value if intent else None
+        row.human_commit = human_commit
         row.resolved_at = datetime.now(UTC)
         self.session.flush()
         return self._to_domain(row)
@@ -120,3 +128,20 @@ class EscalationRepository(Repository[HumanEscalationRow, HumanEscalation]):
             statement.order_by(HumanEscalationRow.created_at)
         ).all()
         return [self._to_domain(row) for row in rows]
+
+    def reconcile_human_commit(
+        self,
+        escalation_id: UUID,
+        human_commit: str,
+    ) -> HumanEscalation:
+        """Record a human commit for a historical COMPLETED_BY_HAND escalation.
+
+        Raises:
+            LookupError: no such escalation.
+        """
+        row = self._get_row(escalation_id)
+        if row is None:
+            raise LookupError(f"Human escalation {escalation_id} not found")
+        row.human_commit = human_commit
+        self.session.flush()
+        return self._to_domain(row)

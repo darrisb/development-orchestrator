@@ -369,6 +369,10 @@ class HumanEscalation:
     #: Which option the person chose. ``None`` on an open escalation, and on a
     #: dismissal, which is an answer that asks for nothing to happen.
     resolution_intent: EscalationIntent | None = None
+    #: The Git commit SHA the operator supplied when resolving with
+    #: ``COMPLETED_BY_HAND`` (concern 73). ``None`` means no code change was
+    #: needed -- the explicit no-code completion path.
+    human_commit: str | None = None
     id: UUID = field(default_factory=_new_id)
     created_at: datetime | None = None
     resolved_at: datetime | None = None

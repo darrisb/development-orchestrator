@@ -448,6 +448,10 @@ class HumanEscalationRow(UUIDPrimaryKey, Base):
     #: (concern 32). Stored beside the free text rather than instead of it:
     #: the text is why, and this is what.
     resolution_intent: Mapped[str | None] = mapped_column(String(32))
+    #: The Git commit SHA an operator supplied when resolving with
+    #: ``COMPLETED_BY_HAND`` (concern 73). NULL means no code change was
+    #: needed -- the explicit no-code completion path.
+    human_commit: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
