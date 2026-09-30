@@ -451,7 +451,24 @@ class HumanEscalationRow(UUIDPrimaryKey, Base):
     #: The Git commit SHA an operator supplied when resolving with
     #: ``COMPLETED_BY_HAND`` (concern 73). NULL means no code change was
     #: needed -- the explicit no-code completion path.
+    #:
+    #: Always the *historical human source commit*: the commit a person wrote,
+    #: exactly as they wrote it. It is never rebased, re-signed or replaced,
+    #: even when the orchestrator could not merge it cleanly (see
+    #: ``integration_resolution_commit``).
     human_commit: Mapped[str | None] = mapped_column(String(64))
+    #: The distinct commit that actually carries ``human_commit``'s work onto
+    #: the integration baseline, created by
+    #: ``services.human_resolution.authorize_human_resolution`` when the
+    #: canonical merge conflicts. NULL on every escalation resolved by a clean
+    #: merge, because then the merge commit's own second parent *is* the human
+    #: commit and no separate value is needed.
+    #:
+    #: The pair is the provenance record: which commit a person authored, and
+    #: which commit the baseline now contains. Conflating them would either
+    #: lose the human commit or pretend the orchestrator's resolution is the
+    #: human's own work.
+    integration_resolution_commit: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

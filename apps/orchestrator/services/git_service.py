@@ -260,6 +260,65 @@ class GitService:
         raw = self._run("ls-files", "-z").stdout
         return tuple(sorted(entry for entry in raw.split("\0") if entry))
 
+    # -------------------------------------------------- tree/patch inspection
+    #
+    # Read-only plumbing added for the human conflict-resolution contract
+    # (concern 73 follow-up). These exist so the resolution validator can
+    # compare *trees* rather than trust an operator's description of what they
+    # did: a resolution has to be proved faithful to the human commit it claims
+    # to carry, and the only acceptable authority on that is Git.
+
+    def list_changed_paths(self, base: str, head: str) -> tuple[str, ...]:
+        """Paths whose content differs between two commits, sorted.
+
+        ``git diff --name-only`` rather than a numstat parse: the question this
+        answers is "which files did this commit touch at all", and a file that
+        changed only in mode or only in whitespace still counts as touched.
+        """
+        assert_safe_ref_component(base, label="revision")
+        assert_safe_ref_component(head, label="revision")
+        raw = self._run("diff", "--name-only", "-z", f"{base}..{head}").stdout
+        return tuple(sorted(path for path in raw.split("\0") if path))
+
+    def commit_parents(self, rev: str) -> tuple[str, ...]:
+        """A commit's parents in order; empty for a root commit."""
+        return tuple(self._run("rev-list", "--parents", "-n", "1", rev).stdout.split()[1:])
+
+    def read_file_at(self, rev: str, path: str) -> str | None:
+        """A file's content at a commit, or ``None`` when it does not exist.
+
+        ``None`` is a real answer rather than an error: "the resolution deleted
+        a file the human edited" and "the resolution kept it" are different
+        trees, and the validator has to be able to tell them apart.
+        """
+        assert_safe_ref_component(rev, label="revision")
+        result = self._run("show", f"{rev}:{path}", check=False)
+        if result.exit_code != 0:
+            return None
+        return result.stdout
+
+    def added_lines_between(self, base: str, head: str, path: str) -> tuple[str, ...]:
+        """Lines ``head`` adds to ``path`` relative to ``base``, verbatim.
+
+        Parsed from a zero-context unified diff so the result depends only on
+        the two trees, never on how a merge happened to be resolved.
+        """
+        assert_safe_ref_component(base, label="revision")
+        assert_safe_ref_component(head, label="revision")
+        diff = self._run(
+            "diff", "--no-color", "--unified=0", "--no-renames", f"{base}..{head}", "--", path
+        ).stdout
+        added: list[str] = []
+        for line in diff.splitlines():
+            # "+++ b/path" is the file header, not added content. The
+            # "\\ No newline at end of file" marker starts with a backslash and
+            # is metadata about the previous line, so it is excluded too.
+            if line.startswith("+++") or line.startswith("---"):
+                continue
+            if line.startswith("+"):
+                added.append(line[1:])
+        return tuple(added)
+
     def recent_commits(
         self, *, limit: int = 5, paths: Sequence[str] = (), rev: str = "HEAD"
     ) -> tuple[CommitSummary, ...]:
@@ -524,6 +583,47 @@ class GitService:
 
     def _has_staged_changes(self) -> bool:
         return self._run("diff", "--cached", "--quiet", check=False).exit_code != 0
+
+    def write_tree(self) -> str:
+        """The tree object the current index describes.
+
+        Reads the index only: the result is a function of what was staged, so
+        nothing untracked and nothing unstaged can reach it.
+        """
+        return self._run("write-tree").stdout.strip()
+
+    def commit_tree(
+        self,
+        tree: str,
+        *,
+        message: str,
+        parents: Sequence[str] = (),
+    ) -> str:
+        """Create a commit from an explicit tree and parent list.
+
+        ``commit-tree`` rather than ``commit`` because the human
+        conflict-resolution path needs a commit with *two* chosen parents and
+        a tree it assembled, which is not a working-tree commit and cannot be
+        expressed as a ``MERGE_HEAD`` side effect. Nothing is written to the
+        index, ``HEAD`` is untouched, and no ref moves: the returned object is
+        reachable only if the caller deliberately points a ref at it, which is
+        what makes "every gate passed first" expressible at all.
+        """
+        assert_safe_ref_component(tree, label="tree")
+        args: list[str] = [*self._identity_flags(), "commit-tree", tree]
+        for parent in parents:
+            assert_safe_ref_component(parent, label="revision")
+            args += ["-p", parent]
+        args += ["-m", message]
+        sha = self._run(*args).stdout.strip()
+        logger.info(
+            "commit_tree_created",
+            sha=sha,
+            tree=tree,
+            parents=list(parents),
+            path=str(self.path),
+        )
+        return sha
 
     def push(self, branch: str, *, remote: str | None = None, force: bool = False) -> None:
         """Push a task branch, subject to policy.

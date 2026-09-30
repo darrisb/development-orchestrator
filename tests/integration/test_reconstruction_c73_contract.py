@@ -113,10 +113,15 @@ def isolated_url(tmp_path: Path) -> str:
     db = tmp_path / "c73_contract.db"
     engine = create_engine(f"sqlite:///{db}", future=True)
     Base.metadata.create_all(engine)
+    # Same rule as the importer tests: the marker names the head the schema
+    # (and therefore the importer) actually requires, taken from the manifest
+    # rather than hardcoded.
+    manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    head = manifest.get("required_alembic_head") or manifest["expected_alembic_head"]
     with engine.begin() as connection:
         connection.execute(text("create table alembic_version (version_num varchar(32))"))
         connection.execute(
-            text("insert into alembic_version(version_num) values ('e8a3c7f21d49')")
+            text("insert into alembic_version(version_num) values (:head)"), {"head": head}
         )
     engine.dispose()
     return f"sqlite:///{db}"

@@ -30,10 +30,16 @@ def sqlite_url(tmp_path: Path) -> str:
     path = tmp_path / "reconstruction_test.db"
     engine = create_engine(f"sqlite:///{path}", future=True)
     Base.metadata.create_all(engine)
+    # The schema create_all just built corresponds to whatever head the code is
+    # at, so the marker has to name that head -- exactly the value the importer
+    # will demand via manifest["required_alembic_head"]. Hardcoding an old
+    # revision here is how the previous migration silently broke this file.
+    manifest = _load(MANIFEST)
+    head = manifest.get("required_alembic_head") or manifest["expected_alembic_head"]
     with engine.begin() as connection:
         connection.execute(text("create table alembic_version (version_num varchar(32))"))
         connection.execute(
-            text("insert into alembic_version(version_num) values ('e8a3c7f21d49')")
+            text("insert into alembic_version(version_num) values (:head)"), {"head": head}
         )
     engine.dispose()
     return f"sqlite:///{path}"
@@ -162,6 +168,55 @@ def test_migration_head_mismatch_rejected(manifest_copy: Path, sqlite_url: str):
 
     with pytest.raises(importer.ReconstructionError, match="migration head"):
         _dry_run(manifest_copy, sqlite_url)
+
+
+def test_manifest_required_head_matches_the_code_head():
+    """The trap that caught this repo once: a migration lands, the sealed
+    ``expected_alembic_head`` must not move, and without
+    ``required_alembic_head`` advancing in step, every reconstruction is
+    silently refused. This test fails on the day they diverge."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    head = ScriptDirectory.from_config(Config("alembic.ini")).get_current_head()
+    manifest = _load(MANIFEST)
+    assert manifest.get("required_alembic_head") == head
+    assert manifest["expected_alembic_head"] == "e8a3c7f21d49"
+
+
+def test_required_head_falls_back_to_expected_when_absent(manifest_copy: Path, sqlite_url: str):
+    """Removing the forward-compat key re-seals the gate to the backup's head.
+
+    The migration-head tests above already run a database at
+    ``required_alembic_head``; with the key stripped, the importer must demand
+    the historical ``expected_alembic_head`` instead and refuse the newer --
+    schema-current -- database rather than write columns into a DB whose
+    migration state it cannot confirm.
+    """
+    payload = _load(manifest_copy)
+    assert payload.pop("required_alembic_head") != payload["expected_alembic_head"]
+    _write(manifest_copy, payload)
+
+    with pytest.raises(importer.ReconstructionError, match="does not match"):
+        _dry_run(manifest_copy, sqlite_url)
+
+
+def test_partial_provenance_columns_are_importable_and_null(manifest_copy: Path, sqlite_url: str):
+    """A reconstructed escalation carries neither provenance value.
+
+    The reconstruction imports the pre-C73 state: ``human_commit`` and
+    ``integration_resolution_commit`` are both NULL, and the source-vs-
+    resolution distinction is made only later, by reconciliation. The import
+    must not invent either value.
+    """
+    _import(manifest_copy, sqlite_url)
+    engine = create_engine(sqlite_url, future=True)
+    with engine.begin() as connection:
+        row = connection.execute(
+            text("select human_commit, integration_resolution_commit from human_escalations")
+        ).one()
+    engine.dispose()
+    assert row == (None, None)
 
 
 def test_non_empty_campaign_db_rejected(manifest_copy: Path, sqlite_url: str):

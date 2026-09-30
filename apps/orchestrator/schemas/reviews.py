@@ -15,6 +15,7 @@ from ..domain.enums import (
 )
 from ..domain.escalation import EscalationIntent, option_labels
 from ..domain.models import HumanEscalation, Review, ReviewIssue
+from ..services.human_resolution import ResolutionWorkspace as HumanResolutionWorkspace
 
 
 class ReviewIssueResponse(BaseModel):
@@ -90,8 +91,15 @@ class EscalationResponse(BaseModel):
     resolution: str | None
     #: The Git commit SHA the operator supplied for a ``COMPLETED_BY_HAND``
     #: resolution (concern 73). ``None`` for all other intents and for the
-    #: explicit no-code completion path.
+    #: explicit no-code completion path. Always the *historical human source
+    #: commit*: the commit a person wrote, preserved unchanged.
     human_commit: str | None
+    #: The distinct commit an operator created to carry the human commit's
+    #: work onto the baseline after resolving a merge conflict
+    #: (concern 73 follow-up). ``None`` when the canonical merge succeeded, and
+    #: on every escalation that has not been reconciled. Non-``None`` always
+    #: implies a non-``None`` ``human_commit``.
+    integration_resolution_commit: str | None
     created_at: datetime | None
     resolved_at: datetime | None
 
@@ -112,6 +120,7 @@ class EscalationResponse(BaseModel):
             status=escalation.status,
             resolution=escalation.resolution,
             human_commit=escalation.human_commit,
+            integration_resolution_commit=escalation.integration_resolution_commit,
             created_at=escalation.created_at,
             resolved_at=escalation.resolved_at,
         )
@@ -156,4 +165,69 @@ class ReconcileHumanCommitRequest(BaseModel):
 
     human_commit: Annotated[
         str, StringConstraints(strip_whitespace=True, min_length=7, max_length=64)
+    ]
+
+
+class PrepareHumanResolutionRequest(BaseModel):
+    """Ask for the workspace a merge conflict gets resolved in.
+
+    Step B of the operator workflow. Refused unless the canonical merge is
+    genuinely blocked, because a resolution commit built when nothing conflicts
+    would be a second, redundant way to move the baseline.
+    """
+
+    #: The historical human source commit. Read-only: the orchestrator never
+    #: rewrites it, and it stays recorded as the human's own work afterwards.
+    human_source_commit: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=40, max_length=40)
+    ]
+    #: The ``agent/integration`` SHA the resolution must be built on. Stated by
+    #: the operator and re-checked at authorization, so a resolution made
+    #: against a superseded baseline is refused rather than merged.
+    expected_integration_sha: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=40, max_length=40)
+    ]
+
+
+class HumanResolutionWorkspaceResponse(BaseModel):
+    """Where to resolve, and what may be resolved."""
+
+    escalation_id: UUID
+    task_external_id: str
+    path: str
+    expected_integration_sha: str
+    human_source_commit: str
+    human_source_parent: str
+    allowed_paths: list[str]
+
+    @classmethod
+    def from_workspace(
+        cls, workspace: HumanResolutionWorkspace
+    ) -> HumanResolutionWorkspaceResponse:
+        return cls(
+            escalation_id=workspace.escalation_id,
+            task_external_id=workspace.task_external_id,
+            path=str(workspace.path),
+            expected_integration_sha=workspace.expected_integration_sha,
+            human_source_commit=workspace.human_source_commit,
+            human_source_parent=workspace.human_source_parent,
+            allowed_paths=list(workspace.allowed_paths),
+        )
+
+
+class AuthorizeHumanResolutionRequest(BaseModel):
+    """Authorize reconciliation of the conflict with an operator's resolution.
+
+    Both provenance values are named apart on purpose. ``human_source_commit``
+    is the historical human commit and is recorded as such; the orchestrator
+    creates the resolution commit itself from the workspace, so the operator
+    never supplies -- and therefore never gets credit for -- a commit they
+    did not have validated.
+    """
+
+    human_source_commit: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=40, max_length=40)
+    ]
+    expected_integration_sha: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=40, max_length=40)
     ]

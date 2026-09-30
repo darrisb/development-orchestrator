@@ -36,6 +36,7 @@ class EscalationRepository(Repository[HumanEscalationRow, HumanEscalation]):
                 EscalationIntent(row.resolution_intent) if row.resolution_intent else None
             ),
             human_commit=row.human_commit,
+            integration_resolution_commit=row.integration_resolution_commit,
             created_at=row.created_at,
             resolved_at=row.resolved_at,
         )
@@ -57,6 +58,7 @@ class EscalationRepository(Repository[HumanEscalationRow, HumanEscalation]):
                 escalation.resolution_intent.value if escalation.resolution_intent else None
             ),
             human_commit=escalation.human_commit,
+            integration_resolution_commit=escalation.integration_resolution_commit,
         )
         self.session.add(row)
         self.session.flush()
@@ -133,8 +135,17 @@ class EscalationRepository(Repository[HumanEscalationRow, HumanEscalation]):
         self,
         escalation_id: UUID,
         human_commit: str,
+        *,
+        integration_resolution_commit: str | None = None,
     ) -> HumanEscalation:
-        """Record a human commit for a historical COMPLETED_BY_HAND escalation.
+        """Record human integration provenance for a COMPLETED_BY_HAND escalation.
+
+        ``human_commit`` is always the historical human source commit.
+        ``integration_resolution_commit`` is the separate, newly created commit
+        that carries that work onto the baseline, and is passed only by
+        ``services.human_resolution``: a clean canonical merge needs no such
+        value, because the merge commit's own second parent is the human commit
+        and the baseline already contains it.
 
         Raises:
             LookupError: no such escalation.
@@ -143,5 +154,6 @@ class EscalationRepository(Repository[HumanEscalationRow, HumanEscalation]):
         if row is None:
             raise LookupError(f"Human escalation {escalation_id} not found")
         row.human_commit = human_commit
+        row.integration_resolution_commit = integration_resolution_commit
         self.session.flush()
         return self._to_domain(row)

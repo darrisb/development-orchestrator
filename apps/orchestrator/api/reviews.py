@@ -7,11 +7,15 @@ from sqlalchemy.orm import Session
 
 from ..db.session import get_db
 from ..schemas.reviews import (
+    AuthorizeHumanResolutionRequest,
     EscalationResponse,
+    HumanResolutionWorkspaceResponse,
+    PrepareHumanResolutionRequest,
     ReconcileHumanCommitRequest,
     ResolveEscalationRequest,
     ReviewResponse,
 )
+from ..services import human_resolution as resolution_service
 from ..services import reviews as review_service
 
 router = APIRouter(tags=["reviews"])
@@ -74,5 +78,59 @@ def reconcile_human_commit(
             session,
             escalation_id,
             human_commit=payload.human_commit,
+        )
+    )
+
+
+@router.post(
+    "/escalations/{escalation_id}/human-integration-resolution/workspace",
+    response_model=HumanResolutionWorkspaceResponse,
+)
+def prepare_human_resolution_workspace(
+    escalation_id: UUID,
+    payload: PrepareHumanResolutionRequest,
+    session: Session = Depends(get_db),
+) -> HumanResolutionWorkspaceResponse:
+    """Create the workspace a merge conflict gets resolved in.
+
+    The supported answer to "the canonical merge of this human commit
+    conflicts". Returns a detached worktree at the stated baseline, the paths
+    that may be edited, and the human commit's own parent so the original patch
+    can be read. Nothing is guessed and no ref moves: the human source commit is
+    read-only throughout.
+    """
+    return HumanResolutionWorkspaceResponse.from_workspace(
+        resolution_service.prepare_resolution_workspace(
+            session,
+            escalation_id,
+            human_source_commit=payload.human_source_commit,
+            expected_integration_sha=payload.expected_integration_sha,
+        )
+    )
+
+
+@router.post(
+    "/escalations/{escalation_id}/human-integration-resolution",
+    response_model=EscalationResponse,
+)
+def authorize_human_resolution(
+    escalation_id: UUID,
+    payload: AuthorizeHumanResolutionRequest,
+    session: Session = Depends(get_db),
+) -> EscalationResponse:
+    """Validate the operator's resolution and advance the baseline onto it.
+
+    Creates the resolution commit itself -- a merge whose second parent is the
+    historical human commit, so that commit really is in the baseline
+    afterwards -- only after the content invariant and the project's own
+    build/lint/tests pass over the resolved tree. Records both provenance
+    values on the escalation and refuses to replay.
+    """
+    return EscalationResponse.from_domain(
+        resolution_service.authorize_human_resolution(
+            session,
+            escalation_id,
+            human_source_commit=payload.human_source_commit,
+            expected_integration_sha=payload.expected_integration_sha,
         )
     )

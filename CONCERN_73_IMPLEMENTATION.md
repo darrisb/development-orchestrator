@@ -228,3 +228,94 @@ Concern 73 successfully addresses the defect where human work could be marked CO
 - ✅ Backward compatible
 - ✅ Well-documented
 - ✅ Ready for deployment
+
+---
+
+## Follow-up: operator-resolved human merge conflict (concern 73 recovery)
+
+The recovered TraceStack history exposed the case the original concern 73
+contract assumed away: the historical human commit `cbff2c4` is **not** a
+descendant of the canonical integration lineage `fc6abc5`. It is a sibling --
+both descend from the pre-TS-101 import `06a0697` -- and both append to the
+same class and the same test file. The canonical merge therefore raises genuine
+content conflicts in `src/navigation/navigation-stack.ts` and
+`src/test/navigation-stack.test.ts`. Concern 73 fails closed on that merge,
+which is correct: nothing was lost, the repository topology is simply what it
+is.
+
+This follow-up adds the supported path through that conflict without rewriting
+the human's history.
+
+### Provenance model
+
+Two durable values, two meanings, never conflated:
+
+- `HumanEscalation.human_commit` keeps its meaning and is now explicitly the
+  **historical human source commit** (`cbff2c4`), stored unchanged, never
+  rebased or replaced.
+- `HumanEscalation.integration_resolution_commit` (new, nullable) is the
+  **distinct commit** that actually carries that work onto the baseline. It is
+  NULL on every clean merge (the merge commit's own second parent is then the
+  human commit) and NULL on the no-code completion path.
+
+The resolution is a genuine merge commit: first parent = the pre-reconciliation
+baseline, second parent = the human source commit. That second parent is what
+makes the historical commit an ancestor of `agent/integration`, the property
+concern 73 exists to guarantee, so the dependency guard stays truthful for
+every task that follows.
+
+### Content invariant (Git-only, no operator assertion)
+
+A conflict resolution legitimately relocates code, so byte-identical patch
+application is impossible and is *not* required. What is enforceable, and
+checked from Git trees alone in `services/human_resolution.py`, is line-level
+content equivalence within the human commit's own file scope:
+
+1. carry-over -- every significant line the human commit added survives into
+   the resolution;
+2. no injection -- every line the resolution adds over the baseline was added
+   by the human commit;
+3. no removal -- every baseline line the resolution drops was dropped by the
+   human commit;
+4. scope -- the resolution may differ from the baseline only inside the files
+   the human commit touched;
+5. no conflict markers may remain in any tracked file;
+6. the project's cumulative build, lint and tests run over the resolved tree,
+   and an empty verification profile is a refusal, not a vacuous pass.
+
+This is weaker than semantic equivalence of arbitrary rewrites, stated rather
+than hidden: an operator who reworded the human method would be rejected even
+if it behaved identically; the verification gate is what covers behaviour.
+
+### Order of durability
+
+Provenance is written and flushed **before** the ref moves; the ref move is
+read back and verified. The residual risk is deliberately the benign direction
+(a recorded reconciliation whose ref move then fails, visible and retryable);
+a baseline that advanced with nothing recording why is unreachable. Replay is
+gated on both columns, so a half-recorded reconciliation is refused rather
+than silently decided.
+
+### Importer forward-compatibility key
+
+`required_alembic_head` (new, optional manifest key) names the head the *target
+database* must be at for the importer's code to write the columns it writes,
+and advances with each migration. It is distinct from `expected_alembic_head`,
+which is a sealed historical fact about the canonical backup and must never
+move. Without this split, adding a migration silently refuses every
+reconstruction -- exactly what `c1f4a7d29b60` would have caused.
+
+### Schema / API
+
+- Migration `c1f4a7d29b60` adds the one nullable column
+  `human_escalations.integration_resolution_commit`. Its down-revision is
+  `e8a3c7f21d49`, so the runtime sequence after the reconstruction importer
+  must apply it before reconciliation.
+- Two endpoints on the reviews router: create the resolution workspace
+  (`POST /escalations/{id}/human-integration-resolution/workspace`) and
+  authorize the validated resolution
+  (`POST /escalations/{id}/human-integration-resolution`).
+- `EscalationResponse` now exposes both provenance values. No existing durable
+  field was renamed, and `TaskRun.candidate_commit` is deliberately left NULL
+  for the reconstructed runs -- a human resolution is never recorded as model
+  provenance.

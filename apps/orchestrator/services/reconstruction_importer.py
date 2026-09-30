@@ -467,7 +467,23 @@ def _validate_database_identity(database_url: str, confirm_database: str) -> Non
         )
 
 
+def _required_alembic_head(manifest: dict[str, Any]) -> str:
+    """The head the *target database* has to be at before a row is inserted.
+
+    Distinct from ``expected_alembic_head``, which is the revision the
+    canonical backup was *taken* at. That one is a historical fact about a
+    checksummed artifact and must never move; this one is a statement about
+    the schema the code needs in order to write the columns it now writes, so
+    it advances with every migration. Collapsing the two would mean either
+    re-cutting a sealed backup each time a migration lands, or -- what
+    happened when a migration was added without noticing -- silently refusing
+    every reconstruction because the code had moved past the artifact.
+    """
+    return manifest.get("required_alembic_head") or manifest["expected_alembic_head"]
+
+
 def _validate_database(engine: Engine, manifest: dict[str, Any]) -> None:
+    required = _required_alembic_head(manifest)
     with engine.connect() as connection:
         try:
             revision = connection.execute(text("select version_num from alembic_version")).scalar()
@@ -476,10 +492,9 @@ def _validate_database(engine: Engine, manifest: dict[str, Any]) -> None:
                 "target database does not expose an alembic_version row; "
                 "it is not at the expected migration head"
             ) from None
-        if revision != manifest["expected_alembic_head"]:
+        if revision != required:
             raise ReconstructionError(
-                f"database migration head {revision!r} does not match "
-                f"{manifest['expected_alembic_head']!r}"
+                f"database migration head {revision!r} does not match {required!r}"
             )
         _assert_campaign_empty_session(connection)
 
