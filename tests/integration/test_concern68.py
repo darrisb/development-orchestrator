@@ -1279,7 +1279,14 @@ def test_the_recovery_mode_is_part_of_the_documented_contract(api: TestClient):
     schema = api.get("/openapi.json").json()["components"]["schemas"]
     assert "recovery_mode" in schema["RecoverabilityResponse"]["properties"]
     assert "recovery_mode" in schema["RunRecoveryResponse"]["properties"]
-    assert set(schema["RecoveryMode"]["enum"]) == {"continue", "settlement_only"}
+    # Concern 76 adds ``delivery_only``: a run whose review already approved a
+    # committed candidate re-enters the ordinary delivery node without any model
+    # work. It joins ``continue`` and ``settlement_only`` as a supported mode.
+    assert set(schema["RecoveryMode"]["enum"]) == {
+        "continue",
+        "settlement_only",
+        "delivery_only",
+    }
 
 
 # =============================================================================

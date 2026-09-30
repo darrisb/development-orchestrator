@@ -104,13 +104,44 @@ distinction is observable as ``recovery_mode``:
 The arithmetic itself is unchanged. Attempts 1-3 of RUN-20260928-000005 are
 still spent, the next durable coder execution is still attempt 4, and 4 is
 still more than 3. What changed is only what that answer is taken to *mean*.
+
+**Concern 76: an approved candidate whose delivery crashed is owed delivery, not
+another attempt.** A third stranding shape the earlier modes could not name: the
+reviewer approved, the candidate was committed, and the process died inside the
+delivery transaction -- so the task is ``APPROVED``, the run is still ``RUNNING``
+with no owner, ``candidate_commit`` is ``NULL``, yet a committed clean worktree
+holds the approved result. Re-entering the ordinary fix loop here would be wrong
+in a new way: it would ask the coder and reviewer to reproduce work that already
+exists, or, worse, refuse and strand an approved result forever.
+
+So ``assess_recoverability`` now recognises a fourth answer,
+``RecoveryMode.DELIVERY_ONLY``, and derives -- rather than trusts -- the candidate
+from supervisor-owned Git state (``_assess_stranded_delivery_candidate``). It
+proves the committed HEAD is real, clean, descends from the run's starting commit,
+falls inside the task's declared scope, is backed by an approving review and passing
+candidate gates, and is not contradicted by the recorded ``candidate_commit``. Every
+one of those is a durable question that fails closed, so recovery can only land work
+that was genuinely approved. The run then re-enters the *normal* delivery node
+through the graph (``_after_prepare`` routes ``APPROVED`` straight to ``deliver``),
+``_commit_or_reconcile`` records the derived candidate idempotently, and
+``integrate_candidate`` settles without moving the ref twice if a crash had already
+advanced it. No coder call, no reviewer call, no new attempt, no new ``TaskRun``.
+
+The namespace defect that caused this crash -- a linked worktree whose absolute
+``.git`` metadata was written under a container path a host run cannot resolve -- is
+repaired in ``services.integration`` for the disposable, supervisor-owned integration
+worktree only. A *task* worktree is never rebuilt, because it may be the only copy of
+an approved or escalated candidate: unusable task-worktree metadata is a refusal here,
+not an excuse to regenerate reviewed work.
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from uuid import UUID
 
 from sqlalchemy import select
@@ -122,20 +153,26 @@ from ..config.settings import Settings, get_settings
 from ..db.models import WorkflowCheckpointRow
 from ..domain.enums import (
     IN_FLIGHT_RUN_STATUSES,
+    ReviewDecision,
     RunEventType,
     RunStatus,
     TaskStatus,
+    VerificationStatus,
+    VerificationType,
 )
-from ..domain.git import INTEGRATION_BRANCH
-from ..domain.models import RunEvent, TaskRun
+from ..domain.git import INTEGRATION_BRANCH, DiffSummary
+from ..domain.models import Project, RunEvent, Task, TaskRun, VerificationRun
+from ..domain.scope import ScopePolicy, evaluate_scope
 from ..domain.state_machine import ACTIVE_STATES
 from ..repositories import (
     PauseRequestRepository,
+    ReviewRepository,
     RunEventRepository,
     TaskRunRepository,
+    VerificationRunRepository,
 )
 from .errors import EntityConflict
-from .git_errors import GitError
+from .git_errors import GitError, WorktreeUnusable
 from .workspace import load_run_context, repository_service, workspace_path
 
 logger = get_logger(__name__)
@@ -173,6 +210,10 @@ class RecoveryMode(StrEnum):
 
     #: A valid next coder/reviewer operation remains inside the task's budget.
     CONTINUE = "continue"
+    #: Review has already approved the candidate and no model work remains.
+    #: Recovery re-enters the normal delivery node after validating the
+    #: existing worktree commit and acquiring execution ownership.
+    DELIVERY_ONLY = "delivery_only"
     #: No coder attempt remains, but the run is non-terminal and the fix loop's
     #: own exhausted-budget path can settle it without any external or model
     #: work. See ``agents.fix_loop.run_fix_loop``: ``first > ceiling`` iterates
@@ -460,6 +501,7 @@ def assess_recoverability(
             )
 
     # ---- worktree ----------------------------------------------------------
+    stranded_delivery_candidate: str | None = None
     if run.branch_name is None:
         # Nothing was prepared, so there is nothing to be wrong. The workflow's
         # prepare step will create it exactly as it would for a fresh dispatch.
@@ -480,6 +522,16 @@ def assess_recoverability(
             else f"the run records branch {run.branch_name} but its worktree "
             f"{path} is missing; recovery does not silently rebuild Git state",
         )
+        if path.exists() and task.status is TaskStatus.APPROVED:
+            stranded_delivery_candidate = _assess_stranded_delivery_candidate(
+                session=session,
+                run=run,
+                task=task,
+                project=project,
+                path=path,
+                settings=config,
+                record=record,
+            )
 
     # ---- attempt / review accounting --------------------------------------
     #
@@ -547,6 +599,14 @@ def assess_recoverability(
                 "there is no safe continuation and no safe settlement to derive "
                 "from accounting that contradicts itself",
             )
+        elif stranded_delivery_candidate is not None:
+            mode = RecoveryMode.DELIVERY_ONLY
+            record(
+                "workflow_action_available",
+                True,
+                "review approved a candidate and delivery is still owed; recovery "
+                "will re-enter delivery without calling coder or reviewer",
+            )
         elif next_attempt <= ceiling:
             mode = RecoveryMode.CONTINUE
             record(
@@ -606,10 +666,285 @@ def assess_recoverability(
         reviews_completed=reviews_completed,
         review_cycle=run.review_cycle,
         max_attempts=ceiling,
-        candidate_commit=run.candidate_commit,
+        candidate_commit=run.candidate_commit or stranded_delivery_candidate,
         integration_advanced_since_start=integration_advanced,
     )
     return report
+
+
+#: The verification gates a coder turn records for *its own* candidate, before
+#: any reviewer ever sees it. The cumulative ``INTEGRATION_*`` types are excluded:
+#: they answer "does the baseline still pass after the merge", which is a question
+#: delivery asks, not one the approved candidate has to pre-answer (concern 51).
+_CANDIDATE_VERIFICATION_TYPES: frozenset[VerificationType] = frozenset(
+    {
+        VerificationType.SCOPE,
+        VerificationType.BUILD,
+        VerificationType.LINT,
+        VerificationType.TESTS,
+        VerificationType.SECURITY,
+        VerificationType.DIFF_POLICY,
+    }
+)
+
+
+def _assess_stranded_delivery_candidate(
+    *,
+    session: Session,
+    run: TaskRun,
+    task: Task,
+    project: Project,
+    path: Path,
+    settings: Settings,
+    record: Callable[[str, bool, str], bool],
+) -> str | None:
+    """Derive and validate the committed candidate a post-approval delivery owes.
+
+    Concern 76. A run whose task is ``APPROVED`` but which is still ``RUNNING``
+    with no execution owner was interrupted *after* the reviewer approved and
+    *after* the candidate commit was made, but *before* the delivery transaction
+    that would have recorded ``candidate_commit``, advanced the integration ref
+    and completed the task. The commit and the clean tree are on disk; the durable
+    database rows that say "this is what was approved" were never written.
+
+    This reads those facts and proves them consistent, recording a named check for
+    each so an operator can see exactly which evidence carries the recovery -- or
+    which contradiction refuses it. It returns the candidate SHA **only** when every
+    check passes, which makes the caller select ``DELIVERY_ONLY`` and lets the
+    ordinary delivery node finish the work. It writes nothing.
+
+    The candidate is *derived from supervisor-owned Git state* -- the run worktree's
+    committed HEAD -- never taken on trust from a caller. Where the run also records
+    a ``candidate_commit``, the recorded value and the worktree HEAD must agree, so a
+    partial or contradictory provenance fails closed rather than delivering whichever
+    one happened to be supplied.
+
+    A task worktree is deliberately *not* repaired here the way the disposable
+    integration worktree is: it may be the only copy of an approved or escalated
+    candidate, so namespace-broken metadata is a refusal to recover, never an excuse
+    to rebuild Git state and silently lose reviewed work.
+
+    Args:
+        record: the caller's check recorder, so every question this asks lands in
+            the same report as every other.
+
+    Returns:
+        The candidate SHA to deliver, or ``None`` when this is not a recoverable
+        stranded delivery -- ``None`` always accompanies at least one failed check
+        or a reason the ordinary continuation applies instead.
+    """
+    if run.candidate_commit is None and run.starting_commit is None:
+        # No candidate is recorded and none can be derived: there is nothing this
+        # module is allowed to call an approved result, so the run is not a
+        # post-approval stranding. The absence is not itself a refusal here; the
+        # ``starting_commit_recorded`` check above owns that verdict.
+        return None
+
+    try:
+        repository = repository_service(project, settings=settings)
+        worktree = repository.for_worktree(path)
+        worktree.assert_usable_worktree()
+    except WorktreeUnusable:
+        record(
+            "delivery_candidate_derivable",
+            False,
+            f"the run's worktree at {path} exists but its Git metadata is not "
+            "usable in this execution namespace; recovery will not rebuild a task "
+            "worktree, because it may be the only copy of the approved candidate",
+        )
+        return None
+    except GitError as error:
+        record(
+            "delivery_candidate_derivable",
+            False,
+            f"the run's worktree at {path} could not be read: {error}",
+        )
+        return None
+
+    head = worktree.get_head_sha()
+
+    # ---- provenance: which commit is the approved result --------------------
+    if run.candidate_commit is not None and run.candidate_commit != head:
+        record(
+            "delivery_candidate_provenance",
+            False,
+            f"the run records candidate {run.candidate_commit} but its worktree "
+            f"HEAD is {head}; the recorded result and the on-disk result disagree, "
+            "and recovery will not choose between them",
+        )
+        return None
+    if run.starting_commit is None:
+        record(
+            "delivery_candidate_provenance",
+            False,
+            "the run records no starting commit, so the candidate's ancestry "
+            "against the accepted baseline cannot be established",
+        )
+        return None
+    if head == run.starting_commit:
+        record(
+            "delivery_candidate_provenance",
+            False,
+            f"the worktree HEAD {head} is the run's starting commit; there is no "
+            "committed candidate to deliver",
+        )
+        return None
+    record(
+        "delivery_candidate_provenance",
+        True,
+        f"the committed candidate is the worktree HEAD {head}"
+        + (
+            ", which matches the recorded candidate"
+            if run.candidate_commit is not None
+            else ", derived from the run's worktree because no candidate was recorded"
+        ),
+    )
+
+    # ---- the approved result is committed, not drifted ---------------------
+    if not worktree.is_clean():
+        record(
+            "delivery_candidate_committed",
+            False,
+            f"the run's worktree has uncommitted changes on top of HEAD {head}; "
+            "recovery will not commit unreviewed drift to land an approval",
+        )
+        return None
+    record(
+        "delivery_candidate_committed",
+        True,
+        f"the worktree is clean at HEAD {head}: the approved result is committed",
+    )
+
+    # ---- ancestry against the accepted baseline -----------------------------
+    if not repository.contains_commit(run.starting_commit, ref=head):
+        record(
+            "delivery_candidate_ancestry",
+            False,
+            f"{head} does not descend from the run's starting commit "
+            f"{run.starting_commit}; the committed work is not built on the "
+            "baseline the run actually started from",
+        )
+        return None
+    record(
+        "delivery_candidate_ancestry",
+        True,
+        f"{head} descends from the run's starting commit {run.starting_commit}",
+    )
+
+    # ---- the reviewer approved THIS cycle -----------------------------------
+    reviews = ReviewRepository(session).list_for_run(run.id)
+    approving = [
+        review
+        for review in reviews
+        if review.cycle == run.review_cycle
+        and review.decision is ReviewDecision.APPROVED
+    ]
+    if run.review_cycle < 1 or not approving:
+        record(
+            "delivery_review_approved",
+            False,
+            f"no APPROVED review exists for the run's review cycle "
+            f"{run.review_cycle}; recovery will not deliver work the reviewer never "
+            "accepted",
+        )
+        return None
+    record(
+        "delivery_review_approved",
+        True,
+        f"review cycle {run.review_cycle} was APPROVED ({len(approving)} approving review(s))",
+    )
+
+    # ---- the verification gates the reviewer relied on still stand as passed -
+    verifications = VerificationRunRepository(session).list_for_run(run.id)
+    latest_by_type: dict[VerificationType, VerificationRun] = {}
+    for verification in verifications:
+        if verification.verification_type in _CANDIDATE_VERIFICATION_TYPES:
+            # Rows come back oldest-first, so the last one per type is current.
+            latest_by_type[verification.verification_type] = verification
+    if not latest_by_type:
+        record(
+            "delivery_verification_gates",
+            False,
+            "the run records no candidate verification results, so the gates the "
+            "reviewer was shown cannot be confirmed from durable evidence",
+        )
+        return None
+    failing = sorted(
+        verification_type.value
+        for verification_type, verification in latest_by_type.items()
+        if verification.status
+        in {
+            VerificationStatus.FAILED,
+            VerificationStatus.ERROR,
+            VerificationStatus.TIMEOUT,
+        }
+    )
+    if failing:
+        record(
+            "delivery_verification_gates",
+            False,
+            f"the latest verification for {', '.join(failing)} did not pass; an "
+            "approval whose gates are contradicted is not safe to deliver",
+        )
+        return None
+    record(
+        "delivery_verification_gates",
+        True,
+        f"the latest verification of each of the {len(latest_by_type)} recorded "
+        "candidate gate(s) passed",
+    )
+
+    # ---- the committed diff is still inside the task's allowance -------------
+    assessment = evaluate_scope(
+        DiffSummary(worktree.get_changed_files_between(run.starting_commit, head)),
+        ScopePolicy.for_task(task, project),
+    )
+    if not assessment.allowed:
+        record(
+            "delivery_scope_within_allowance",
+            False,
+            f"the committed diff between {run.starting_commit} and {head} is out "
+            f"of this task's scope: {assessment.summary()}",
+        )
+        return None
+    record(
+        "delivery_scope_within_allowance",
+        True,
+        f"the committed diff is within scope ({assessment.files_changed} file(s), "
+        f"{assessment.diff_lines} line(s))",
+    )
+
+    # ---- the integration ref is not already carrying this candidate ---------
+    #
+    # The ``integration_baseline_compatible`` check above already refused a
+    # baseline that diverged from the run's starting commit. What is left to say is
+    # whether the accepted candidate has *already landed*: a crash between Git
+    # moving the ref and the database committing is exactly this shape, and
+    # delivery must settle it idempotently rather than integrate the same commit a
+    # second time. ``integrate_candidate`` detects the containment and does the
+    # settle; this records that the recovery knows which case it is in.
+    try:
+        already_landed = repository.contains_commit(head, ref=INTEGRATION_BRANCH)
+    except GitError as error:
+        record(
+            "delivery_integration_state",
+            False,
+            f"{INTEGRATION_BRANCH} could not be read to judge the candidate: {error}",
+        )
+        return None
+    record(
+        "delivery_integration_state",
+        True,
+        (
+            f"{INTEGRATION_BRANCH} already contains {head}; re-delivery will "
+            "settle idempotently without moving the ref"
+            if already_landed
+            else f"{INTEGRATION_BRANCH} does not yet contain the candidate; delivery "
+            "will merge and advance it exactly once"
+        ),
+    )
+
+    return head
 
 
 def recover_run(

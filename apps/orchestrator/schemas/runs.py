@@ -95,12 +95,15 @@ class RecoverabilityResponse(BaseModel):
     run_id: UUID
     external_run_id: str | None
     recoverable: bool
-    #: Concern 68. ``continue`` when a coder attempt remains inside the task's
-    #: budget; ``settlement_only`` when none does but the run is non-terminal and
-    #: the fix loop's deterministic exhausted-budget settlement is still owed to
-    #: it; ``None`` when the attempt accounting could not be trusted, which
-    #: always accompanies a refusal. A settlement-only recovery takes ownership
-    #: exactly as a continuation does and executes no attempt.
+    #: Concern 68 and concern 76. ``continue`` when a coder attempt remains inside
+    #: the task's budget; ``delivery_only`` when the review already approved a
+    #: committed candidate and only delivery is owed, so recovery re-enters the
+    #: ordinary delivery node without any model work; ``settlement_only`` when no
+    #: attempt remains but the run is non-terminal and the fix loop's deterministic
+    #: exhausted-budget settlement is still owed to it; ``None`` when the attempt
+    #: accounting could not be trusted, which always accompanies a refusal. Both a
+    #: settlement-only and a delivery-only recovery take ownership exactly as a
+    #: continuation does and execute no coder attempt.
     recovery_mode: RecoveryMode | None
     execution_generation: int
     execution_owner: str | None

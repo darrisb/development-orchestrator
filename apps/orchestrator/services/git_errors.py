@@ -105,3 +105,12 @@ class WorktreeMissing(GitError):
     reports that a run cannot be resumed or delivered from where it worked.
     Recoverable by policy, not by retrying -- see ``services.recovery``.
     """
+
+
+class WorktreeUnusable(GitError):
+    """A linked worktree exists on disk but Git cannot use it.
+
+    This is distinct from a missing worktree: the directory may be present, but
+    its administrative metadata can point at a path that is valid only in a
+    different execution namespace.
+    """

@@ -90,7 +90,15 @@ def _git_soft(repo: Path, *args: str) -> int:
 
 @pytest.fixture
 def repo_copy(tmp_path: Path) -> Path:
-    """Disposable clone carrying the real TraceStack refs and commits."""
+    """Disposable clone frozen at the pre-C73 campaign topology.
+
+    Carries the real objects (``fc6abc5``, ``cbff2c4`` and their common parent)
+    then pins ``agent/integration`` back to the historical baseline. The live
+    campaign has since advanced it and merged the human source, which would make
+    ``cbff2c4`` an ancestor and the operator merge non-conflicting -- the opposite
+    of the topology this contract reconstructs. Only the throwaway clone is
+    written; the canonical repository is never touched.
+    """
     clone = tmp_path / "tracestack-clean"
     subprocess.run(
         ["git", "clone", "--quiet", str(SOURCE_REPO.resolve()), str(clone)],
@@ -105,6 +113,7 @@ def repo_copy(tmp_path: Path) -> Path:
         if name == current:
             continue
         _git(clone, "branch", "--force", name, ref)
+    _git(clone, "update-ref", "refs/heads/agent/integration", INTEGRATION_SHA)
     return clone
 
 
@@ -155,8 +164,15 @@ def _snapshot_runs(factory) -> list[dict]:
 def _import_and_point_at_copy(
     tmp_path: Path, isolated_url: str, repo_copy: Path, monkeypatch: pytest.MonkeyPatch
 ):
+    # Reconstruct against the frozen clone so the importer's read-only Git
+    # validation is deterministic; the live campaign has advanced the baseline
+    # ref the manifest's default path would otherwise read.
+    manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    manifest["repository"]["path"] = str(repo_copy.resolve())
+    manifest_path = tmp_path / "campaign-manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     importer.import_reconstruction(
-        manifest_path=MANIFEST,
+        manifest_path=manifest_path,
         database_url=isolated_url,
         confirm_database=isolated_url.removeprefix("sqlite:///"),
         runner=_runner,
@@ -223,7 +239,14 @@ def test_operator_resolved_merge_completes_the_contract(
     """
     from apps.orchestrator.services import reviews
 
-    # Model the operator's conflict-resolved merge inside the disposable copy.
+    # Reconstruct from the frozen pre-C73 clone first: the importer validates the
+    # baseline (fc6abc5) and the TS-109 run refs against the untouched clone.
+    engine, factory = _import_and_point_at_copy(tmp_path, isolated_url, repo_copy, monkeypatch)
+    before = _snapshot_runs(factory)
+
+    # Model the operator's conflict-resolved merge inside the disposable copy,
+    # after reconstruction, so the reconciliation sees a baseline that already
+    # carries the human work.
     _git(repo_copy, "checkout", "--quiet", "-B", "operator-merge-base", "agent/integration")
     assert _git_soft(repo_copy, "merge", "--no-commit", "--no-ff", HUMAN_COMMIT) != 0
     # Resolve both conflicted paths by keeping the baseline (stage-2) side;
@@ -237,9 +260,6 @@ def test_operator_resolved_merge_completes_the_contract(
     _git(repo_copy, "branch", "--force", "agent/integration", resolved)
     _git(repo_copy, "checkout", "--quiet", "master")
     assert _is_ancestor(repo_copy, HUMAN_COMMIT, "agent/integration")
-
-    engine, factory = _import_and_point_at_copy(tmp_path, isolated_url, repo_copy, monkeypatch)
-    before = _snapshot_runs(factory)
 
     with factory.begin() as session:
         updated = reviews.reconcile_human_commit(
@@ -279,12 +299,19 @@ def test_operator_resolved_merge_completes_the_contract(
     engine.dispose()
 
 
-def test_canonical_repository_never_mutated(
-    isolated_url: str,
-):
-    """The clone fixtures must never move the canonical refs."""
-    assert _git(SOURCE_REPO, "rev-parse", "agent/integration") == INTEGRATION_SHA
-    assert not _is_ancestor(SOURCE_REPO, HUMAN_COMMIT, "agent/integration")
+def test_canonical_repository_never_mutated(repo_copy: Path):
+    """The clone fixture must never move the canonical refs.
+
+    The live campaign has advanced ``agent/integration`` past the pre-C73
+    baseline, so a hardcoded canonical SHA would test a mutable campaign position
+    instead of the isolation guarantee. Snapshot the canonical baseline, advance
+    the disposable clone's copy of that ref, and assert the canonical ref is
+    exactly where it was.
+    """
+    before = _git(SOURCE_REPO, "rev-parse", "agent/integration")
+    _git(repo_copy, "update-ref", "refs/heads/agent/integration", HUMAN_COMMIT)
+    assert _git(repo_copy, "rev-parse", "agent/integration") == HUMAN_COMMIT
+    assert _git(SOURCE_REPO, "rev-parse", "agent/integration") == before
 
 
 def test_manifest_escalation_and_human_commit_are_evidenced():

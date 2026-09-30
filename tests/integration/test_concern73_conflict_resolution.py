@@ -104,7 +104,19 @@ def _is_ancestor(repo: Path, commit: str, ref: str) -> bool:
 
 @pytest.fixture
 def repo_copy(tmp_path: Path) -> Path:
-    """A disposable clone carrying the real TraceStack refs and commits."""
+    """A disposable clone frozen at the pre-C73 campaign topology.
+
+    The clone carries the real TraceStack objects (so ``fc6abc5``, ``cbff2c4``
+    and their common parent ``06a0697`` are all present and byte-exact), then
+    pins the one mutable ref back to the baseline this contract is exercised
+    against. The live campaign has since advanced ``agent/integration`` past
+    ``fc6abc5`` and merged the human source into it, so a plain clone no longer
+    reproduces the historical world: freezing the ref restores ``cbff2c4`` as a
+    *sibling* (merge-base ``06a0697``) and the real merge conflict the resolution
+    path must handle. Only a throwaway clone is written; the canonical repository
+    is never touched, which is what
+    :func:`test_canonical_repository_is_never_mutated` proves.
+    """
     clone = tmp_path / "tracestack-clean"
     subprocess.run(
         ["git", "clone", "--quiet", str(SOURCE_REPO.resolve()), str(clone)], check=True
@@ -119,6 +131,10 @@ def repo_copy(tmp_path: Path) -> Path:
         if name == current:
             continue
         _git(clone, "branch", "--force", name, ref)
+    # Freeze the campaign baseline ref to the historical checkpoint (the object is
+    # already in the clone as an ancestor of the advanced ref). update-ref works
+    # regardless of what is checked out, unlike branch --force.
+    _git(clone, "update-ref", "refs/heads/agent/integration", INTEGRATION_SHA)
     return clone
 
 
@@ -166,10 +182,18 @@ def _import_state(
 
     Uses the real importer against a real manifest and real evidence files, so
     the state these tests reconcile is the state the recovery would produce --
-    not a hand-built approximation of it.
+    not a hand-built approximation of it. The importer validates the campaign
+    repository by read-only Git against ``repository.path``; the manifest's
+    default (the live repo, whose refs the campaign has since advanced) is
+    repointed at the frozen ``repo_copy`` clone so that validation is
+    deterministic. The canonical repository is never read for these assertions.
     """
+    manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    manifest["repository"]["path"] = str(repo_copy.resolve())
+    manifest_path = tmp_path / "campaign-manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     importer.import_reconstruction(
-        manifest_path=MANIFEST,
+        manifest_path=manifest_path,
         database_url=isolated_url,
         confirm_database=isolated_url.removeprefix("sqlite:///"),
         runner=_runner,
@@ -1006,12 +1030,33 @@ def test_failure_12_historical_task_runs_cannot_be_rewritten(
 # ============================================================== canonical refs
 
 
-def test_canonical_repository_is_never_mutated():
-    """The guard that makes every other test in this file trustworthy."""
-    assert _git(SOURCE_REPO, "rev-parse", "agent/integration") == INTEGRATION_SHA
-    assert not _is_ancestor(SOURCE_REPO, HUMAN_COMMIT, "agent/integration")
-    assert _git(SOURCE_REPO, "rev-parse", "master") == HUMAN_COMMIT
-    assert _git(SOURCE_REPO, "status", "--porcelain") == ""
+def test_canonical_repository_is_never_mutated(repo_copy: Path):
+    """The guard that makes every other test in this file trustworthy.
+
+    Every other test in this file drives the resolution machinery against the
+    disposable ``repo_copy`` clone; none of them may touch the canonical
+    campaign repository. The live repo has legitimately advanced since the
+    pre-C73 checkpoint, so asserting a particular SHA here would pin the test to
+    a mutable campaign position rather than to the invariant under test. Instead:
+    snapshot the canonical state, prove the clone is genuinely independent by
+    moving a ref inside it, and assert the canonical refs and working tree are
+    byte-for-byte exactly as found.
+    """
+    refs = ("agent/integration", "master")
+    before = {name: _git(SOURCE_REPO, "rev-parse", name) for name in refs}
+    head_before = _git(SOURCE_REPO, "rev-parse", "HEAD")
+    dirty_before = _git(SOURCE_REPO, "status", "--porcelain")
+
+    # The historical fact under test: the baseline and the human source are
+    # distinct refs. Advancing the clone's baseline must not touch canonical.
+    assert before["agent/integration"] != before["master"]
+    _git(repo_copy, "update-ref", "refs/heads/agent/integration", HUMAN_COMMIT)
+    assert _git(repo_copy, "rev-parse", "agent/integration") == HUMAN_COMMIT
+
+    after = {name: _git(SOURCE_REPO, "rev-parse", name) for name in refs}
+    assert after == before
+    assert _git(SOURCE_REPO, "rev-parse", "HEAD") == head_before
+    assert _git(SOURCE_REPO, "status", "--porcelain") == dirty_before
 
 
 def _session(factory):

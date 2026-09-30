@@ -16,12 +16,63 @@ from apps.orchestrator.domain.enums import EscalationStatus, TaskStatus
 from apps.orchestrator.services import reconstruction_importer as importer
 
 MANIFEST = Path("data/recovery/tracestack_reconstruction_manifest.json")
+SOURCE_REPO = Path("workspace/tracestack-clean")
+#: The pre-C73 campaign baseline the manifest evidences and the importer verifies.
+INTEGRATION_SHA = "fc6abc579cee88f821c5f72f00162872b2dc8326"
 
 
 @pytest.fixture
-def manifest_copy(tmp_path: Path) -> Path:
+def pinned_repo(tmp_path: Path) -> Path:
+    """A disposable clone frozen at the campaign baseline the manifest describes.
+
+    The importer validates the campaign repository by read-only plumbing against
+    its ``repository.path``: it requires ``agent/integration`` at the historical
+    baseline, the human source as a non-integrated sibling, and the seven
+    ``agent/TS-109-*-runN`` refs. The live campaign has since legitimately advanced
+    that ref and merged the human source, so the tests must not read the shared
+    repository's mutable position. Cloning brings every real object across (they are
+    ancestors of the advanced ref); pinning the single ref back gives a
+    deterministic fixture. The canonical repository is never written.
+    """
+    clone = tmp_path / "tracestack-frozen"
+    subprocess.run(
+        ["git", "clone", "--quiet", str(SOURCE_REPO.resolve()), str(clone)], check=True
+    )
+    # Materialise the campaign's local branches (the importer reads refs/heads/*
+    # for the TS-109 run refs) and freeze the baseline ref to the historical
+    # checkpoint; the objects are already in the clone as ancestors of the
+    # advanced ref, so this touches only refs.
+    heads = subprocess.run(
+        ["git", "-C", str(clone), "for-each-ref", "--format=%(refname)",
+         "refs/remotes/origin/"],
+        check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    default = subprocess.run(
+        ["git", "-C", str(clone), "rev-parse", "--abbrev-ref", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    for ref in heads:
+        if ref.endswith("/HEAD"):
+            continue
+        name = ref.removeprefix("refs/remotes/origin/")
+        if name == default:
+            continue
+        subprocess.run(["git", "-C", str(clone), "branch", "--force", name, ref], check=True)
+    subprocess.run(
+        ["git", "-C", str(clone), "update-ref", "refs/heads/agent/integration", INTEGRATION_SHA],
+        check=True,
+    )
+    return clone
+
+
+@pytest.fixture
+def manifest_copy(tmp_path: Path, pinned_repo: Path) -> Path:
     target = tmp_path / "manifest.json"
-    target.write_text(MANIFEST.read_text(encoding="utf-8"), encoding="utf-8")
+    payload = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    # Point the manifest at the deterministic clone instead of the live campaign
+    # repository, whose refs the campaign has since moved.
+    payload["repository"]["path"] = str(pinned_repo)
+    target.write_text(json.dumps(payload), encoding="utf-8")
     return target
 
 

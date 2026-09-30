@@ -40,6 +40,7 @@ from .git_errors import (
     ProtectedBranch,
     PushNotPermitted,
     WorktreePathRejected,
+    WorktreeUnusable,
 )
 
 logger = get_logger(__name__)
@@ -353,6 +354,34 @@ class GitService:
 
     def list_worktrees(self) -> tuple[WorktreeEntry, ...]:
         return _parse_worktrees(self._run("worktree", "list", "--porcelain").stdout)
+
+    def assert_usable_worktree(self, *, expected_head: str | None = None) -> None:
+        """Prove this linked worktree's Git metadata works in this namespace.
+
+        A linked worktree can exist on disk while its ``.git`` file points at an
+        administrative directory spelled for another namespace, for example a
+        container path seen later by a host-run process. In that case most
+        Python path checks pass and the first real Git command fails with
+        "not a git repository". Callers that own a disposable worktree can use
+        this check before deciding whether to reuse or recreate it.
+
+        Raises:
+            WorktreeUnusable: Git cannot resolve this worktree, or it resolves
+                to a different commit than ``expected_head``.
+        """
+        try:
+            head = self.get_head_sha()
+        except GitCommandFailed as exc:
+            raise WorktreeUnusable(str(self.path)) from exc
+        if expected_head is not None:
+            try:
+                expected = self.resolve_sha(expected_head)
+            except GitCommandFailed as exc:
+                raise WorktreeUnusable(str(self.path)) from exc
+            if head != expected:
+                raise WorktreeUnusable(
+                    f"{self.path} is at {head}, expected {expected}"
+                )
 
     # -------------------------------------------------------------- branch ops
 

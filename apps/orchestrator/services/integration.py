@@ -82,7 +82,7 @@ from ..repositories import (
 from . import artifact_store
 from .command_execution import execute_commands
 from .errors import EntityConflict
-from .git_errors import MergeConflict
+from .git_errors import GitError, MergeConflict, WorktreeUnusable
 from .git_service import GitService
 from .worker_service import worker_session
 
@@ -212,6 +212,24 @@ def integrate_candidate(
         settings=config,
     )
     previous = ensure_integration_branch(repository, project)
+
+    # Concern 76: idempotent integration. Git cannot share the delivery
+    # transaction, so a crash after the ref moved but before the database
+    # committed leaves a baseline that already carries this exact candidate while
+    # the run row still says "delivery owed". Asking Git the same question
+    # ``retry_integration`` asks -- is the work already in the baseline -- turns a
+    # replayed delivery into a settle instead of a second, divergent merge. On the
+    # ordinary path the candidate is a brand-new commit and is never contained, so
+    # this short-circuit cannot fire except on a genuine replay.
+    if repository.contains_commit(candidate_sha, ref=INTEGRATION_BRANCH):
+        logger.info(
+            "integration_candidate_already_in_baseline",
+            task=task.external_task_id,
+            run_id=str(run.id),
+            candidate_sha=candidate_sha,
+            baseline_sha=previous,
+        )
+        return _already_integrated(session, project, task, run, previous, candidate_sha)
 
     worktree = _integration_worktree(repository, project, previous, config=config)
     try:
@@ -434,17 +452,56 @@ def _integration_worktree(
     and nothing in it is worth keeping between integrations.
     """
     path = integration_worktree_path(project.id, settings=config)
-    if (path / ".git").exists():
-        worktree = repository.for_worktree(path)
-        worktree.reset_hard_to_sha(baseline)
-        worktree.checkout_detached(baseline)
-    else:
-        if path.exists():
-            shutil.rmtree(path)
-        repository.prune_worktrees()
-        worktree = repository.create_detached_worktree(path, baseline)
+    worktree = _usable_or_recreated_integration_worktree(
+        repository, path, baseline
+    )
     _copy_dependencies(project, path, worktree)
     return worktree
+
+
+def _usable_or_recreated_integration_worktree(
+    repository: GitService, path: Path, baseline: str
+) -> GitService:
+    """Return the supervisor-owned integration worktree at ``baseline``.
+
+    The integration worktree is disposable supervisor state. If its linked
+    worktree metadata was written in another namespace and is not usable here,
+    remove exactly that worktree and recreate it from the expected baseline.
+    Task run worktrees are deliberately not repaired this way: they may be the
+    only copy of an approved or escalated candidate.
+    """
+    if (path / ".git").exists():
+        worktree = repository.for_worktree(path)
+        try:
+            worktree.assert_usable_worktree()
+            worktree.reset_hard_to_sha(baseline)
+            worktree.checkout_detached(baseline)
+            return worktree
+        except WorktreeUnusable as exc:
+            logger.warning(
+                "integration_worktree_unusable_recreating",
+                path=str(path),
+                error=str(exc),
+            )
+            _remove_owned_integration_worktree(repository, path)
+        except GitError:
+            # Other Git failures (for example a dirty or conflicted but usable
+            # tree) remain loud. Recreating on every GitError would turn an
+            # operator problem into silent deletion of evidence.
+            raise
+    elif path.exists():
+        shutil.rmtree(path)
+    repository.prune_worktrees()
+    recreated = repository.create_detached_worktree(path, baseline)
+    recreated.assert_usable_worktree(expected_head=baseline)
+    return recreated
+
+
+def _remove_owned_integration_worktree(repository: GitService, path: Path) -> None:
+    """Remove only the orchestrator-owned integration worktree path."""
+    repository.remove_worktree(path)
+    if path.exists():
+        shutil.rmtree(path)
 
 
 def _copy_dependencies(project: Project, worktree: Path, worktree_git: GitService) -> None:
