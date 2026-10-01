@@ -45,6 +45,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "sensitive_path_exceptions",
         "generated_path_exceptions",
         "dependency_paths",
+        "dependency_bootstrap_commands",
         "approval_gated_categories",
         "tasks",
     }
@@ -127,6 +128,7 @@ class ProjectManifest:
     sensitive_path_exceptions: tuple[str, ...] = ()
     generated_path_exceptions: tuple[str, ...] = ()
     dependency_paths: tuple[str, ...] = ()
+    dependency_bootstrap_commands: tuple[str, ...] = ()
     approval_gated_categories: tuple[str, ...] | None = None
 
     @property
@@ -198,6 +200,10 @@ def parse_manifest(data: Any) -> ProjectManifest:
         ),
         dependency_paths=_parse_string_list(
             document.get("dependency_paths"), "dependency_paths"
+        ),
+        dependency_bootstrap_commands=_parse_string_list(
+            document.get("dependency_bootstrap_commands"),
+            "dependency_bootstrap_commands",
         ),
         approval_gated_categories=(
             None

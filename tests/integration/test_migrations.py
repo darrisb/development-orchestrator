@@ -20,10 +20,9 @@ from apps.orchestrator.domain.enums import (
     TaskStatus,
     WorkerProfile,
 )
-from apps.orchestrator.domain.models import Model, Project, Task, TaskLimits
+from apps.orchestrator.domain.models import Model, Task, TaskLimits
 from apps.orchestrator.repositories import (
     ModelRepository,
-    ProjectRepository,
     TaskRepository,
 )
 
@@ -32,6 +31,38 @@ pytestmark = pytest.mark.integration
 EXPECTED_TABLES = set(Base.metadata.tables)
 
 ENDPOINT = "http://x/v1"
+
+
+def _insert_legacy_project(
+    session, name: str, repository_path: str, worker_profile: str = "node"
+) -> uuid.UUID:
+    """Insert a project the way the app wrote one at an older revision.
+
+    Raw, for the same reason the raw ``task_runs`` inserts below are raw: the
+    mapping now names project columns the database at these revisions does not
+    have, and routing through ``ProjectRepository`` would write today's columns
+    into yesterday's table. Returns the id so the FK children can be built.
+    """
+    project_id = uuid.uuid4()
+    session.execute(
+        text(
+            "INSERT INTO projects "
+            "(id, name, repository_path, default_branch, worker_profile, status, "
+            "protected_paths, sensitive_path_exceptions, generated_path_exceptions, "
+            "dependency_paths, verification_profile, created_at, updated_at) "
+            "VALUES (:id, :name, :repository_path, 'main', :worker_profile, "
+            "'REGISTERED', '[]', '[]', '[]', '[]', "
+            "'{\"build\": [], \"lint\": [], \"tests\": [], \"security\": []}', "
+            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        ),
+        {
+            "id": project_id.hex,
+            "name": name,
+            "repository_path": repository_path,
+            "worker_profile": worker_profile,
+        },
+    )
+    return project_id
 
 
 @pytest.fixture
@@ -156,13 +187,12 @@ def test_a_recorded_call_survives_the_audit_columns_revision(alembic_config):
         with engine.connect() as connection:
             factory = sessionmaker(bind=connection, expire_on_commit=False)
             with factory.begin() as session:
-                project = ProjectRepository(session).add(
-                    Project(name="T", repository_path="/tmp/t", default_branch="main",
-                            worker_profile=WorkerProfile.PYTHON)
+                project_id = _insert_legacy_project(
+                    session, "T", "/tmp/t", WorkerProfile.PYTHON.value
                 )
                 tasks = TaskRepository(session)
                 task = tasks.add(
-                    Task(project_id=project.id, external_task_id="TS-001", title="t",
+                    Task(project_id=project_id, external_task_id="TS-001", title="t",
                          instructions="i", complexity=Complexity.LOW, files_to_modify=["a.py"],
                          limits=TaskLimits(max_files_changed=3, max_diff_lines=200))
                 )
@@ -207,11 +237,9 @@ def test_populated_task_runs_gain_conservative_runtime_accounting(alembic_config
         with engine.connect() as connection:
             factory = sessionmaker(bind=connection, expire_on_commit=False)
             with factory.begin() as session:
-                project = ProjectRepository(session).add(
-                    Project(name="runtime", repository_path="/tmp/runtime")
-                )
+                project_id = _insert_legacy_project(session, "runtime", "/tmp/runtime")
                 task = TaskRepository(session).add(
-                    Task(project_id=project.id, external_task_id="T-1", title="runtime")
+                    Task(project_id=project_id, external_task_id="T-1", title="runtime")
                 )
                 session.execute(
                     text(
@@ -249,11 +277,9 @@ def test_populated_task_runs_gain_unowned_generation_zero(alembic_config):
         with engine.connect() as connection:
             factory = sessionmaker(bind=connection, expire_on_commit=False)
             with factory.begin() as session:
-                project = ProjectRepository(session).add(
-                    Project(name="ownership", repository_path="/tmp/ownership")
-                )
+                project_id = _insert_legacy_project(session, "ownership", "/tmp/ownership")
                 task = TaskRepository(session).add(
-                    Task(project_id=project.id, external_task_id="T-67", title="own")
+                    Task(project_id=project_id, external_task_id="T-67", title="own")
                 )
                 session.execute(
                     text(

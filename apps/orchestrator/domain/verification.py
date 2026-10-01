@@ -65,6 +65,7 @@ COMMAND_CATEGORIES: tuple[VerificationType, ...] = (
 #: none falls through to a generic handler.
 FAILURE_REASONS: Mapping[VerificationType, FailureReason] = {
     VerificationType.SCOPE: FailureReason.SCOPE_VIOLATION,
+    VerificationType.DEPENDENCY_BOOTSTRAP: FailureReason.BUILD_FAILED,
     VerificationType.BUILD: FailureReason.BUILD_FAILED,
     VerificationType.LINT: FailureReason.LINT_FAILED,
     VerificationType.TESTS: FailureReason.TEST_FAILED,
@@ -283,7 +284,9 @@ class VerificationReport:
         ``SKIPPED``, nothing fails, and a caller that checked ``passed``
         would send a completely unverified candidate to review.
         """
-        return self.passed and bool(self.commands_run)
+        return self.passed and any(
+            step.verification_type in COMMAND_CATEGORIES for step in self.commands_run
+        )
 
     @property
     def requires_human_review(self) -> bool:

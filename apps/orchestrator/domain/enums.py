@@ -98,6 +98,7 @@ class RiskLevel(StrEnum):
 
 class VerificationType(StrEnum):
     SCOPE = "SCOPE"
+    DEPENDENCY_BOOTSTRAP = "DEPENDENCY_BOOTSTRAP"
     BUILD = "BUILD"
     LINT = "LINT"
     TESTS = "TESTS"

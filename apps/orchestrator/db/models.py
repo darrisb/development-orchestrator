@@ -25,6 +25,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -73,6 +74,12 @@ class ProjectRow(UUIDPrimaryKey, Timestamps, Base):
         JSON, nullable=False, default=list
     )
     dependency_paths: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    #: ``server_default`` matches the migration that added this column, so a
+    #: schema built by ``create_all`` accepts the same column-omitting inserts
+    #: a migrated schema does.
+    dependency_bootstrap_commands: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list, server_default=text("'[]'")
+    )
     approval_gated_categories: Mapped[list[str] | None] = mapped_column(JSON)
     #: The verification profile (section 18): {"build": [...], "lint": [...],
     #: "tests": [...], "security": [...]}. Stored as declared so a re-import

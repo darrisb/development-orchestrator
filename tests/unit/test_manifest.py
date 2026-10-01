@@ -59,6 +59,7 @@ def test_optional_sections_fall_back_to_documented_defaults():
     assert manifest.max_parallel_tasks == 1
     assert manifest.milestone_interval is None
     assert manifest.protected_paths == ()
+    assert manifest.dependency_bootstrap_commands == ()
     assert task.status is TaskStatus.PENDING
     assert task.complexity is Complexity.MEDIUM
     assert task.risk_level is RiskLevel.LOW
@@ -211,6 +212,16 @@ def test_max_parallel_tasks_is_accepted_but_must_be_positive():
     assert parse_manifest(_minimal(runtime={"max_parallel_tasks": 4})).max_parallel_tasks == 4
     with pytest.raises(ManifestError, match="max_parallel_tasks must be >= 1"):
         parse_manifest(_minimal(runtime={"max_parallel_tasks": 0}))
+
+
+def test_dependency_bootstrap_commands_are_project_configuration():
+    manifest = parse_manifest(
+        _minimal(dependency_bootstrap_commands=["python -m pip install -r requirements.txt"])
+    )
+
+    assert manifest.dependency_bootstrap_commands == (
+        "python -m pip install -r requirements.txt",
+    )
 
 
 # --- Task-declared files (section 6) ----------------------------------------

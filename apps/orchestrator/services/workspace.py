@@ -11,7 +11,6 @@ on failure paths, where raising a second error would bury the first.
 
 from __future__ import annotations
 
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
@@ -35,6 +34,7 @@ from ..repositories import (
     TaskRepository,
     TaskRunRepository,
 )
+from .dependency_bootstrap import prepopulate_dependencies
 from .errors import EntityConflict, EntityNotFound
 from .git_errors import GitError, WorktreeMissing
 from .git_service import DIFF_TRUNCATION_MARKER, GitService
@@ -132,7 +132,7 @@ def prepare_workspace(
     path = config.worktree_root / str(project.id) / directory
 
     worktree_git = repository.create_worktree(path, branch, start_point=starting_commit)
-    _prepopulate_dependencies(project, path, worktree_git)
+    prepopulate_dependencies(project, path, worktree_git, settings=config)
 
     TaskRunRepository(session).update_fields(
         run.id, branch_name=branch, starting_commit=starting_commit
@@ -199,41 +199,6 @@ def _assert_dependencies_integrated(session: Session, task: Task) -> None:
             "whose accepted work is not in the integration baseline; the "
             "blocked integration has to be resolved first"
         )
-
-
-def _prepopulate_dependencies(
-    project: Project, worktree: Path, worktree_git: GitService
-) -> None:
-    """Copy declared, Git-ignored dependencies into a networkless worktree."""
-    repository = Path(project.repository_path).resolve()
-    for declared in project.dependency_paths:
-        relative = Path(declared)
-        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
-            raise ValueError(f"Unsafe dependency path {declared!r}")
-        source = (repository / relative).resolve()
-        if not source.is_relative_to(repository):
-            raise ValueError(f"Dependency path escapes repository: {declared!r}")
-        if not source.exists():
-            raise ValueError(f"Declared dependency path does not exist: {declared!r}")
-        normalized = relative.as_posix()
-        # A directory-only `.gitignore` entry (`node_modules/`) does not match
-        # the bare name when the path is absent from the worktree, which it
-        # always is at this point: Git cannot tell an absent path is a
-        # directory. The source is on disk, so ask with the form that matches.
-        candidates = (normalized, f"{normalized}/") if source.is_dir() else (normalized,)
-        if not any(worktree_git.is_ignored(form) for form in candidates):
-            raise ValueError(
-                f"Dependency path {declared!r} must be ignored by Git before it "
-                "can be copied into a task worktree"
-            )
-        target = worktree / relative
-        if target.exists():
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if source.is_dir():
-            shutil.copytree(source, target, symlinks=True)
-        else:
-            shutil.copy2(source, target, follow_symlinks=False)
 
 
 def workspace_path(

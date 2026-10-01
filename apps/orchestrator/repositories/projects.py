@@ -29,6 +29,7 @@ class ProjectRepository(Repository[ProjectRow, Project]):
             sensitive_path_exceptions=list(row.sensitive_path_exceptions or []),
             generated_path_exceptions=list(row.generated_path_exceptions or []),
             dependency_paths=list(row.dependency_paths or []),
+            dependency_bootstrap_commands=list(row.dependency_bootstrap_commands or []),
             approval_gated_categories=(
                 list(row.approval_gated_categories)
                 if row.approval_gated_categories is not None
@@ -53,6 +54,7 @@ class ProjectRepository(Repository[ProjectRow, Project]):
             sensitive_path_exceptions=list(project.sensitive_path_exceptions),
             generated_path_exceptions=list(project.generated_path_exceptions),
             dependency_paths=list(project.dependency_paths),
+            dependency_bootstrap_commands=list(project.dependency_bootstrap_commands),
             approval_gated_categories=project.approval_gated_categories,
             verification_profile=project.verification.describe(),
             milestone_interval=project.milestone_interval,

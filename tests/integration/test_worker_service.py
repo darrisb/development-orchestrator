@@ -299,6 +299,31 @@ def test_the_worker_environment_is_built_not_inherited(
     assert spec.environment["HOME"] == "/tmp"
 
 
+def test_worker_network_defaults_to_settings_and_can_be_overridden(
+    workspace: TaskWorkspace, tmp_path: Path
+):
+    settings = Settings(
+        _env_file=None,
+        artifact_root=tmp_path / "data",
+        worktree_root=tmp_path / "worktrees",
+        worker_backend=WorkerBackend.SUBPROCESS,
+        worker_network="none",
+    )
+
+    default_spec = build_spec(
+        workspace.path, profile=WorkerProfile.PYTHON, settings=settings
+    )
+    override_spec = build_spec(
+        workspace.path,
+        profile=WorkerProfile.PYTHON,
+        settings=settings,
+        worker_network="bridge",
+    )
+
+    assert default_spec.network == "none"
+    assert override_spec.network == "bridge"
+
+
 def test_a_passthrough_variable_is_copied_and_a_credential_shaped_one_is_not(
     workspace: TaskWorkspace, tmp_path: Path, monkeypatch
 ):
@@ -465,6 +490,29 @@ def test_a_closed_worker_refuses_further_commands(
 
     with pytest.raises(WorkerNotRunning):
         worker.run(f"{PYTHON} verify.py")
+
+
+def test_worker_network_override_is_threaded_through_worker_factories(
+    workspace: TaskWorkspace, worker_settings: Settings
+):
+    worker = start_worker(
+        workspace.path,
+        profile=WorkerProfile.PYTHON,
+        settings=worker_settings,
+        worker_network="bridge",
+    )
+    try:
+        assert worker.spec.network == "bridge"
+    finally:
+        worker.close()
+
+    with worker_session(
+        workspace.path,
+        profile=WorkerProfile.PYTHON,
+        settings=worker_settings,
+        worker_network="host",
+    ) as session_worker:
+        assert session_worker.spec.network == "host"
 
 
 def test_policy_is_applied_even_to_a_caller_that_already_holds_a_worker(

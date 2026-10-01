@@ -521,6 +521,7 @@ def build_spec(
     settings: Settings | None = None,
     secrets: Mapping[str, str] | None = None,
     worker_id: str | None = None,
+    worker_network: str | None = None,
 ) -> WorkerSpec:
     """Assemble a spec, enforcing the mount rule before anything is created.
 
@@ -544,7 +545,7 @@ def build_spec(
         mount_source=daemon_mount,
         image=worker_image_for(profile, config),
         backend=config.worker_backend,
-        network=config.worker_network,
+        network=worker_network if worker_network is not None else config.worker_network,
         cpus=config.worker_cpus,
         memory=config.worker_memory,
         pids_limit=config.worker_pids_limit,
@@ -562,6 +563,7 @@ def start_worker(
     settings: Settings | None = None,
     secrets: Mapping[str, str] | None = None,
     worker_id: str | None = None,
+    worker_network: str | None = None,
 ) -> Worker:
     """Create and start a worker for one worktree.
 
@@ -577,6 +579,7 @@ def start_worker(
         settings=config,
         secrets=secrets,
         worker_id=worker_id,
+        worker_network=worker_network,
     )
     if spec.backend is WorkerBackend.DOCKER:
         assert_backend_available(config)
@@ -604,6 +607,7 @@ def worker_session(
     profile: WorkerProfile,
     settings: Settings | None = None,
     secrets: Mapping[str, str] | None = None,
+    worker_network: str | None = None,
 ) -> Iterator[Worker]:
     """A worker that is destroyed when the block ends, however it ends.
 
@@ -613,7 +617,11 @@ def worker_session(
     """
     config = settings or get_settings()
     worker = start_worker(
-        mount_source, profile=profile, settings=config, secrets=secrets
+        mount_source,
+        profile=profile,
+        settings=config,
+        secrets=secrets,
+        worker_network=worker_network,
     )
     failed = False
     try:

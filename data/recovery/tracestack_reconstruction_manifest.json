@@ -65,7 +65,7 @@
     "repository_path": "/home/darri/development-orchestrator/workspace/tracestack-clean",
     "status": "REGISTERED"
   },
-  "required_alembic_head": "c1f4a7d29b60",
+  "required_alembic_head": "f42b0c91a8d4",
   "repository": {
     "default_branch": "master",
     "expected_integration_sha": "fc6abc579cee88f821c5f72f00162872b2dc8326",

@@ -768,7 +768,7 @@ def _open_resolution_worktree(
             shutil.rmtree(path)
         repository.prune_worktrees()
         worktree = repository.create_detached_worktree(path, baseline)
-    _copy_dependencies(project, path, worktree)
+    _copy_dependencies(project, path, worktree, settings=config)
     return worktree
 
 

@@ -81,6 +81,14 @@ from ..repositories import (
 )
 from . import artifact_store
 from .command_execution import execute_commands
+from .dependency_bootstrap import (
+    NETWORKLESS_VERIFICATION_NETWORK,
+    DependencyBootstrapError,
+    bootstrap_dependencies,
+    finalize_dependency_markers,
+    prepopulate_dependencies,
+    publish_dependencies,
+)
 from .errors import EntityConflict
 from .git_errors import GitError, MergeConflict, WorktreeUnusable
 from .git_service import GitService
@@ -252,6 +260,25 @@ def integrate_candidate(
             settings=config,
         )
 
+    bootstrap_failed = _bootstrap_cumulative_dependencies(
+        session,
+        project,
+        run,
+        worktree,
+        integration_sha=merged,
+        settings=config,
+    )
+    if bootstrap_failed:
+        return _blocked(
+            session, project, task, run, previous,
+            candidate_sha=candidate_sha,
+            reason="dependency bootstrap failed for the merged integration tree",
+            failed_commands=bootstrap_failed,
+            merged_sha=merged,
+            commands_run=0,
+            settings=config,
+        )
+
     failed, ran = _verify_cumulative(
         session, project, run, worktree_path=worktree.path, settings=config
     )
@@ -269,6 +296,37 @@ def integrate_candidate(
             settings=config,
         )
 
+    try:
+        # After verification, before the ref moves: the markers must describe
+        # the tree that is actually being published, and the baseline must not
+        # advance past a publication that failed.
+        finalize_dependency_markers(
+            project,
+            worktree=worktree.path,
+            worktree_git=worktree,
+            integration_sha=merged,
+            settings=config,
+        )
+        publish_dependencies(
+            project,
+            source_worktree=worktree.path,
+            source_worktree_git=worktree,
+            settings=config,
+        )
+    except DependencyBootstrapError as error:
+        return _blocked(
+            session, project, task, run, previous,
+            candidate_sha=candidate_sha,
+            reason=(
+                "the merged tree verified but its dependency tree could not be "
+                "published, so the baseline would advance without the "
+                "dependencies it was verified against"
+            ),
+            failed_commands=(f"dependency publication: {error}",),
+            merged_sha=merged,
+            commands_run=ran,
+            settings=config,
+        )
     advanced = repository.force_branch(INTEGRATION_BRANCH, merged)
     # The task's output is in the baseline, so nothing of it is outstanding and
     # anything that depends on it may run (concern 51). Written here rather than
@@ -455,7 +513,7 @@ def _integration_worktree(
     worktree = _usable_or_recreated_integration_worktree(
         repository, path, baseline
     )
-    _copy_dependencies(project, path, worktree)
+    prepopulate_dependencies(project, path, worktree, settings=config)
     return worktree
 
 
@@ -504,37 +562,42 @@ def _remove_owned_integration_worktree(repository: GitService, path: Path) -> No
         shutil.rmtree(path)
 
 
-def _copy_dependencies(project: Project, worktree: Path, worktree_git: GitService) -> None:
-    """Give the integration worktree the same declared dependencies a task gets.
+def _copy_dependencies(
+    project: Project, worktree: Path, worktree_git: GitService, *, settings: Settings
+) -> None:
+    """Give a conflict-resolution worktree the same dependencies a task gets.
 
-    Cumulative verification runs the project's real commands, so it needs what
-    they need (concern 12). Deliberately a copy of the same rule rather than a
-    call into ``workspace``: that module is about a *run's* worktree and this one
-    has no run.
+    Kept as a named entry point rather than inlined at its one caller in
+    ``human_resolution``: that module borrows this path deliberately, so that a
+    resolution worktree is prepared by the same rule as every other worktree
+    (concern 12), and the import is what documents the sharing.
     """
-    repository_root = Path(project.repository_path).resolve()
-    for declared in project.dependency_paths:
-        relative = Path(declared)
-        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
-            raise ValueError(f"Unsafe dependency path {declared!r}")
-        source = (repository_root / relative).resolve()
-        if not source.is_relative_to(repository_root) or not source.exists():
-            raise ValueError(f"Unusable dependency path {declared!r}")
-        normalized = relative.as_posix()
-        candidates = (normalized, f"{normalized}/") if source.is_dir() else (normalized,)
-        if not any(worktree_git.is_ignored(form) for form in candidates):
-            raise ValueError(
-                f"Dependency path {declared!r} must be ignored by Git before it "
-                "can be copied into the integration worktree"
-            )
-        target = worktree / relative
-        if target.exists():
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if source.is_dir():
-            shutil.copytree(source, target, symlinks=True)
-        else:
-            shutil.copy2(source, target, follow_symlinks=False)
+    prepopulate_dependencies(project, worktree, worktree_git, settings=settings)
+
+
+def _bootstrap_cumulative_dependencies(
+    session: Session,
+    project: Project,
+    run: TaskRun,
+    worktree: GitService,
+    *,
+    integration_sha: str,
+    settings: Settings,
+) -> tuple[str, ...]:
+    try:
+        result = bootstrap_dependencies(
+            session,
+            project,
+            run,
+            worktree_path=worktree.path,
+            worktree_git=worktree,
+            integration_sha=integration_sha,
+            settings=settings,
+            prefix="integration/",
+        )
+    except DependencyBootstrapError as error:
+        return (f"dependency bootstrap: {error}",)
+    return result.failed_commands
 
 
 def _verify_cumulative(
@@ -586,7 +649,10 @@ def _verify_cumulative(
     failures: list[str] = []
     ran = 0
     with worker_session(
-        worktree_path, profile=project.worker_profile, settings=settings
+        worktree_path,
+        profile=project.worker_profile,
+        settings=settings,
+        worker_network=NETWORKLESS_VERIFICATION_NETWORK,
     ) as worker:
         for category in COMMAND_CATEGORIES:
             commands = profile.commands_for(category)

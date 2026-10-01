@@ -62,6 +62,7 @@ class Project:
     sensitive_path_exceptions: list[str] = field(default_factory=list)
     generated_path_exceptions: list[str] = field(default_factory=list)
     dependency_paths: list[str] = field(default_factory=list)
+    dependency_bootstrap_commands: list[str] = field(default_factory=list)
     #: ``None`` keeps the conservative built-in approval categories; an
     #: explicit list (including an empty one) is a project-owned override.
     approval_gated_categories: list[str] | None = None

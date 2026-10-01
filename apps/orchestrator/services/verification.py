@@ -86,6 +86,11 @@ from ..repositories import (
 )
 from . import artifact_store
 from .command_execution import CommandExecution, execute_commands
+from .dependency_bootstrap import (
+    NETWORKLESS_VERIFICATION_NETWORK,
+    DependencyBootstrapError,
+    bootstrap_dependencies,
+)
 from .worker_service import worker_session
 from .workspace import DiffCapture, TaskWorkspace, capture_diff, load_run_context
 
@@ -187,6 +192,26 @@ def verify_candidate(
     if steps[-1].failed:
         return _finish(session, run, task, project, steps, review_reasons, config, prefix)
 
+    try:
+        bootstrap = bootstrap_dependencies(
+            session,
+            project,
+            run,
+            worktree_path=workspace.path,
+            worktree_git=workspace.git,
+            integration_sha=workspace.starting_commit,
+            settings=config,
+            prefix=prefix,
+            secrets=secrets,
+        )
+    except DependencyBootstrapError as error:
+        steps.append(recorder.record(_bootstrap_error_step(str(error))))
+        return _finish(session, run, task, project, steps, review_reasons, config, prefix)
+    for execution in bootstrap.executions:
+        steps.append(recorder.record(_bootstrap_command_step(execution)))
+    if any(step.failed for step in steps):
+        return _finish(session, run, task, project, steps, review_reasons, config, prefix)
+
     # --- the project's commands, in one worker -----------------------------
     if profile.is_empty:
         logger.warning(
@@ -272,7 +297,11 @@ def _run_command_categories(
     candidate_patch = workspace.git.get_diff(workspace.starting_commit)
     try:
         with worker_session(
-            workspace.path, profile=project.worker_profile, settings=settings, secrets=secrets
+            workspace.path,
+            profile=project.worker_profile,
+            settings=settings,
+            secrets=secrets,
+            worker_network=NETWORKLESS_VERIFICATION_NETWORK,
         ) as worker:
             worker_deadline = monotonic() + settings.worker_timeout_seconds
             for category, commands in to_run.items():
@@ -333,6 +362,42 @@ def _command_step(
         executed=True,
         detail=detail,
         output=result.combined_output[-MAX_STEP_OUTPUT_CHARS:],
+    )
+
+
+def _bootstrap_command_step(execution: CommandExecution) -> VerificationStep:
+    result = execution.result
+    status = classify_command(
+        VerificationType.DEPENDENCY_BOOTSTRAP,
+        exit_code=result.exit_code,
+        timed_out=result.timed_out,
+    )
+    detail = ""
+    if result.timed_out:
+        detail = "dependency bootstrap timed out"
+    elif result.truncated:
+        detail = f"output was clipped; {result.output_bytes} bytes were produced"
+    elif not result.succeeded:
+        detail = "dependency bootstrap command failed"
+    return VerificationStep(
+        verification_type=VerificationType.DEPENDENCY_BOOTSTRAP,
+        status=status,
+        command=result.command.display,
+        exit_code=result.exit_code,
+        duration_ms=result.duration_ms,
+        log_artifact=execution.log_artifact,
+        executed=True,
+        detail=detail,
+        output=result.combined_output[-MAX_STEP_OUTPUT_CHARS:],
+    )
+
+
+def _bootstrap_error_step(detail: str) -> VerificationStep:
+    return VerificationStep(
+        verification_type=VerificationType.DEPENDENCY_BOOTSTRAP,
+        status=VerificationStatus.ERROR,
+        command="dependency bootstrap",
+        detail=detail,
     )
 
 

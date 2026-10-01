@@ -172,6 +172,10 @@ def _assert_commands_permitted(manifest: ProjectManifest, settings: Settings) ->
             policy.approve_all(getattr(manifest.verification, category))
         except CommandRejected as error:
             raise ManifestError(f"verification.{category}: {error}") from error
+    try:
+        policy.approve_all(manifest.dependency_bootstrap_commands)
+    except CommandRejected as error:
+        raise ManifestError(f"dependency_bootstrap_commands: {error}") from error
     for task in manifest.tasks:
         try:
             policy.approve_all(task.verify_commands)
@@ -221,6 +225,7 @@ def _resolve_project(
         sensitive_path_exceptions=list(manifest.sensitive_path_exceptions),
         generated_path_exceptions=list(manifest.generated_path_exceptions),
         dependency_paths=list(manifest.dependency_paths),
+        dependency_bootstrap_commands=list(manifest.dependency_bootstrap_commands),
         approval_gated_categories=(
             list(manifest.approval_gated_categories)
             if manifest.approval_gated_categories is not None
@@ -244,6 +249,7 @@ def _project_changes(project: Project, manifest: ProjectManifest) -> dict[str, o
         "sensitive_path_exceptions": list(manifest.sensitive_path_exceptions),
         "generated_path_exceptions": list(manifest.generated_path_exceptions),
         "dependency_paths": list(manifest.dependency_paths),
+        "dependency_bootstrap_commands": list(manifest.dependency_bootstrap_commands),
         "approval_gated_categories": (
             list(manifest.approval_gated_categories)
             if manifest.approval_gated_categories is not None
