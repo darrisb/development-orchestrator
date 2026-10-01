@@ -87,8 +87,8 @@ from ..repositories import (
 from . import artifact_store
 from .command_execution import CommandExecution, execute_commands
 from .dependency_bootstrap import (
+    DEPENDENCY_FAILURES,
     NETWORKLESS_VERIFICATION_NETWORK,
-    DependencyBootstrapError,
     bootstrap_dependencies,
 )
 from .worker_service import worker_session
@@ -204,7 +204,10 @@ def verify_candidate(
             prefix=prefix,
             secrets=secrets,
         )
-    except DependencyBootstrapError as error:
+    except DEPENDENCY_FAILURES as error:
+        # A filesystem failure or a malformed dependency path is a failed
+        # verification step with a readable reason, not an exception escaping
+        # into the fix loop.
         steps.append(recorder.record(_bootstrap_error_step(str(error))))
         return _finish(session, run, task, project, steps, review_reasons, config, prefix)
     for execution in bootstrap.executions:

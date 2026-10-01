@@ -198,6 +198,29 @@ class GitService:
     def get_head_sha(self, rev: str = "HEAD") -> str:
         return self.resolve_sha(rev)
 
+    def git_dir(self) -> Path:
+        """This worktree's own administrative directory, absolute.
+
+        For a linked worktree that is ``<repo>/.git/worktrees/<name>``, which is
+        removed with the worktree. Orchestrator state about *this* tree belongs
+        here: Git never reports anything under it as a working-tree change, so
+        writing here cannot be mistaken for source.
+        """
+        return Path(self._run("rev-parse", "--absolute-git-dir").stdout.strip())
+
+    def git_common_dir(self) -> Path:
+        """The administrative directory shared by the repository and every
+        linked worktree of it, absolute.
+
+        State about the repository as a whole -- as opposed to one worktree --
+        belongs here, so that all worktrees agree on it.
+        """
+        return Path(
+            self._run(
+                "rev-parse", "--path-format=absolute", "--git-common-dir"
+            ).stdout.strip()
+        )
+
     def resolve_sha(self, rev: str) -> str:
         assert_safe_ref_component(rev, label="revision")
         return self._run("rev-parse", "--verify", f"{rev}^{{commit}}").stdout.strip()

@@ -82,10 +82,9 @@ from ..repositories import (
 from . import artifact_store
 from .command_execution import execute_commands
 from .dependency_bootstrap import (
+    DEPENDENCY_FAILURES,
     NETWORKLESS_VERIFICATION_NETWORK,
-    DependencyBootstrapError,
     bootstrap_dependencies,
-    finalize_dependency_markers,
     prepopulate_dependencies,
     publish_dependencies,
 )
@@ -239,7 +238,25 @@ def integrate_candidate(
         )
         return _already_integrated(session, project, task, run, previous, candidate_sha)
 
-    worktree = _integration_worktree(repository, project, previous, config=config)
+    try:
+        worktree = _integration_worktree(repository, project, previous, config=config)
+    except DEPENDENCY_FAILURES as error:
+        # Preparing the declared dependencies is the one part of opening the
+        # integration worktree that depends on project configuration and on the
+        # filesystem rather than on Git. A broken dependency path is an
+        # operator's problem with an operator's fix, so it blocks and escalates
+        # like any other integration outcome. Git failures are not caught here
+        # and stay loud.
+        return _blocked(
+            session, project, task, run, previous,
+            candidate_sha=candidate_sha,
+            reason=(
+                "the integration worktree's declared dependencies could not be "
+                "prepared, so the merged tree could not be verified against them"
+            ),
+            failed_commands=(f"dependency preparation: {error}",),
+            settings=config,
+        )
     try:
         merged = worktree.merge(
             candidate_sha,
@@ -297,23 +314,18 @@ def integrate_candidate(
         )
 
     try:
-        # After verification, before the ref moves: the markers must describe
-        # the tree that is actually being published, and the baseline must not
-        # advance past a publication that failed.
-        finalize_dependency_markers(
-            project,
-            worktree=worktree.path,
-            worktree_git=worktree,
-            integration_sha=merged,
-            settings=config,
-        )
+        # After verification, before the ref moves: the baseline must not
+        # advance past a dependency set that could not be published, or the next
+        # task would start from a tree whose dependencies were never verified
+        # together with it.
         publish_dependencies(
             project,
             source_worktree=worktree.path,
             source_worktree_git=worktree,
+            integration_sha=merged,
             settings=config,
         )
-    except DependencyBootstrapError as error:
+    except DEPENDENCY_FAILURES as error:
         return _blocked(
             session, project, task, run, previous,
             candidate_sha=candidate_sha,
@@ -595,7 +607,7 @@ def _bootstrap_cumulative_dependencies(
             settings=settings,
             prefix="integration/",
         )
-    except DependencyBootstrapError as error:
+    except DEPENDENCY_FAILURES as error:
         return (f"dependency bootstrap: {error}",)
     return result.failed_commands
 
@@ -957,7 +969,15 @@ def integrate_human_commit(
             integrated_sha=commit_sha,
         )
 
-    worktree = _integration_worktree(repository, project, previous, config=config)
+    try:
+        worktree = _integration_worktree(repository, project, previous, config=config)
+    except DEPENDENCY_FAILURES as error:
+        # Unlike the automated path this function raises for every failure by
+        # contract, so the caller can roll back the escalation resolution.
+        raise EntityConflict(
+            f"Human commit {commit_sha} could not be integrated: the project's "
+            f"declared dependencies could not be prepared ({error})"
+        ) from error
     try:
         merged = worktree.merge(
             commit_sha,
