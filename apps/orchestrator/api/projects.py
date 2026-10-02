@@ -100,12 +100,13 @@ def next_task(project_id: UUID, session: Session = Depends(get_db)) -> NextTaskR
 
 
 @router.post("/{project_id}/run", response_model=ProjectRunResponse)
-async def run_project(
-    project_id: UUID, session: Session = Depends(get_db)
-) -> ProjectRunResponse:
+async def run_project(project_id: UUID) -> ProjectRunResponse:
     """Run the next task through the durable workflow, not graph internals."""
-    project_service.get_project(session, project_id)
-    runner = WorkflowRunner.configured(get_session_factory())
+    session_factory = get_session_factory()
+    with session_factory.begin() as session:
+        project_service.get_project(session, project_id)
+
+    runner = WorkflowRunner.configured(session_factory)
     try:
         selection, state = await runner.run_next(project_id)
     finally:

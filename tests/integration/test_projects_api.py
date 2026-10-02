@@ -8,11 +8,13 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy.orm import Session
+from sqlalchemy import Engine
+from sqlalchemy.orm import Session, sessionmaker
 
 from apps.orchestrator.config import get_settings
 from apps.orchestrator.db.session import get_db
 from apps.orchestrator.main import create_app
+from apps.orchestrator.services import projects as project_service
 from apps.orchestrator.services.git_errors import (
     BranchAlreadyExists,
     DirtyWorktree,
@@ -20,6 +22,7 @@ from apps.orchestrator.services.git_errors import (
     ProtectedBranch,
     WorktreeMissing,
 )
+from apps.orchestrator.services.scheduler import NoTaskReason, Selection
 
 pytestmark = pytest.mark.integration
 
@@ -178,6 +181,117 @@ def test_resuming_a_project_that_is_not_paused_is_a_conflict(client: TestClient,
     project = _register(client, tmp_path)
     response = client.post(f"/projects/{project['id']}/resume")
     assert response.status_code == 409
+
+
+def test_run_project_closes_preflight_session_before_workflow(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from apps.orchestrator.api import projects as projects_api
+
+    class RecordingSession(Session):
+        instances: list[RecordingSession] = []
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.closed_for_test = False
+            self.instances.append(self)
+
+        def close(self) -> None:
+            self.closed_for_test = True
+            super().close()
+
+    class Runner:
+        async def run_next(self, project_id):
+            observed["all_preflight_sessions_closed"] = all(
+                session.closed_for_test for session in RecordingSession.instances
+            )
+            return Selection(reason=NoTaskReason.NO_TASKS), None
+
+        async def aclose(self):
+            observed["runner_closed"] = True
+
+    observed: dict[str, bool] = {}
+    connection = engine.connect()
+    transaction = connection.begin()
+    factory = sessionmaker(
+        bind=connection,
+        class_=RecordingSession,
+        expire_on_commit=False,
+        join_transaction_mode="create_savepoint",
+    )
+    try:
+        with factory.begin() as setup:
+            project = project_service.create_project(
+                setup, name="TraceStack", repository_path=str(tmp_path)
+            )
+            project_id = project.id
+
+        monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+        get_settings.cache_clear()
+        monkeypatch.setattr(projects_api, "get_session_factory", lambda: factory)
+        monkeypatch.setattr(
+            projects_api.WorkflowRunner,
+            "configured",
+            staticmethod(lambda session_factory: Runner()),
+        )
+        app = create_app()
+        with TestClient(app) as test_client:
+            response = test_client.post(f"/projects/{project_id}/run")
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "run_id": None,
+            "outcome": None,
+            "state": None,
+            "no_task_reason": "NO_TASKS",
+        }
+        assert observed == {
+            "all_preflight_sessions_closed": True,
+            "runner_closed": True,
+        }
+    finally:
+        get_settings.cache_clear()
+        transaction.rollback()
+        connection.close()
+
+
+def test_run_project_preserves_project_not_found_before_workflow(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from apps.orchestrator.api import projects as projects_api
+
+    connection = engine.connect()
+    transaction = connection.begin()
+    factory = sessionmaker(
+        bind=connection,
+        expire_on_commit=False,
+        join_transaction_mode="create_savepoint",
+    )
+    configured_called = False
+
+    def configured(session_factory):
+        nonlocal configured_called
+        configured_called = True
+        raise AssertionError("runner should not be built for an unknown project")
+
+    try:
+        monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+        get_settings.cache_clear()
+        monkeypatch.setattr(projects_api, "get_session_factory", lambda: factory)
+        monkeypatch.setattr(
+            projects_api.WorkflowRunner, "configured", staticmethod(configured)
+        )
+        app = create_app()
+        with TestClient(app) as test_client:
+            response = test_client.post(f"/projects/{uuid4()}/run")
+
+        assert response.status_code == 404
+        assert response.json()["error"] == "EntityNotFound"
+        assert configured_called is False
+    finally:
+        get_settings.cache_clear()
+        transaction.rollback()
+        connection.close()
 
 
 @pytest.mark.parametrize(
