@@ -338,11 +338,14 @@ async def run_coding_attempt(
             FailureReason.INVALID_MODEL_RESPONSE,
             feedback=(
                 f"Your previous answer could not be applied: {error}. Return one JSON "
-                f"object with an 'edits' array. For a small change to an existing file "
-                f"use operation 'replace' with 'oldText' copied exactly from the file "
-                f"and the 'newText' that replaces it; otherwise return the complete new "
-                f"contents of every file you change. An omitted test is a deleted test: "
-                f"keep the content the task did not ask you to remove."
+                f"object with an 'edits' array. For an existing writable file whose "
+                f"complete original contents were supplied and whose complete-file "
+                f"update fits the stated limit, prefer operation 'update' with the "
+                f"COMPLETE resulting file contents. Use 'create' for new files. Use "
+                f"'replace' only when a complete-file update is not appropriate or "
+                f"permitted, with 'oldText' copied exactly from the file and the "
+                f"'newText' that replaces it. An omitted test is a deleted test: keep "
+                f"the content the task did not ask you to remove."
             ),
             plan=plan,
             assessment=assessment,
@@ -368,12 +371,15 @@ async def run_coding_attempt(
             FailureReason.INVALID_MODEL_RESPONSE,
             feedback=(
                 "Your previous answer contained edits that could not be applied: "
-                f"{detail}. For a small change to an existing file, use operation "
-                "'replace' with 'oldText' copied exactly from the file's current "
-                "contents and the 'newText' that replaces it, and leave 'content' as "
-                "an empty string. Otherwise return the complete new contents of every "
-                "file you change, within the size limits. Keep all the content the "
-                "task did not ask you to change: an omitted test is a deleted test."
+                f"{detail}. For an existing writable file whose complete original "
+                "contents were supplied and whose complete-file update fits the "
+                "stated limit, prefer operation 'update' with the COMPLETE resulting "
+                "file contents. Use 'create' for new files. Use 'replace' only when "
+                "a complete-file update is not appropriate or permitted, with "
+                "'oldText' copied exactly from the file's current contents and "
+                "'newText' that replaces it, and leave 'content' as an empty string. "
+                "Keep all the content the task did not ask you to change: an omitted "
+                "test is a deleted test."
             ),
             plan=plan,
             assessment=assessment,
@@ -695,11 +701,11 @@ def _judge(
             + (f": {rejected}." if rejected else ".")
             + " Name files that exist for 'update' and use 'create' for new ones."
             + (
-                " For a small change to a file that already exists, prefer operation "
-                "'replace' with 'oldText' copied exactly from the file's current "
-                "contents -- it must occur exactly once -- and the 'newText' that "
-                "replaces it, with 'content' left as an empty string. That way the "
-                "rest of the file, including its existing tests, is preserved exactly."
+                " For a 'replace' fallback, copy 'oldText' exactly from the file's "
+                "current contents -- it must occur exactly once -- provide the "
+                "'newText' that replaces it, and leave 'content' as an empty string. "
+                "That way the rest of the file, including its existing tests, is "
+                "preserved exactly."
                 if asked_for_targeted
                 else ""
             )

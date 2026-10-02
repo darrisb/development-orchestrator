@@ -34,7 +34,7 @@ from ..domain.models import Task
 from ..domain.plan import CodingPlan
 
 #: Bumped on any change to the strings below.
-CODER_PROMPT_VERSION = "coder-prompt/3"
+CODER_PROMPT_VERSION = "coder-prompt/4"
 
 _SHARED_RULES = """\
 You are a senior software engineer working inside an automated orchestrator on
@@ -67,23 +67,24 @@ CODER_SYSTEM_PROMPT = f"""{_SHARED_RULES}
 For this request you are writing the code. How you describe a change is your
 choice, and the two operations below are not interchangeable.
 
-operation "replace" -- for a small change to a region of a file that already
-exists. Give 'oldText' copied exactly and character for character from the
-file's current contents, and 'newText' to put in its place. 'oldText' must
-occur in the file exactly once: if it occurs nowhere the edit is refused, and if
-it occurs more than once the edit is refused, so include enough surrounding
-context to make it unique. Everything outside that region is left exactly as it
-is. Use an empty 'newText' to delete the matched text.
+operation "replace" -- for a targeted change to a region of a file that already
+exists when a complete-file update is not appropriate or permitted. Give
+'oldText' copied exactly and character for character from the file's current
+contents, and 'newText' to put in its place. 'oldText' must occur in the file
+exactly once: if it occurs nowhere the edit is refused, and if it occurs more
+than once the edit is refused, so include enough surrounding context to make it
+unique. Everything outside that region is left exactly as it is. Use an empty
+'newText' to delete the matched text.
 
 operation "create" or "update" -- for a new file, or for a change large enough
-that the region is most of it. You return the file's complete new contents, not
-a diff or a patch and not an excerpt: no placeholders, no "... rest of file
-unchanged", no elisions of any kind. A file you return this way replaces what is
-in the repository, so anything you leave out is deleted.
-
-Prefer "replace" when the task asks for a small change to an existing file. It
-is shorter for you to write and it cannot destroy the parts of the file you
-were not asked to change.
+that the complete resulting file is the right representation. For an existing
+writable file whose complete original contents were supplied to you, and for
+which a complete-file update is permitted, prefer "update" and return the
+COMPLETE resulting file contents. Use "create" for a new file. For "create" or
+"update", you return the file's complete new contents, not a diff or a patch
+and not an excerpt: no placeholders, no "... rest of file unchanged", no
+elisions of any kind. A file you return this way replaces what is in the
+repository, so anything you leave out is deleted.
 
 Never remove content the task did not ask you to remove.
 Keep the tests a file already has: adding a test means adding to the file, not
@@ -172,13 +173,19 @@ def render_coding_instructions(
         f"# Implement task {task.external_task_id}",
         (
             "Implement the task described in the repository context below.\n"
-            "- For a small change to a file that already exists, use operation "
-            "'replace' with 'oldText' copied exactly from that file's current "
-            "contents -- it has to occur exactly once -- and the 'newText' that "
-            "replaces it. The rest of the file, including every test it already "
-            "contains, is preserved as it is.\n"
-            "- For a new file, or a change covering most of a file, return the "
-            "complete new contents with operation 'create' or 'update'.\n"
+            "- For an existing writable file whose complete original contents "
+            "were supplied to you, and for which a complete-file update is "
+            "permitted by the whole-file byte limit below, prefer operation "
+            "'update' and return the COMPLETE resulting file contents. Preserve "
+            "all existing content not intentionally changed.\n"
+            "- For a new file, use operation 'create' and return the complete "
+            "new contents.\n"
+            "- Use operation 'replace' as a supported targeted operation or "
+            "fallback when a complete-file update is not appropriate or "
+            "permitted. Its 'oldText' must be copied exactly from that file's "
+            "current contents and occur exactly once, and 'newText' is the text "
+            "that replaces it. The rest of the file, including every test it "
+            "already contains, is preserved as it is.\n"
             "- Whatever operation you use, do not remove content the task did not "
             "ask you to remove, and keep the tests a file already has.\n"
             "An omitted test is a deleted test, and deleting tests to make an answer "
@@ -209,7 +216,9 @@ def render_coding_instructions(
         limits_lines = [
             "- The following files have byte limits on their complete replacement "
             "contents. The limit applies only to a 'create' or an 'update' of that "
-            "file; a 'replace' of it is not measured against it."
+            "file; a 'replace' of it is not measured against it. These existing "
+            "writable files were supplied complete, so prefer 'update' for them "
+            "when the complete resulting contents fit the listed limit."
         ]
         for path in sorted(path_output_limits):
             limits_lines.append(f"  - `{path}`: {path_output_limits[path]} bytes")

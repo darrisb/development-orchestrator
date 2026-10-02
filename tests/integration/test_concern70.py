@@ -1021,11 +1021,39 @@ def test_the_prompt_advertises_the_targeted_operation():
     assert "occur exactly once" in prompt
 
 
-def test_the_system_prompt_states_both_operations_and_which_to_prefer():
+def test_the_system_prompt_states_supported_operations_without_small_replace_preference():
     assert 'operation "replace"' in CODER_SYSTEM_PROMPT
     assert 'operation "create" or "update"' in CODER_SYSTEM_PROMPT
-    assert 'Prefer "replace" when the task asks for a small change' in CODER_SYSTEM_PROMPT
+    assert 'prefer "update"' in CODER_SYSTEM_PROMPT
+    assert 'Use "create" for a new file' in CODER_SYSTEM_PROMPT
+    assert "small change" not in CODER_SYSTEM_PROMPT
+    assert 'Prefer "replace"' not in CODER_SYSTEM_PROMPT
     assert "if it occurs nowhere the edit is refused" in CODER_SYSTEM_PROMPT
+
+
+def test_complete_writable_existing_files_are_steered_to_update():
+    prompt = _instructions(path_output_limits={NAV_TEST: 14_766})
+
+    assert "were supplied complete, so prefer 'update' for them" in prompt
+    assert "prefer operation 'update'" in prompt
+    assert "COMPLETE resulting file contents" in prompt
+    assert "Preserve all existing content not intentionally changed" in prompt
+
+
+def test_replace_remains_supported_with_exact_old_text_semantics():
+    prompt = _instructions()
+
+    assert "Use operation 'replace' as a supported targeted operation" in prompt
+    assert "not appropriate or permitted" in prompt
+    assert "'oldText' must be copied exactly" in prompt
+    assert "occur exactly once" in prompt
+
+
+def test_create_remains_the_operation_for_new_files():
+    prompt = _instructions()
+
+    assert "For a new file, use operation 'create'" in prompt
+    assert "return the complete new contents" in prompt
 
 
 def test_the_prompt_tells_the_model_to_preserve_unrelated_tests_and_content():
