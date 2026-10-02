@@ -83,7 +83,7 @@ from ..domain.review import HumanApprovalPolicy, issue_fingerprint, unreraised_i
 from ..domain.state_machine import can_transition
 from ..domain.verification import VerificationReport
 from ..domain.workflow import deadline_exceeded, run_deadline
-from ..providers import ModelProvider
+from ..providers import ModelProvider, ModelProviderError
 from ..providers.review import ReviewProvider
 from ..repositories import (
     EscalationRepository,
@@ -383,7 +383,6 @@ async def run_fix_loop(
 
     Raises:
         EntityNotFound: the run, its task or its project is missing.
-        ModelProviderError: the coder's endpoint failed or timed out.
         ReviewerUnavailable: the reviewer could not produce a review.
         WorkerBackendUnavailable: the container runtime is not usable.
         CommandRejected: a configured verification command is not permitted.
@@ -591,6 +590,8 @@ async def run_fix_loop(
                 reason=iteration.failure_reason,
                 rollback=True,
             )
+        if iteration.action is FailureAction.RETRY:
+            continue
         if iteration.action is FailureAction.SEND_TO_CODER and iteration.feedback:
             feedback = _correction_feedback(
                 iterations,
@@ -661,17 +662,27 @@ async def _turn(
     record of the call with it, and the resumed run cannot tell an attempt that
     was made from one that never was.
     """
-    attempt = await run_coding_attempt(
-        session,
-        workspace,
-        provider=coder,
-        settings=config,
-        review_feedback=feedback,
-        # A correction attempt does not re-plan: see ``run_coding_attempt``.
-        plan_required=False if number > 1 else None,
-        review_cycle=cycle,
-        checkpoint_call=checkpoint_call,
-    )
+    try:
+        attempt = await run_coding_attempt(
+            session,
+            workspace,
+            provider=coder,
+            settings=config,
+            review_feedback=feedback,
+            # A correction attempt does not re-plan: see ``run_coding_attempt``.
+            plan_required=False if number > 1 else None,
+            review_cycle=cycle,
+            checkpoint_call=checkpoint_call,
+        )
+    except ModelProviderError as error:
+        attempt = _provider_failed_attempt(
+            session,
+            run,
+            task,
+            project,
+            provider=coder,
+            error=error,
+        )
     if attempt.failure_reason is not None:
         return _stop(
             FixIteration(number=number, attempt=run.attempt_number, cycle=cycle,
@@ -742,6 +753,13 @@ def _stop(
     """
     action = action_for(reason)
     if action is not FailureAction.SEND_TO_CODER:
+        if action is FailureAction.RETRY and limits_exhausted:
+            return replace(
+                iteration,
+                failure_reason=FailureReason.RETRY_EXHAUSTED,
+                action=FailureAction.ESCALATE,
+                feedback=feedback,
+            )
         return replace(iteration, failure_reason=reason, action=action, feedback=None)
     if limits_exhausted:
         return replace(
@@ -751,6 +769,52 @@ def _stop(
             feedback=feedback,
         )
     return replace(iteration, failure_reason=reason, action=action, feedback=feedback)
+
+
+def _provider_failed_attempt(
+    session: Session,
+    run: TaskRun,
+    task: Task,
+    project: Project,
+    *,
+    provider: ModelProvider,
+    error: ModelProviderError,
+) -> CodingAttempt:
+    """Represent a recorded provider failure as this turn's failed attempt.
+
+    ``run_coding_attempt`` has already recorded and checkpointed the failed
+    model call before raising. This adapter deliberately does not write another
+    model-call or advance any counters; it only gives the fix loop the same
+    shape it already knows how to route.
+    """
+    stored_run = TaskRunRepository(session).get(run.id) or run
+    feedback = str(error)
+    _emit(
+        session,
+        stored_run,
+        task,
+        project,
+        RunEventType.CODING_COMPLETED,
+        {"failure_reason": error.reason.value, "feedback": feedback},
+    )
+    logger.warning(
+        "coding_attempt_provider_failed",
+        run_id=str(run.id),
+        task=task.external_task_id,
+        attempt=stored_run.attempt_number,
+        failure_reason=error.reason.value,
+        error=str(error),
+    )
+    return CodingAttempt(
+        task_run_id=run.id,
+        external_task_id=task.external_task_id,
+        attempt=stored_run.attempt_number,
+        context_hash=stored_run.context_hash or "",
+        provider_id=provider.config.provider_id,
+        model_name=provider.config.model_name,
+        failure_reason=error.reason,
+        feedback=feedback,
+    )
 
 
 def _reviews_are_stagnant(

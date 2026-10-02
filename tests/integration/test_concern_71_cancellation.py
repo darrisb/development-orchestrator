@@ -90,10 +90,7 @@ from apps.orchestrator.services.runs import create_run
 from apps.orchestrator.services.workspace import load_run_context
 from apps.orchestrator.workflow import WorkflowRunner
 from apps.orchestrator.workflow.graph import CANCELLATION_FAILURE_REASON
-from apps.orchestrator.workflow.recovery import (
-    RecoveryDisposition,
-    inspect_incomplete_runs,
-)
+from apps.orchestrator.workflow.recovery import inspect_incomplete_runs
 from tests.conftest import run_git
 from tests.integration.test_fix_loop import (
     BROKEN,
@@ -706,37 +703,32 @@ def _run_isolated(awaitable: Any) -> BaseException | None:
 
 @pytest.mark.asyncio
 async def test_a_provider_failure_is_not_a_cancellation(tmp_path: Path):
-    """Concern 67's behaviour is unchanged: an endpoint that timed out strands.
+    """A provider timeout is routed by the loop, not recorded as cancellation.
 
-    A provider failure is an ``Exception`` and has always unwound through the
-    ordinary handler, leaving the run in flight for an operator to recover --
-    concern 67, and the test that pins it. The cancellation settlement must
-    not quietly take that over: the two conditions need different answers, and
-    the difference is that one has a person coming to it and the other does not.
+    A provider failure is an ``Exception`` and must not be confused with an
+    ``asyncio.CancelledError``. It now stays inside the fix loop's bounded
+    attempt accounting instead of escaping and stranding the run.
     """
     coder = GatedModel(
         _code(BROKEN),
         ModelTimeout("coder request timed out after 600s", timeout_seconds=600.0),
     )
-    world = _world(tmp_path, coder)
+    world = _world(tmp_path, coder, limits=TaskLimits(max_attempts=2))
     try:
-        with pytest.raises(ModelTimeout):
-            await world.runner.run(world.run_id)
+        await world.runner.run(world.run_id)
 
         state = world.read()
         run, stored_task = state["run"], state["task"]
-        assert run.status is RunStatus.RUNNING
-        assert run.failure_reason is None
+        assert run.status is RunStatus.FAILED
+        assert run.failure_reason == "RETRY_EXHAUSTED"
         assert state["cancellations"] == []
-        assert stored_task.status is TaskStatus.CODING
+        assert stored_task.status is TaskStatus.HUMAN_REVIEW
         assert run.execution_owner is None
         assert [call.status for call in state["model_calls"]] == [
             RunStatus.SUCCEEDED,
             RunStatus.FAILED,
         ]
-        assert state["recoverable"] and (
-            state["recoverable"][0].disposition is RecoveryDisposition.RESUMABLE
-        )
+        assert state["recoverable"] == []
     finally:
         world.engine.dispose()
 
@@ -857,4 +849,3 @@ async def test_a_superseded_dispatch_cannot_settle_a_recovered_run(tmp_path: Pat
         assert state["recoverable"], "a run with a live owner is not recoverable"
     finally:
         world.engine.dispose()
-

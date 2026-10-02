@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy.orm import Session
 
+from apps.orchestrator.agents.coding_agent import run_coding_attempt
 from apps.orchestrator.agents.fix_loop import (
     FIX_LOOP_ARTIFACT,
     LoopOutcome,
@@ -42,6 +43,7 @@ from apps.orchestrator.domain.enums import (
     Complexity,
     EscalationStatus,
     FailureReason,
+    ModelPurpose,
     ModelRole,
     RunEventType,
     RunStatus,
@@ -57,11 +59,13 @@ from apps.orchestrator.providers import (
     ProviderConfig,
     TokenUsage,
 )
+from apps.orchestrator.providers.errors import ModelTimeout
 from apps.orchestrator.providers.review import ModelReviewProvider
 from apps.orchestrator.providers.structured import parse_structured, strip_reasoning
 from apps.orchestrator.repositories import (
     ArtifactRepository,
     EscalationRepository,
+    ModelRunRepository,
     ProjectRepository,
     ReviewRepository,
     RunEventRepository,
@@ -341,6 +345,14 @@ def _status(session: Session, task: Task) -> TaskStatus:
 
 def _events(session: Session, run: TaskRun) -> list[RunEventType]:
     return [event.event_type for event in RunEventRepository(session).list_for_run(run.id)]
+
+
+def _coding_calls(session: Session, run: TaskRun) -> list:
+    return [
+        call
+        for call in ModelRunRepository(session).list_for_run(run.id)
+        if call.purpose in {ModelPurpose.CODE, ModelPurpose.FIX}
+    ]
 
 
 def _artifact(settings: Settings, path: str) -> str:
@@ -634,6 +646,129 @@ async def test_an_unfixable_fixture_escalates_when_the_attempts_run_out(
     assert (workspace.path / "src" / "nav.py").read_text() == BROKEN
     assert stored_run.starting_commit in escalation.summary
     assert RunEventType.HUMAN_REVIEW_REQUIRED in _events(session, run)
+
+
+@pytest.mark.asyncio
+async def test_provider_timeout_on_first_attempt_retries_inside_the_fix_loop(
+    session: Session,
+    workspace: TaskWorkspace,
+    run: TaskRun,
+    loop_settings: Settings,
+):
+    coder = ScriptedModel(
+        ModelTimeout("coder timed out after 600s", timeout_seconds=600),
+        _code(WORKING),
+    )
+
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=coder,
+        reviewer=reviewer(_review()),
+        settings=loop_settings,
+    )
+
+    assert result.outcome is LoopOutcome.APPROVED
+    assert result.attempts_used == 2
+    assert [iteration.failure_reason for iteration in result.iterations] == [
+        FailureReason.MODEL_TIMEOUT,
+        None,
+    ]
+
+    calls = _coding_calls(session, run)
+    assert [call.status for call in calls] == [RunStatus.FAILED, RunStatus.SUCCEEDED]
+    assert [call.attempt for call in calls] == [1, 2]
+    assert len(calls) == 2, "the failed provider call was not recorded twice"
+
+
+@pytest.mark.asyncio
+async def test_repeated_provider_failures_exhaust_exactly_max_attempts(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    run: TaskRun,
+    loop_settings: Settings,
+):
+    coder = ScriptedModel(
+        *[
+            ModelTimeout("coder timed out after 600s", timeout_seconds=600)
+            for _ in range(task.limits.max_attempts)
+        ]
+    )
+
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=coder,
+        reviewer=reviewer(),
+        settings=loop_settings,
+    )
+
+    assert result.outcome is LoopOutcome.ESCALATED
+    assert result.failure_reason is FailureReason.RETRY_EXHAUSTED
+    assert result.attempts_used == task.limits.max_attempts
+    assert result.cycles_used == 0
+    assert not coder.answers, "the loop stopped at the task's attempt ceiling"
+
+    calls = _coding_calls(session, run)
+    assert len(calls) == task.limits.max_attempts
+    assert [call.status for call in calls] == [RunStatus.FAILED] * task.limits.max_attempts
+    assert [call.attempt for call in calls] == list(range(1, task.limits.max_attempts + 1))
+
+    stored_run = TaskRunRepository(session).get(run.id)
+    assert stored_run.status is RunStatus.FAILED
+    assert stored_run.failure_reason == FailureReason.RETRY_EXHAUSTED.value
+    assert stored_run.execution_owner is None
+    assert stored_run.completed_at is not None
+
+    (escalation,) = EscalationRepository(session).list_open(task_id=task.id)
+    assert escalation.reason == FailureReason.RETRY_EXHAUSTED.value
+    assert "3 of the task's 3 permitted attempts" in escalation.summary
+
+
+@pytest.mark.asyncio
+async def test_recovery_from_already_stranded_provider_failure_uses_next_attempt(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    run: TaskRun,
+    loop_settings: Settings,
+):
+    with pytest.raises(ModelTimeout):
+        await run_coding_attempt(
+            session,
+            workspace,
+            provider=ScriptedModel(
+                ModelTimeout("coder timed out after 600s", timeout_seconds=600)
+            ),
+            settings=loop_settings,
+            checkpoint_call=session.commit,
+        )
+    session.rollback()
+
+    stranded = TaskRunRepository(session).get(run.id)
+    assert stranded.status is RunStatus.RUNNING
+    assert stranded.execution_owner is None
+    assert [call.attempt for call in _coding_calls(session, run)] == [1]
+
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=ScriptedModel(_code(WORKING)),
+        reviewer=reviewer(_review()),
+        settings=loop_settings,
+    )
+
+    assert result.outcome is LoopOutcome.APPROVED
+    assert result.recovery is not None
+    assert result.recovery.interrupted_attempt == 1
+    assert result.attempts_used == 2
+    assert result.iterations[0].attempt == 2
+    assert [call.status for call in _coding_calls(session, run)] == [
+        RunStatus.FAILED,
+        RunStatus.SUCCEEDED,
+    ]
+    assert [call.attempt for call in _coding_calls(session, run)] == [1, 2]
 
 
 @pytest.mark.asyncio

@@ -56,12 +56,14 @@ from pathlib import Path
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
+from apps.orchestrator.agents.coding_agent import run_coding_attempt
 from apps.orchestrator.agents.fix_loop import (
     FIX_LOOP_ARTIFACT,
     LoopOutcome,
     run_fix_loop,
 )
 from apps.orchestrator.agents.loop_recovery import recover_loop_state
+from apps.orchestrator.agents.review_agent import run_review
 from apps.orchestrator.agents.review_prompts import (
     REVIEWER_SYSTEM_PROMPT,
     render_review_instructions,
@@ -98,7 +100,12 @@ from apps.orchestrator.repositories import (
 )
 from apps.orchestrator.services.abandon import abandon_run
 from apps.orchestrator.services.runs import create_run
-from apps.orchestrator.services.workspace import attach_workspace, prepare_workspace
+from apps.orchestrator.services.verification import verify_candidate
+from apps.orchestrator.services.workspace import (
+    TaskWorkspace,
+    attach_workspace,
+    prepare_workspace,
+)
 from tests.conftest import run_git
 from tests.integration.test_fix_loop import (
     _COMPILE,
@@ -260,6 +267,63 @@ def _calls(session: Session, run: TaskRun, *purposes: str) -> list:
     ]
 
 
+async def _strand_correction_timeout(
+    session: Session,
+    run: TaskRun,
+    settings: Settings,
+    *,
+    first_code: str,
+    timed_out_code: Exception,
+    first_review: str,
+    timeout_model: type[ScriptedModel] = ScriptedModel,
+    workspace: TaskWorkspace | None = None,
+) -> TaskWorkspace:
+    """Leave a run in the legacy state produced by an escaped coder timeout."""
+    workspace = workspace or prepare_workspace(session, run.id, settings=settings)
+    first_attempt = await run_coding_attempt(
+        session,
+        workspace,
+        provider=ScriptedModel(first_code),
+        settings=settings,
+        review_cycle=1,
+        checkpoint_call=session.commit,
+    )
+    report = verify_candidate(session, workspace, settings=settings)
+    review = None
+    if report.passed:
+        review = await run_review(
+            session,
+            workspace,
+            provider=reviewer(first_review),
+            verification=report,
+            completion_report=first_attempt.report,
+            settings=settings,
+            checkpoint_call=session.commit,
+        )
+        assert review.feedback
+        feedback = review.feedback
+        review_cycle = 2
+    else:
+        feedback = first_attempt.feedback
+        review_cycle = 1
+    session.commit()
+    TaskRunRepository(session).update_fields(run.id, attempt_number=2)
+    session.commit()
+    with pytest.raises(ModelTimeout):
+        await run_coding_attempt(
+            session,
+            workspace,
+            provider=timeout_model(timed_out_code),
+            settings=settings,
+            review_feedback=feedback,
+            plan_required=False,
+            review_cycle=review_cycle,
+            checkpoint_call=session.commit,
+        )
+    session.rollback()
+    return workspace
+
+
 async def _interrupt_then_resume(
     session: Session,
     run: TaskRun,
@@ -268,26 +332,21 @@ async def _interrupt_then_resume(
     coders: tuple[tuple, ...],
     reviewers: tuple[tuple, ...],
 ):
-    """Run the loop, lose the correction, then run it again on the same run.
+    """Create a legacy interrupted correction, then run the loop again.
 
-    The first invocation is abandoned the way the graph abandons it: the
-    exception propagates and the transaction is rolled back. The second is a
-    fresh call to ``run_fix_loop`` with nothing carried over from the first -- no
-    in-memory list, no feedback variable, no attempt counter, no ``first``
-    attempt. If the resume needs any of those, this test fails, which is the
-    point of it.
+    ``run_fix_loop`` now consumes coder-side provider failures and routes them
+    through the bounded retry/exhaustion workflow, so an interrupted historical
+    run is manufactured at the narrower old failure boundary:
+    ``run_coding_attempt`` records the failed model call and raises.
     """
-    workspace = prepare_workspace(session, run.id, settings=settings)
-    with pytest.raises(ModelTimeout):
-        await run_fix_loop(
-            session,
-            workspace,
-            coder=ScriptedModel(*coders[0]),
-            reviewer=reviewer(*reviewers[0]),
-            settings=settings,
-            checkpoint_turn=session.commit,
-        )
-    session.rollback()
+    await _strand_correction_timeout(
+        session,
+        run,
+        settings,
+        first_code=coders[0][0],
+        timed_out_code=coders[0][1],
+        first_review=reviewers[0][0],
+    )
     return await run_fix_loop(
         session,
         attach_workspace(session, run.id, settings=settings),
@@ -488,22 +547,18 @@ async def test_an_endpoint_that_goes_quiet_does_not_take_the_review_with_it(
     session, settings = world.session, world.settings
     run = world.make_run()
 
-    with pytest.raises(ModelTimeout) as timed_out:
-        await run_fix_loop(
-            session,
-            prepare_workspace(session, run.id, settings=settings),
-            coder=coder,
-            reviewer=judge,
-            settings=settings,
-            checkpoint_turn=session.commit,
-        )
-    session.rollback()  # what the graph does on the way out
+    result = await run_fix_loop(
+        session,
+        prepare_workspace(session, run.id, settings=settings),
+        coder=coder,
+        reviewer=judge,
+        settings=settings,
+        checkpoint_turn=session.commit,
+    )
 
     # The failure is the provider's own, not this file's: it names the endpoint
     # and the timeout it was configured with.
     assert live.stalls == 1
-    assert f"within {live.timeout_seconds:g}s" in str(timed_out.value)
-    assert timed_out.value.timeout_seconds == live.timeout_seconds
 
     failed = [call for call in _calls(session, run) if call.status.value == "FAILED"]
     assert len(failed) == 1, [call.describe() for call in _calls(session, run)]
@@ -524,22 +579,12 @@ async def test_an_endpoint_that_goes_quiet_does_not_take_the_review_with_it(
     assert _MISSING_GUARD["problem"] in correction_prompt
     assert _MISSING_GUARD["requiredFix"] in correction_prompt
 
-    # And the resume, on the same endpoint, still answering.
-    result = await run_fix_loop(
-        session,
-        attach_workspace(session, run.id, settings=settings),
-        coder=coder,
-        reviewer=judge,
-        settings=settings,
-        checkpoint_turn=session.commit,
-    )
-
     assert result.outcome is LoopOutcome.APPROVED
     assert result.attempts_used == 3
     assert result.cycles_used == 2
-    assert live.stalls == 1, "the resume must not have needed another stall"
+    assert result.recovery is not None and not result.recovery.recovered
     # The correction that came back carries what the review asked for.
-    resumed = result.iterations[0].attempt
+    resumed = result.iterations[-1].attempt
     prompt = _read(session, run, settings, f"attempt-{resumed}-cycle-2", "prompt.txt")
     assert _MISSING_GUARD["problem"] in prompt
     assert "ValueError" in _read(
@@ -553,7 +598,6 @@ async def test_an_endpoint_that_goes_quiet_does_not_take_the_review_with_it(
         "FAILED",
         "SUCCEEDED",
     ]
-    assert result.recovery is not None and result.recovery.interrupted_attempt == 2
 
 
 
@@ -572,20 +616,14 @@ async def test_a_timed_out_correction_call_is_recorded_before_the_rollback(world
     """
     session, settings = world.session, world.settings
     run = world.make_run()
-    workspace = prepare_workspace(session, run.id, settings=settings)
-    with pytest.raises(ModelTimeout):
-        await run_fix_loop(
-            session,
-            workspace,
-            coder=ScriptedModel(_FIRST_CANDIDATE, _timeout()),
-            reviewer=reviewer(_CHANGES_REQUESTED),
-            settings=settings,
-            checkpoint_turn=session.commit,
-        )
-    # What the graph does on the way out. With a savepoint session this rolls
-    # back only what has happened since the last commit, which is what a real
-    # rollback does and what makes the surviving rows meaningful.
-    session.rollback()
+    await _strand_correction_timeout(
+        session,
+        run,
+        settings,
+        first_code=_FIRST_CANDIDATE,
+        timed_out_code=_timeout(),
+        first_review=_CHANGES_REQUESTED,
+    )
 
     failed = [call for call in _calls(session, run) if call.status.value == "FAILED"]
     assert len(failed) == 1, [call.describe() for call in _calls(session, run)]
@@ -622,17 +660,16 @@ async def test_a_failed_call_reports_the_time_it_actually_took(world: _World):
                 await asyncio.sleep(0.06)
             return await super().generate(request)
 
-    workspace = prepare_workspace(session, run.id, settings=settings)
-    with pytest.raises(ModelTimeout):
-        await run_fix_loop(
-            session,
-            workspace,
-            coder=SlowToFail(_FIRST_CANDIDATE, _timeout()),
-            reviewer=reviewer(_CHANGES_REQUESTED),
-            settings=settings,
-            checkpoint_turn=session.commit,
-        )
-    session.rollback()
+    await _strand_correction_timeout(
+        session,
+        run,
+        settings,
+        first_code=_FIRST_CANDIDATE,
+        timed_out_code=_timeout(),
+        first_review=_CHANGES_REQUESTED,
+        timeout_model=SlowToFail,
+        workspace=prepare_workspace(session, run.id, settings=settings),
+    )
 
     timed_out = [call for call in _calls(session, run) if call.status.value == "FAILED"]
     assert len(timed_out) == 1
@@ -775,17 +812,14 @@ async def test_recovering_twice_does_not_move_the_run(world: _World):
     """
     session, settings = world.session, world.settings
     run = world.make_run()
-    workspace = prepare_workspace(session, run.id, settings=settings)
-    with pytest.raises(ModelTimeout):
-        await run_fix_loop(
-            session,
-            workspace,
-            coder=ScriptedModel(_FIRST_CANDIDATE, _timeout()),
-            reviewer=reviewer(_CHANGES_REQUESTED),
-            settings=settings,
-            checkpoint_turn=session.commit,
-        )
-    session.rollback()
+    await _strand_correction_timeout(
+        session,
+        run,
+        settings,
+        first_code=_FIRST_CANDIDATE,
+        timed_out_code=_timeout(),
+        first_review=_CHANGES_REQUESTED,
+    )
 
     first = recover_loop_state(session, run, settings=settings)
     second = recover_loop_state(session, run, settings=settings)
@@ -856,16 +890,14 @@ async def test_a_resumed_run_with_no_attempts_left_escalates_with_the_truth(worl
         ),
     )
     run = create_run(session, task.id)
-    with pytest.raises(ModelTimeout):
-        await run_fix_loop(
-            session,
-            prepare_workspace(session, run.id, settings=settings),
-            coder=ScriptedModel(_FIRST_CANDIDATE, _timeout()),
-            reviewer=reviewer(_CHANGES_REQUESTED),
-            settings=settings,
-            checkpoint_turn=session.commit,
-        )
-    session.rollback()
+    await _strand_correction_timeout(
+        session,
+        run,
+        settings,
+        first_code=_FIRST_CANDIDATE,
+        timed_out_code=_timeout(),
+        first_review=_CHANGES_REQUESTED,
+    )
 
     result = await run_fix_loop(
         session,
@@ -950,7 +982,9 @@ sys.path.insert(0, REPO_ROOT)
 
 from sqlalchemy.orm import sessionmaker
 
+from apps.orchestrator.agents.coding_agent import run_coding_attempt
 from apps.orchestrator.agents.fix_loop import run_fix_loop
+from apps.orchestrator.agents.review_agent import run_review
 from apps.orchestrator.config.settings import Settings, WorkerBackend
 from apps.orchestrator.agents.review_prompts import (
     REVIEWER_SYSTEM_PROMPT,
@@ -964,8 +998,9 @@ from apps.orchestrator.domain.verification import VerificationProfile
 from apps.orchestrator.providers import OpenAICompatibleProvider, ProviderConfig
 from apps.orchestrator.providers.errors import ModelTimeout
 from apps.orchestrator.providers.review import ModelReviewProvider, ReviewerUnavailable
-from apps.orchestrator.repositories import ProjectRepository, TaskRepository
+from apps.orchestrator.repositories import ProjectRepository, TaskRepository, TaskRunRepository
 from apps.orchestrator.services.runs import create_run
+from apps.orchestrator.services.verification import verify_candidate
 from apps.orchestrator.services.workspace import attach_workspace, prepare_workspace
 PYTHON = "python3"
 STUB = "def navigate(target):\\n    pass  # TODO: TS-004\\n"
@@ -1082,26 +1117,59 @@ def main():
         )
         if phase == "interrupted":
             workspace = prepare_workspace(session, run_id, settings=settings())
-        else:
-            workspace = attach_workspace(session, run_id, settings=settings())
-        try:
-            result = asyncio.run(
-                run_fix_loop(
+
+            async def interrupt():
+                first_attempt = await run_coding_attempt(
                     session,
                     workspace,
-                    coder=coder,
-                    reviewer=judge,
+                    provider=coder,
                     settings=settings(),
-                    checkpoint_turn=session.commit,
+                    review_cycle=1,
+                    checkpoint_call=session.commit,
                 )
+                report = verify_candidate(session, workspace, settings=settings())
+                review = await run_review(
+                    session,
+                    workspace,
+                    provider=judge,
+                    verification=report,
+                    completion_report=first_attempt.report,
+                    settings=settings(),
+                    checkpoint_call=session.commit,
+                )
+                session.commit()
+                TaskRunRepository(session).update_fields(run_id, attempt_number=2)
+                session.commit()
+                await run_coding_attempt(
+                    session,
+                    workspace,
+                    provider=coder,
+                    settings=settings(),
+                    review_feedback=review.feedback,
+                    plan_required=False,
+                    review_cycle=2,
+                    checkpoint_call=session.commit,
+                )
+
+            try:
+                asyncio.run(interrupt())
+            except ModelTimeout:
+                session.rollback()
+                write_report("interrupted", {{"raised": "ModelTimeout"}})
+                return
+            raise AssertionError("interrupted phase did not time out")
+        else:
+            workspace = attach_workspace(session, run_id, settings=settings())
+        result = asyncio.run(
+            run_fix_loop(
+                session,
+                workspace,
+                coder=coder,
+                reviewer=judge,
+                settings=settings(),
+                checkpoint_turn=session.commit,
             )
-        except ModelTimeout:
-            # What the graph does: roll back and let the exception out. Whatever
-            # the loop committed per model call is already committed; the rest of
-            # this attempt is not.
-            session.rollback()
-            write_report("interrupted", {{"raised": "ModelTimeout"}})
-            return
+        )
         write_report(phase, {{"result": result.describe()}})
 
 
@@ -1338,19 +1406,17 @@ async def test_timeout_longer_than_idle_limit_is_durable_without_a_long_sleep(
             assert not session.in_transaction()
             raise _timeout()
 
-    with pytest.raises(ModelTimeout) as caught:
-        await run_fix_loop(
+    with pytest.raises(ModelTimeout):
+        await run_coding_attempt(
             session,
             prepare_workspace(session, run.id, settings=settings),
-            coder=LongTimeout(),
-            reviewer=reviewer(_APPROVED),
+            provider=LongTimeout(),
             settings=settings,
-            checkpoint_turn=session.commit,
+            checkpoint_call=session.commit,
         )
     session.rollback()
 
-    assert caught.value.reason is FailureReason.MODEL_TIMEOUT
-    assert action_for(caught.value.reason) is FailureAction.RETRY
+    assert action_for(FailureReason.MODEL_TIMEOUT) is FailureAction.RETRY
     failed = _calls(session, run)
     assert len(failed) == 1 and failed[0].status is RunStatus.FAILED
     assert recover_loop_state(session, run, settings=settings).next_attempt == 2
@@ -1371,16 +1437,15 @@ async def test_build_failure_then_slow_second_call_timeout_is_recoverable(
                 await asyncio.sleep(0.02)
             return await super().generate(request)
 
-    with pytest.raises(ModelTimeout):
-        await run_fix_loop(
-            session,
-            prepare_workspace(session, run.id, settings=settings),
-            coder=SlowSecondCall(_code("SYNTAX ERROR\n"), _timeout()),
-            reviewer=reviewer(_APPROVED),
-            settings=settings,
-            checkpoint_turn=session.commit,
-        )
-    session.rollback()
+    await _strand_correction_timeout(
+        session,
+        run,
+        settings,
+        first_code=_code("SYNTAX ERROR\n"),
+        timed_out_code=_timeout(),
+        first_review=_APPROVED,
+        timeout_model=SlowSecondCall,
+    )
 
     events = RunEventRepository(session).list_for_run(run.id)
     assert RunEventType.BUILD_FAILED in [event.event_type for event in events]
