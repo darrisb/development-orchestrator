@@ -206,6 +206,15 @@ class FixIteration:
                     "passed": self.verification.passed,
                     "verified": self.verification.verified,
                     "classification": self.verification.classification.value,
+                    # Concern 78, stage 3: the bounded evidence this turn sent
+                    # to the repair attempt, recorded so that what the model was
+                    # shown is auditable from the loop's own artifact rather
+                    # than only from the rendered feedback string.
+                    "repair_evidence": (
+                        evidence.describe()
+                        if (evidence := self.verification.repair_evidence) is not None
+                        else None
+                    ),
                     "failure_reason": (
                         self.verification.failure_reason.value
                         if self.verification.failure_reason

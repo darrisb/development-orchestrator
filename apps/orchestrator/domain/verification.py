@@ -40,6 +40,8 @@ from .enums import (
     VerificationType,
 )
 from .failure_identity import MAX_RENDERED_IDENTITIES, FailureComparison
+from .repair_evidence import MAX_EVIDENCE_EXCERPT_LINES, RepairEvidence
+from .repair_evidence import build as build_repair_evidence
 
 #: The pipeline, in section 17's order. ``SCOPE`` runs before anything is
 #: executed -- a candidate that already broke its allowance should not get a
@@ -102,8 +104,9 @@ MAX_FEEDBACK_STEPS = 3
 #: reason for existing, in one number: once the orchestrator knows *which*
 #: tests the candidate broke, the repair prompt needs the output for those
 #: tests, not the whole suite's log. The log itself is unchanged on disk and
-#: referenced by path.
-MAX_REGRESSION_EXCERPT_LINES = 40
+#: referenced by path. Stage 3 owns the bound; re-exported here so the name
+#: stage 2 introduced keeps meaning the number actually applied.
+MAX_REGRESSION_EXCERPT_LINES = MAX_EVIDENCE_EXCERPT_LINES
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,10 +361,28 @@ class VerificationReport:
         return self.classification in NON_REGRESSING_CLASSIFICATIONS
 
     @property
+    def repair_evidence(self) -> RepairEvidence | None:
+        """Bounded, attributed repair evidence, or ``None`` (concern 78, stage 3).
+
+        Present only for ``NEW_REGRESSION``. Derived like ``classification``,
+        from the same steps and the same comparison, so there is no state in
+        which the report says a candidate caused a regression and the evidence
+        handed to the repair attempt disagrees.
+        """
+        if not self.failures:
+            return None
+        return build_repair_evidence(
+            self.failures, self.comparison, classification=self.classification
+        )
+
+    @property
     def feedback(self) -> str | None:
         """What to send back to the coder (section 17), or ``None`` on a pass."""
         if not self.failures:
             return None
+        evidence = self.repair_evidence
+        if evidence is not None:
+            return evidence.render()
         if self.comparison is not None and self.comparison.available:
             return render_classified_feedback(self.failures, self.comparison)
         return render_feedback(self.failures)
@@ -419,6 +440,11 @@ class VerificationReport:
             ],
             "classification": self.classification.value,
             "no_new_regressions": self.no_new_regressions,
+            "repair_evidence": (
+                evidence.describe()
+                if (evidence := self.repair_evidence) is not None
+                else None
+            ),
             "comparison": (
                 self.comparison.describe() if self.comparison is not None else None
             ),
@@ -500,35 +526,19 @@ def render_classified_feedback(
             lines += ["", "Pre-existing failures:", _identity_list(comparison.known)]
         return "\n".join(lines)
 
-    new_failures = sorted(comparison.new)
-    blocks: list[str] = [
-        f"Authoritative verification found {len(new_failures)} new "
-        f"regression(s) relative to the established baseline"
-        + (f" ({comparison.baseline_sha})." if comparison.baseline_sha else "."),
-        "New failure(s):\n" + _identity_list(comparison.new),
-    ]
-    for step in failures[:MAX_FEEDBACK_STEPS]:
-        excerpt = _excerpt_for(step.output, new_failures)
-        if not excerpt:
-            continue
-        reference = (
-            f" (full log: {step.log_artifact})" if step.log_artifact else ""
-        )
-        blocks.append(
-            f"Relevant failure output from `{step.command}`{reference}:\n{excerpt}"
-        )
-    if comparison.resolved:
-        blocks.append(
-            "For information only -- this change also resolved "
-            f"{len(comparison.resolved)} pre-existing failure(s). Leave them "
-            "fixed."
-        )
-    blocks.append(
-        "Repair the supplied regression(s). You may run the directly affected "
-        "tests to confirm the fix; the full verification suite will be run by "
-        "the orchestrator after you return the corrected candidate."
+    # The regression case is stage 3's: the evidence is bounded, attributed to
+    # the command that produced each failure, and rendered from that structure
+    # rather than from prose assembled here. Built directly rather than read off
+    # a report, because this function is also reachable from a caller holding
+    # only the failing steps and the comparison.
+    evidence = build_repair_evidence(
+        failures,
+        comparison,
+        classification=VerificationClassification.NEW_REGRESSION,
     )
-    return "\n\n".join(blocks)
+    # ``comparison.new`` is non-empty above, so the builder cannot refuse.
+    assert evidence is not None
+    return evidence.render()
 
 
 def _identity_list(identities: frozenset[str]) -> str:
@@ -538,30 +548,6 @@ def _identity_list(identities: frozenset[str]) -> str:
     if len(ordered) > len(shown):
         lines.append(f"- [... {len(ordered) - len(shown)} more ...]")
     return "\n".join(lines)
-
-
-def _excerpt_for(output: str, identities: Sequence[str]) -> str:
-    """The lines of ``output`` that mention one of ``identities``, bounded.
-
-    A substring match rather than a parse: the identity came *out* of this text
-    in the first place, and the lines around a failure that name it -- the
-    short-summary line, the traceback header -- are the ones worth sending.
-    """
-    if not output or not identities:
-        return ""
-    kept = [
-        line
-        for line in output.splitlines()
-        if any(identity in line for identity in identities)
-    ]
-    if not kept:
-        return ""
-    if len(kept) <= MAX_REGRESSION_EXCERPT_LINES:
-        return "\n".join(kept)
-    dropped = len(kept) - MAX_REGRESSION_EXCERPT_LINES
-    return "\n".join(
-        [*kept[:MAX_REGRESSION_EXCERPT_LINES], f"[... {dropped} more line(s) ...]"]
-    )
 
 
 def render_feedback(failures: Sequence[VerificationStep]) -> str:
@@ -631,6 +617,7 @@ __all__ = [
     "FEEDBACK_OUTPUT_LINES",
     "MAX_FEEDBACK_STEPS",
     "PIPELINE_ORDER",
+    "RepairEvidence",
     "VerificationProfile",
     "VerificationReport",
     "VerificationStep",

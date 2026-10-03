@@ -1000,7 +1000,7 @@ def test_the_edit_schema_version_records_the_contract_change():
     where concern 70 left it while the prompt is free to advance.
     """
     assert EDIT_SCHEMA_VERSION == "code-edits/3"
-    assert CODER_PROMPT_VERSION == "coder-prompt/5"
+    assert CODER_PROMPT_VERSION == "coder-prompt/6"
 
 
 # ===========================================================================

@@ -42,7 +42,7 @@ from ..domain.models import Task
 from ..domain.plan import CodingPlan
 
 #: Bumped on any change to the strings below.
-CODER_PROMPT_VERSION = "coder-prompt/5"
+CODER_PROMPT_VERSION = "coder-prompt/6"
 
 _SHARED_RULES = """\
 You are a senior software engineer working inside an automated orchestrator on
@@ -111,6 +111,11 @@ given are the subject of this attempt:
   or its regression suite, and do not compare it against a baseline.
 - Anything failing for reasons outside the findings you were given is not
   yours to chase.
+- What you were given is the complete evidence for this repair. A verification
+  failure arrives as the specific failures the orchestrator attributed to this
+  candidate plus a bounded excerpt of the output that named them; the full logs
+  stay with the orchestrator. Do not ask for them, and do not go looking for
+  the rest of the suite's output to reconstruct them.
 - Return the corrected edits. The orchestrator re-runs authoritative
   verification on them and decides whether the repair holds."""
 

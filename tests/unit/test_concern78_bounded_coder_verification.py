@@ -184,4 +184,4 @@ def test_the_coder_prompt_version_records_the_contract_change() -> None:
     ``coder-prompt/4`` was the whole-file-update preference; this is the
     bounded-verification split.
     """
-    assert CODER_PROMPT_VERSION == "coder-prompt/5"
+    assert CODER_PROMPT_VERSION == "coder-prompt/6"
