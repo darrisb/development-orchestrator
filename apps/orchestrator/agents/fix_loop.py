@@ -21,10 +21,23 @@ indefinitely.**
 Four properties are worth knowing before reading it.
 
 * **One turn of the loop spends exactly one coding attempt.** So the loop is
-  bounded by ``max_attempts`` structurally, by a ``for`` over the attempts the
-  task is allowed, not by a ceiling check that could be got wrong. The review
-  cycle ceiling is enforced where the cycle is counted -- inside
-  ``route_review`` -- for the same reason.
+  bounded by ``max_attempts`` structurally, by a queue holding exactly the
+  attempts the task is allowed, not by a ceiling check that could be got
+  wrong. The review cycle ceiling is enforced where the cycle is counted --
+  inside ``route_review`` -- for the same reason.
+
+  **Concern 79 adds the one exception, and it is deliberately the only thing
+  that can put a further number in that queue.** When a reviewer asks for a
+  correction, the coder makes it, and deterministic verification rejects the
+  candidate it produced on the last attempt the budget allowed, the run is
+  granted a single bounded *verification repair*: one more coding turn, given
+  the verifier's own evidence rather than the reviewer's findings, followed by
+  the same authoritative verification and -- if it passes -- the same reviewer.
+  It is not an extra retry. The gate is ``can_repair_after_reviewer_correction``
+  in ``domain.limits``, the provenance it turns on is ``CorrectionSource``
+  recorded per turn rather than inferred from an attempt number, and the grant
+  itself is a ``VERIFICATION_REPAIR_GRANTED`` run event, so a crashed run reads
+  its own spent allowance back instead of being handed a second one.
 * **Feedback is never invented here.** A deterministic failure travels as
   ``VerificationReport.feedback`` (the real command and its real output) and a
   review as ``ReviewRouting.feedback`` (the actionable blocking issues). This
@@ -61,6 +74,7 @@ from sqlalchemy.orm import Session
 from ..config.logging import get_logger
 from ..config.settings import Settings, get_settings
 from ..domain.enums import (
+    CorrectionSource,
     EscalationStatus,
     FailureAction,
     FailureReason,
@@ -71,7 +85,11 @@ from ..domain.enums import (
 )
 from ..domain.escalation import render_run_escalation, run_escalation_options
 from ..domain.failure_policy import action_for
-from ..domain.limits import can_retry_coding
+from ..domain.limits import (
+    VERIFICATION_REPAIR_ALLOWANCE,
+    can_repair_after_reviewer_correction,
+    can_retry_coding,
+)
 from ..domain.models import (
     HumanEscalation,
     Project,
@@ -158,6 +176,17 @@ class FixIteration:
     feedback: str | None = None
     #: Earlier findings this turn's review did not raise again (concern 27).
     resolved_issues: tuple[UUID, ...] = ()
+    #: Where the instruction *this* turn was given came from (concern 79).
+    #: Recorded rather than inferred: the allowance below is reachable from one
+    #: provenance only, and an attempt number cannot tell a reviewer-driven
+    #: correction from the verification repair that follows it.
+    correction_source: CorrectionSource = CorrectionSource.INITIAL
+    #: True when this turn *is* the bounded verification repair -- the one turn
+    #: a run may make past ``max_attempts``.
+    verification_repair: bool = False
+    #: True when this turn's verification failure granted the allowance. The
+    #: turn that grants it is never the turn that spends it.
+    repair_granted: bool = False
 
     @property
     def stage(self) -> str:
@@ -237,6 +266,13 @@ class FixIteration:
             ),
             "resolved_issues": [str(issue_id) for issue_id in self.resolved_issues],
             "sent_to_coder": self.feedback is not None,
+            # Concern 79. Three facts, so a reader of ``fix-loop.json`` can
+            # answer "was this an ordinary attempt?" without counting turns:
+            # what this turn was told to do, whether it was the repair, and
+            # whether it was the turn that granted one.
+            "correction_source": self.correction_source.value,
+            "verification_repair": self.verification_repair,
+            "verification_repair_granted": self.repair_granted,
         }
 
 
@@ -260,6 +296,15 @@ class FixLoopResult:
     attempts_used: int = 0
     #: Reviews that returned a verdict, across every process.
     cycles_used: int = 0
+    #: Concern 79 allowances spent by this run, across every process. At most
+    #: ``VERIFICATION_REPAIR_ALLOWANCE``.
+    verification_repairs_used: int = 0
+    #: The attempt number the bounded verification repair was filed under, when
+    #: one was made. One past the run's coding ceiling, so its artifacts land in
+    #: a directory no ordinary attempt can own. This is what makes
+    #: ``attempts_used`` greater than ``max_attempts`` readable rather than
+    #: alarming: the excess is named, and it is exactly this turn.
+    verification_repair_attempt: int | None = None
     #: The state this run was resumed from, when it was resumed.
     recovery: RecoveredLoopState | None = None
     configured_runtime_ms: int | None = None
@@ -291,6 +336,8 @@ class FixLoopResult:
             "failure_reason": self.failure_reason.value if self.failure_reason else None,
             "attempts_used": self.attempts_used,
             "cycles_used": self.cycles_used,
+            "verification_repairs_used": self.verification_repairs_used,
+            "verification_repair_attempt": self.verification_repair_attempt,
             "runtime": {
                 "configured_ms": self.configured_runtime_ms,
                 "consumed_ms": self.consumed_runtime_ms,
@@ -432,6 +479,18 @@ async def run_fix_loop(
     iterations: list[FixIteration] = []
     fingerprints: list[Fingerprint] = list(recovered.fingerprints)
     feedback = recovered.feedback
+    # Concern 79. The provenance of the instruction the next turn will be
+    # given, carried alongside the text because the text cannot be asked where
+    # it came from. On a resume this is whatever the records say wrote the
+    # feedback being restored; on a first invocation there is no instruction and
+    # no provenance.
+    correction_source = recovered.feedback_source
+    # Allowances already spent, read from this run's own events. A resumed run
+    # that was granted one before the interruption starts here with it spent,
+    # which is the whole of requirement 9: the grant is durable, so the refusal
+    # is too.
+    repairs_granted = recovered.verification_repairs_granted
+    repair_attempt: int | None = None
     # What a reader of the outcome is told. Counted from the durable records
     # and incremented per turn, rather than measured from ``iterations``,
     # which is empty after a resume and would report one attempt for a run
@@ -471,6 +530,8 @@ async def run_fix_loop(
             cycles_used=cycles_used,
             recovered=recovered,
             runtime_budget=runtime_budget,
+            verification_repairs_used=repairs_granted,
+            verification_repair_attempt=repair_attempt,
         )
 
     recovered_dispute = _recovered_repeated_blocking_dispute(session, run, task)
@@ -519,7 +580,18 @@ async def run_fix_loop(
             interrupted_attempt=recovered.interrupted_attempt,
         )
 
-    for number in range(first, ceiling + 1):
+    # The attempts this invocation may make, as a queue rather than a range.
+    # ``ceiling`` is still the task's coding budget and is still the only thing
+    # that puts numbers in here to begin with; concern 79's allowance, when it
+    # is granted, appends exactly one more. A queue because the grant is made
+    # *during* a turn and a ``range`` cannot be extended from inside its own
+    # body -- and because every ``continue`` below then keeps working unchanged.
+    pending_attempts = list(range(first, ceiling + 1))
+    while pending_attempts:
+        number = pending_attempts.pop(0)
+        # Past the task's own ceiling, so by construction this is the one turn
+        # the allowance bought. Nothing else can put such a number in the queue.
+        repair_turn = number > ceiling
         if deadline_exceeded(effective_deadline):
             runtime_exhausted = effective_deadline == runtime_deadline
             return settle(
@@ -553,6 +625,8 @@ async def run_fix_loop(
                     ),
                     "recovered": recovered.recovered,
                     "interrupted_attempt": recovered.interrupted_attempt,
+                    "correction_source": correction_source.value,
+                    "verification_repair": repair_turn,
                 },
             )
         # A review cycle is spent when a reviewer answers, and that is counted
@@ -580,6 +654,9 @@ async def run_fix_loop(
             policy=policy,
             secrets=secrets,
             checkpoint_call=checkpoint_turn,
+            correction_source=correction_source,
+            repairs_granted=repairs_granted,
+            repair_turn=repair_turn,
         )
         iterations.append(iteration)
         # The attempt was made, and charged, whether or not it succeeded: it
@@ -587,6 +664,46 @@ async def run_fix_loop(
         # derived from the loop's own length so that a rollback upstream cannot
         # make the run look like it had not tried.
         attempts_used = max(attempts_used, number)
+        if repair_turn:
+            repair_attempt = number
+        if iteration.repair_granted:
+            # Concern 79, the grant itself. Spent here -- before the repair is
+            # made, not after it answers -- and appended to the run's events in
+            # the same breath, so the only way to be granted a second one would
+            # be for this append to have never happened. ``repairs_granted`` is
+            # raised first so that nothing between here and the next turn can
+            # read the allowance as still available.
+            repairs_granted += 1
+            repair_number = number + 1
+            pending_attempts.append(repair_number)
+            _emit(
+                session, run, task, project,
+                RunEventType.VERIFICATION_REPAIR_GRANTED,
+                {
+                    "granted_after_attempt": number,
+                    "repair_attempt": repair_number,
+                    "cycle": cycle,
+                    "ceiling": ceiling,
+                    "allowance": VERIFICATION_REPAIR_ALLOWANCE,
+                    "granted_total": repairs_granted,
+                    "correction_source": iteration.correction_source.value,
+                    "failure_reason": (
+                        iteration.verification.failure_reason.value
+                        if iteration.verification
+                        and iteration.verification.failure_reason
+                        else None
+                    ),
+                },
+            )
+            logger.warning(
+                "fix_loop_verification_repair_granted",
+                run_id=str(run.id),
+                task=task.external_task_id,
+                granted_after_attempt=number,
+                repair_attempt=repair_number,
+                ceiling=ceiling,
+                granted_total=repairs_granted,
+            )
         if iteration.review is not None:
             # Same rule as the attempt: a review that answered is spent, and a
             # resumed run's answer belongs to the same count.
@@ -655,6 +772,14 @@ async def run_fix_loop(
                 iteration.feedback,
                 history_limit=config.fix_loop_feedback_history_limit,
             )
+            # Which of the three writers produced the text that was just
+            # chosen. ``iteration.feedback`` is the reviewer's findings when
+            # this turn reached a review and the deterministic report's own
+            # command output when it did not, so the provenance follows the
+            # same branch the text does -- including for the repair turn, which
+            # is given verification evidence and is therefore recorded as
+            # ``VERIFICATION``, never as the reviewer feedback that preceded it.
+            correction_source = _correction_source(iteration)
             continue
 
         # Everything else. ``RETRY`` and ``PAUSE`` belong to failures the agents
@@ -708,6 +833,9 @@ async def _turn(
     policy: HumanApprovalPolicy | None,
     secrets: Mapping[str, str] | None,
     checkpoint_call: Callable[[], None] | None = None,
+    correction_source: CorrectionSource = CorrectionSource.INITIAL,
+    repairs_granted: int = 0,
+    repair_turn: bool = False,
 ) -> FixIteration:
     """Code, verify, review. Stops at the first of the three that has a verdict.
 
@@ -719,6 +847,15 @@ async def _turn(
     committed the moment it is made. Without it a provider failure takes the
     record of the call with it, and the resumed run cannot tell an attempt that
     was made from one that never was.
+
+    ``correction_source`` is where the instruction this turn was given came
+    from, and ``repairs_granted`` how many of concern 79's allowances the run
+    has already spent. Both exist for one decision, taken in one branch below:
+    whether a candidate that deterministic verification has just rejected may
+    be repaired once past the attempt ceiling. Nothing else reads them, and
+    the verifier's verdict is not among the things they can change -- a
+    rejected candidate is rejected either way, and the only question is whether
+    the run is allowed another turn to answer it.
     """
     try:
         attempt = await run_coding_attempt(
@@ -742,13 +879,20 @@ async def _turn(
             provider=coder,
             error=error,
         )
+    exhausted = not can_retry_coding(task.limits, run.attempt_number)
     if attempt.failure_reason is not None:
+        # No candidate, so nothing a verifier rejected and nothing concern 79
+        # could repair. A refused edit set, an unusable response and a provider
+        # that never answered all leave through here, whatever asked for the
+        # turn -- which is why a reviewer-driven correction that dies in the
+        # provider does not earn the allowance.
         return _stop(
             FixIteration(number=number, attempt=run.attempt_number, cycle=cycle,
-                         coding=attempt),
+                         coding=attempt, correction_source=correction_source,
+                         verification_repair=repair_turn),
             reason=attempt.failure_reason,
             feedback=attempt.feedback,
-            limits_exhausted=not can_retry_coding(task.limits, run.attempt_number),
+            limits_exhausted=exhausted,
         )
 
     report = verify_candidate(session, workspace, settings=config, secrets=secrets)
@@ -764,12 +908,36 @@ async def _turn(
     # back to the coder as before.
     if not report.no_new_regressions:
         reason = report.failure_reason or FailureReason.TEST_FAILED
+        # Concern 79's one branch. Everything the allowance requires is true
+        # exactly here and nowhere else in this function: a candidate was
+        # produced (the early exit above did not fire) and deterministic
+        # verification rejected it (this one did). The remaining clauses -- that
+        # the turn was reviewer-driven, that the budget is spent, and that the
+        # allowance is unspent -- are the domain's to answer.
+        #
+        # The verifier's authority is untouched. The candidate is still
+        # rejected, the reason on the record is still the verifier's own, and
+        # what the grant buys is one more coding turn that will be verified
+        # again by the same commands.
+        granted = can_repair_after_reviewer_correction(
+            task.limits,
+            run.attempt_number,
+            correction_source=correction_source,
+            repairs_granted=repairs_granted,
+        )
         return _stop(
             FixIteration(number=number, attempt=run.attempt_number, cycle=cycle,
-                         coding=attempt, verification=report),
+                         coding=attempt, verification=report,
+                         correction_source=correction_source,
+                         verification_repair=repair_turn,
+                         repair_granted=granted),
             reason=reason,
             feedback=report.feedback,
-            limits_exhausted=not can_retry_coding(task.limits, run.attempt_number),
+            # Granting the allowance is exactly "this turn is not the last
+            # one", so it is said here, in the one variable the routing
+            # already reads. ``_stop`` keeps deciding what an exhausted turn
+            # becomes; it is not asked to know about allowances.
+            limits_exhausted=exhausted and not granted,
         )
 
     review = await run_review(
@@ -796,6 +964,7 @@ async def _turn(
     iteration = FixIteration(
         number=number, attempt=run.attempt_number, cycle=review.cycle,
         coding=attempt, verification=report, review=review, resolved_issues=resolved,
+        correction_source=correction_source, verification_repair=repair_turn,
     )
     if review.approved:
         return iteration
@@ -806,7 +975,13 @@ async def _turn(
         # A review that requests changes on its last permitted cycle has
         # already been routed to a human by ``route_review``; the attempt
         # ceiling is the one this module still has to apply.
-        limits_exhausted=not can_retry_coding(task.limits, run.attempt_number),
+        #
+        # No allowance here either, and this is the clause that keeps the
+        # repair from becoming a way to out-sit a reviewer: concern 79 is about
+        # a verifier rejecting a correction, not about a reviewer refusing one.
+        # A repair turn that verifies and is then sent back by the reviewer
+        # escalates on the record exactly as any exhausted turn does.
+        limits_exhausted=exhausted,
     )
 
 
@@ -846,6 +1021,24 @@ def _stop(
             feedback=feedback,
         )
     return replace(iteration, failure_reason=reason, action=action, feedback=feedback)
+
+
+def _correction_source(iteration: FixIteration) -> CorrectionSource:
+    """Which writer produced the feedback ``iteration`` is sending onward.
+
+    The same branch ``_turn`` took to choose the text, read back off the turn
+    it produced: a turn that reached a review is sending the reviewer's
+    findings, one that reached a verifier is sending the verifier's command
+    output, and one that reached neither has only the coding agent's own
+    complaint. Derived from which verdicts the turn actually holds rather than
+    from its attempt number or from the shape of the string, because concern
+    79 turns on this answer being the truth.
+    """
+    if iteration.review is not None:
+        return CorrectionSource.REVIEW
+    if iteration.verification is not None:
+        return CorrectionSource.VERIFICATION
+    return CorrectionSource.CODING
 
 
 def _provider_failed_attempt(
@@ -1127,6 +1320,8 @@ def _settle(
     cycles_used: int | None = None,
     recovered: RecoveredLoopState | None = None,
     runtime_budget: RuntimeBudget | None = None,
+    verification_repairs_used: int = 0,
+    verification_repair_attempt: int | None = None,
 ) -> FixLoopResult:
     """Close the loop: the worktree, the run row, the task, the artifact.
 
@@ -1193,6 +1388,8 @@ def _settle(
             attempts_used=attempts,
             recovered=recovered,
             cycles_used=cycles,
+            verification_repairs_used=verification_repairs_used,
+            verification_repair_attempt=verification_repair_attempt,
             configured_runtime_ms=configured_ms,
             consumed_runtime_ms=consumed_ms,
             remaining_runtime_ms=remaining_ms,
@@ -1210,6 +1407,8 @@ def _settle(
         rolled_back=workspace_reset,
         attempts_used=attempts,
         cycles_used=cycles,
+        verification_repairs_used=verification_repairs_used,
+        verification_repair_attempt=verification_repair_attempt,
         recovery=recovered,
         configured_runtime_ms=configured_ms,
         consumed_runtime_ms=consumed_ms,
@@ -1237,6 +1436,7 @@ def _settle(
         outcome=outcome.value,
         attempts_used=result.attempts_used,
         cycles_used=result.cycles_used,
+        verification_repairs_used=verification_repairs_used,
         failure_reason=reason.value if reason else None,
         escalation_id=str(escalation.id) if escalation else None,
         rolled_back=workspace_reset,
@@ -1339,6 +1539,8 @@ def _escalate(
     attempts_used: int | None = None,
     recovered: RecoveredLoopState | None = None,
     cycles_used: int = 0,
+    verification_repairs_used: int = 0,
+    verification_repair_attempt: int | None = None,
     configured_runtime_ms: int | None = None,
     consumed_runtime_ms: int | None = None,
     remaining_runtime_ms: int | None = None,
@@ -1362,10 +1564,29 @@ def _escalate(
     history.extend(iteration.summary() for iteration in iterations)
     options = run_escalation_options(reason)
     if reason is FailureReason.RETRY_EXHAUSTED:
+        # ``attempts`` counts coding attempts begun, and concern 79's repair is
+        # one of those, so a run that was granted one has begun more attempts
+        # than the task permits. Naming the excess rather than hiding it: a
+        # person reading this needs to know both that the budget was spent and
+        # that the extra turn the allowance bought was spent too.
+        ordinary = max(0, attempts - verification_repairs_used)
         reason_text = (
-            f"{attempts} of the task's {task.limits.max_attempts} permitted "
+            f"{ordinary} of the task's {task.limits.max_attempts} permitted "
             "attempts were made and none produced a change a reviewer accepted."
         )
+        if verification_repairs_used:
+            reason_text += (
+                f" A reviewer-driven correction was additionally granted "
+                f"{verification_repairs_used} bounded verification repair"
+                f"{'' if verification_repairs_used == 1 else 's'}"
+                + (
+                    f" (attempt {verification_repair_attempt})"
+                    if verification_repair_attempt is not None
+                    else ""
+                )
+                + ", and deterministic verification was not satisfied by it "
+                "either; the allowance is spent and is not granted twice."
+            )
     elif reason is FailureReason.RUNTIME_EXHAUSTED:
         reason_text = (
             "The run consumed its active-execution runtime budget: "
@@ -1421,6 +1642,8 @@ def _escalate(
             "consumed_active_runtime_ms": consumed_runtime_ms,
             "remaining_runtime_ms": remaining_runtime_ms,
             "review_cycles_used": cycles_used,
+            "verification_repairs_used": verification_repairs_used,
+            "verification_repair_attempt": verification_repair_attempt,
             "budget_exhausted": (
                 "runtime" if reason is FailureReason.RUNTIME_EXHAUSTED else "retry"
                 if reason is FailureReason.RETRY_EXHAUSTED else None

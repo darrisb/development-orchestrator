@@ -111,6 +111,7 @@ from tests.integration.test_fix_loop import (
     _COMPILE,
     _MISSING_GUARD,
     _TEST,
+    BROKEN,
     REVIEWED,
     STUB,
     WORKING,
@@ -1457,3 +1458,130 @@ async def test_build_failure_then_slow_second_call_timeout_is_recoverable(
     assert recovered.attempts_started == 2
     assert recovered.next_attempt == 3
     assert recovered.interrupted_attempt == 2
+
+
+# --- concern 79: the allowance survives the process that granted it ----------
+#
+# The allowance is one turn past a ceiling, which makes "how many have you had"
+# the only question that matters, and an in-memory boolean answers it wrongly
+# the moment the process dies. These two tests are the two places a crash can
+# land: inside the repair, and after it.
+
+
+def _grants(world: _World, run: TaskRun) -> list:
+    return [
+        event
+        for event in RunEventRepository(world.session).list_for_run(run.id)
+        if event.event_type == RunEventType.VERIFICATION_REPAIR_GRANTED
+    ]
+
+
+def _two_attempt_run(world: _World) -> TaskRun:
+    """A run whose reviewer-driven correction is its last permitted attempt."""
+    return world.make_run(
+        world.make_task(
+            limits=TaskLimits(
+                max_attempts=2,
+                max_review_cycles=3,
+                max_files_changed=3,
+                max_diff_lines=200,
+            )
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_crash_inside_the_repair_does_not_buy_a_second_one(world: _World):
+    """G, first half. The grant is durable before the repair is attempted.
+
+    The loop is killed in the middle of the repair turn -- the coder is asked
+    and never answers at all -- which is the worst case for the allowance: it
+    has been spent and has produced nothing. The resumed invocation reads the
+    grant back off the run's own events and refuses, rather than starting the
+    repair over as if it had never happened.
+    """
+    run = _two_attempt_run(world)
+    workspace = prepare_workspace(world.session, run.id, settings=world.settings)
+
+    with pytest.raises(AssertionError):
+        await run_fix_loop(
+            world.session,
+            workspace,
+            coder=ScriptedModel(_FIRST_CANDIDATE, _code(BROKEN)),
+            reviewer=reviewer(_CHANGES_REQUESTED),
+            settings=world.settings,
+            checkpoint_turn=world.session.commit,
+        )
+    # Everything after the last turn boundary goes with the process.
+    world.session.rollback()
+
+    # The grant is on the record, because it was appended inside the turn that
+    # granted it rather than after the repair it paid for.
+    assert len(_grants(world, run)) == 1
+    recovered = recover_loop_state(
+        world.session,
+        TaskRunRepository(world.session).get(run.id),
+        settings=world.settings,
+    )
+    assert recovered.verification_repairs_granted == 1
+
+    resumed_coder = ScriptedModel(_CORRECTED)
+    result = await run_fix_loop(
+        world.session,
+        attach_workspace(world.session, run.id, settings=world.settings),
+        coder=resumed_coder,
+        reviewer=reviewer(_APPROVED),
+        settings=world.settings,
+        checkpoint_turn=world.session.commit,
+    )
+
+    assert result.outcome is LoopOutcome.ESCALATED
+    assert result.failure_reason is FailureReason.RETRY_EXHAUSTED
+    assert resumed_coder.requests == [], "the repair was not started over"
+    assert result.iterations == ()
+    assert len(_grants(world, run)) == 1, "the allowance was not granted twice"
+    assert result.recovery is not None
+    assert result.recovery.verification_repairs_granted == 1
+
+
+@pytest.mark.asyncio
+async def test_resuming_after_a_spent_repair_grants_nothing(world: _World):
+    """G, second half. A repair that ran and failed is not re-run either.
+
+    The first invocation uses the whole lifecycle: correction, grant, repair,
+    and a repair the verifier rejects. A second invocation over the same run --
+    an operator retrying, a scheduler re-dispatching -- must find a spent
+    budget and a spent allowance.
+    """
+    run = _two_attempt_run(world)
+
+    first = await run_fix_loop(
+        world.session,
+        prepare_workspace(world.session, run.id, settings=world.settings),
+        coder=ScriptedModel(_FIRST_CANDIDATE, _code(BROKEN), _code(BROKEN)),
+        reviewer=reviewer(_CHANGES_REQUESTED),
+        settings=world.settings,
+        checkpoint_turn=world.session.commit,
+    )
+    world.session.commit()
+
+    assert first.verification_repairs_used == 1
+    assert first.verification_repair_attempt == 3
+    assert first.failure_reason is FailureReason.RETRY_EXHAUSTED
+    assert len(_grants(world, run)) == 1
+
+    second_coder = ScriptedModel(_CORRECTED)
+    second = await run_fix_loop(
+        world.session,
+        attach_workspace(world.session, run.id, settings=world.settings),
+        coder=second_coder,
+        reviewer=reviewer(_APPROVED),
+        settings=world.settings,
+        checkpoint_turn=world.session.commit,
+    )
+
+    assert second.outcome is LoopOutcome.ESCALATED
+    assert second.failure_reason is FailureReason.RETRY_EXHAUSTED
+    assert second_coder.requests == []
+    assert second.verification_repairs_used == 1, "read back, not re-granted"
+    assert len(_grants(world, run)) == 1

@@ -18,7 +18,10 @@ book of record. Everything here is read from something already durable:
 * ``model_runs`` -- every model call, committed the moment it was made, so a
   call whose turn was unwound is still a call that happened.
 * ``run_events`` -- ``CODING_STARTED``, each stamped with the attempt it
-  belongs to.
+  belongs to, and ``VERIFICATION_REPAIR_GRANTED``, which is the whole of
+  concern 79's bounded allowance: granted once, appended inside the turn
+  boundary that granted it, and read back here so a resumed run cannot be
+  handed a second one.
 * the run's artifact directory -- ``attempt-N-cycle-M/`` exists on disk as
   soon as a turn starts writing, and a file is inside nobody's transaction.
 
@@ -50,7 +53,12 @@ from sqlalchemy.orm import Session
 
 from ..config.logging import get_logger
 from ..config.settings import Settings
-from ..domain.enums import ModelPurpose, ReviewDecision, RunEventType
+from ..domain.enums import (
+    CorrectionSource,
+    ModelPurpose,
+    ReviewDecision,
+    RunEventType,
+)
 from ..domain.models import ModelRun, Review, TaskRun
 from ..domain.review import ReviewResult, issue_fingerprint, render_review_feedback
 from ..repositories import (
@@ -141,6 +149,16 @@ class RecoveredLoopState:
     #: The attempt that was begun and never reached a verdict, when there is
     #: one. For the log and the report; the accounting does not depend on it.
     interrupted_attempt: int | None = None
+    #: Where ``feedback`` came from (concern 79). A reviewer's findings outrank
+    #: a person's answer, and both outrank having nothing, which is the same
+    #: order ``feedback`` itself is resolved in -- so this is a label for the
+    #: choice that was already being made, not a second decision.
+    feedback_source: CorrectionSource = CorrectionSource.INITIAL
+    #: Concern 79 allowances already granted to this run, counted from the
+    #: ``VERIFICATION_REPAIR_GRANTED`` events. The one piece of this state that
+    #: exists purely to be able to *refuse*: a resumed run reads its own grant
+    #: back and is not given another.
+    verification_repairs_granted: int = 0
 
     def describe(self) -> dict[str, object]:
         return {
@@ -151,6 +169,8 @@ class RecoveredLoopState:
             "reviews_completed": self.reviews_completed,
             "interrupted_attempt": self.interrupted_attempt,
             "feedback_reconstructed": self.feedback is not None,
+            "feedback_source": self.feedback_source.value,
+            "verification_repairs_granted": self.verification_repairs_granted,
             "turns": [turn.describe() for turn in self.turns],
         }
 
@@ -184,11 +204,28 @@ def recover_loop_state(
         for call in ModelRunRepository(session).list_for_run(run.id)
         if call.purpose in _CODING_PURPOSES
     ]
+    history = RunEventRepository(session).list_for_run(run.id)
     events = [
         event
-        for event in RunEventRepository(session).list_for_run(run.id)
+        for event in history
         if event.event_type is RunEventType.CODING_STARTED and event.attempt
     ]
+    # Concern 79. The allowance is a run event and nothing else, which is what
+    # makes it survive the process that granted it. Counted rather than tested
+    # for presence so that a record somehow carrying two is read as two spent,
+    # not as one still available.
+    # ``==``, not ``is``: ``RunEvent.event_type`` is typed and stored as a
+    # plain ``str``, so a row read back from the database is a string and an
+    # identity test against the enum member is always false. Getting this wrong
+    # here would make the refusal silently stop working -- a resumed run would
+    # count zero grants and hand out a second allowance -- which is the one
+    # failure mode this count exists to prevent. ``StrEnum`` compares equal to
+    # its value, so this holds for a live event object too.
+    repairs_granted = sum(
+        1
+        for event in history
+        if event.event_type == RunEventType.VERIFICATION_REPAIR_GRANTED
+    )
     directories = _attempt_directories(run, settings=settings)
 
     started_attempts = {
@@ -218,8 +255,9 @@ def recover_loop_state(
     attempts_started = max(highest_started, run.attempt_number - 1)
     next_attempt = max(run.attempt_number, highest_started + 1)
     interrupted = _interrupted_attempt(highest_started, calls, judged_cycles)
+    review_feedback = _correction_feedback(reviews)
     state = RecoveredLoopState(
-        feedback=_correction_feedback(reviews) or initial_feedback,
+        feedback=review_feedback or initial_feedback,
         next_attempt=next_attempt,
         cycle=cycle,
         attempts_started=attempts_started,
@@ -228,6 +266,14 @@ def recover_loop_state(
         turns=_recovered_turns(reviews, calls, highest_started),
         recovered=bool(reviews or started_attempts or run.attempt_number > 1),
         interrupted_attempt=interrupted,
+        feedback_source=(
+            CorrectionSource.REVIEW
+            if review_feedback
+            else CorrectionSource.HUMAN
+            if initial_feedback
+            else CorrectionSource.INITIAL
+        ),
+        verification_repairs_granted=repairs_granted,
     )
     if state.recovered:
         logger.info(
@@ -239,6 +285,8 @@ def recover_loop_state(
             reviews_completed=state.reviews_completed,
             interrupted_attempt=state.interrupted_attempt,
             feedback_reconstructed=state.feedback is not None,
+            feedback_source=state.feedback_source.value,
+            verification_repairs_granted=state.verification_repairs_granted,
         )
     return state
 

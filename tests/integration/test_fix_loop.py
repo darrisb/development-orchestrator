@@ -41,7 +41,9 @@ from apps.orchestrator.agents.review_prompts import (
 from apps.orchestrator.config.settings import Settings, WorkerBackend
 from apps.orchestrator.domain.enums import (
     Complexity,
+    CorrectionSource,
     EscalationStatus,
+    FailureAction,
     FailureReason,
     IssueCategory,
     IssueSeverity,
@@ -1372,3 +1374,362 @@ async def test_a_run_that_continues_earlier_work_does_not_reuse_its_attempt_numb
     assert len(directories) == 2
     assert result.outcome is LoopOutcome.ESCALATED
     assert result.failure_reason is FailureReason.RETRY_EXHAUSTED
+
+
+# --- concern 79: the bounded verification repair ------------------------------
+#
+# The lifecycle this allowance exists for, and the six ways it must refuse to
+# fire. A real campaign produced the sequence: a reviewer correctly asked for
+# missing requirements, the correction was substantially more complete than
+# anything before it, deterministic verification rejected it, and because the
+# correction had spent the final attempt the run went straight to HUMAN_REVIEW
+# with no bounded chance to repair what the reviewer had just asked for.
+#
+# The verifier was right every time. What was missing was one turn.
+
+_CHANGES = _review(decision="CHANGES_REQUESTED", issues=[_MISSING_GUARD])
+
+
+def _repair_grants(session: Session, run: TaskRun) -> list[dict]:
+    """The run's own record of the allowance, which is the only record of it."""
+    return [
+        event.payload
+        for event in RunEventRepository(session).list_for_run(run.id)
+        if event.event_type == RunEventType.VERIFICATION_REPAIR_GRANTED
+    ]
+
+
+def _two_attempt_task(task_factory) -> Task:
+    """A task whose budget runs out on the reviewer-driven correction.
+
+    Two attempts, so the correction the reviewer asks for *is* the last one the
+    budget allows -- which is the whole situation. Three review cycles, because
+    a repair that verifies still has to face a reviewer.
+    """
+    return task_factory(
+        limits=TaskLimits(
+            max_attempts=2, max_review_cycles=3, max_files_changed=3, max_diff_lines=200
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_ordinary_exhaustion_grants_no_allowance(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    run: TaskRun,
+    loop_settings: Settings,
+):
+    """A. Normal max-attempt behaviour is untouched.
+
+    Three attempts, three deterministic failures, nothing reviewer-driven
+    anywhere in it: the run stops at the task's ceiling exactly as it did
+    before the allowance existed.
+    """
+    coder = ScriptedModel(_code(BROKEN), _code(BROKEN), _code(BROKEN))
+
+    result = await run_fix_loop(
+        session, workspace, coder=coder, reviewer=reviewer(), settings=loop_settings
+    )
+
+    assert result.outcome is LoopOutcome.ESCALATED
+    assert result.failure_reason is FailureReason.RETRY_EXHAUSTED
+    assert result.attempts_used == 3 == task.limits.max_attempts
+    assert result.verification_repairs_used == 0
+    assert result.verification_repair_attempt is None
+    assert not coder.answers, "no fourth attempt was asked for"
+    assert _repair_grants(session, run) == []
+    assert RunEventType.VERIFICATION_REPAIR_GRANTED not in _events(session, run)
+
+
+@pytest.mark.asyncio
+async def test_an_initial_implementation_failure_is_not_a_reviewer_correction(
+    session: Session,
+    task_factory,
+    loop_settings: Settings,
+):
+    """B. The first attempt has no reviewer behind it, so it earns nothing."""
+    task = task_factory(limits=TaskLimits(max_attempts=1, max_files_changed=3))
+    run = create_run(session, task.id)
+    workspace = prepare_workspace(session, run.id, settings=loop_settings)
+    coder = ScriptedModel(_code(BROKEN))
+
+    result = await run_fix_loop(
+        session, workspace, coder=coder, reviewer=reviewer(), settings=loop_settings
+    )
+
+    assert result.failure_reason is FailureReason.RETRY_EXHAUSTED
+    assert result.attempts_used == 1
+    assert result.verification_repairs_used == 0
+    assert _repair_grants(session, run) == []
+    (iteration,) = result.iterations
+    assert iteration.correction_source is CorrectionSource.INITIAL
+    assert not iteration.repair_granted
+
+
+@pytest.mark.asyncio
+async def test_a_verification_driven_correction_does_not_earn_the_allowance(
+    session: Session,
+    task_factory,
+    loop_settings: Settings,
+):
+    """C. The provenance has to be a reviewer's, not another verifier's.
+
+    Two deterministic failures in a row is the ordinary fix loop doing its job
+    and running out of budget. Granting a repair here would be an extra retry
+    for every task, which is precisely what this must not be.
+    """
+    task = _two_attempt_task(task_factory)
+    run = create_run(session, task.id)
+    workspace = prepare_workspace(session, run.id, settings=loop_settings)
+    coder = ScriptedModel(_code(BROKEN), _code(BROKEN))
+
+    result = await run_fix_loop(
+        session, workspace, coder=coder, reviewer=reviewer(), settings=loop_settings
+    )
+
+    assert result.failure_reason is FailureReason.RETRY_EXHAUSTED
+    assert result.attempts_used == 2
+    assert result.verification_repairs_used == 0
+    assert _repair_grants(session, run) == []
+    assert [item.correction_source for item in result.iterations] == [
+        CorrectionSource.INITIAL,
+        CorrectionSource.VERIFICATION,
+    ]
+    assert not coder.answers
+
+
+@pytest.mark.asyncio
+async def test_a_reviewer_correction_rejected_by_the_verifier_gets_one_repair(
+    session: Session,
+    task_factory,
+    loop_settings: Settings,
+):
+    """D, F and J. The lifecycle, end to end, and what it leaves behind.
+
+    Attempt 1 verifies and the reviewer sends it back. Attempt 2 is the
+    correction and spends the last of the budget; the tests reject it. That is
+    the dead end the allowance opens: one more turn, given the failing command
+    rather than the reviewer's findings, verified by the same commands, and
+    then shown to the same reviewer.
+    """
+    task = _two_attempt_task(task_factory)
+    run = create_run(session, task.id)
+    workspace = prepare_workspace(session, run.id, settings=loop_settings)
+    coder = ScriptedModel(_code(WORKING), _code(BROKEN), _code(REVIEWED))
+    review_provider = reviewer(_CHANGES, _review())
+
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=coder,
+        reviewer=review_provider,
+        settings=loop_settings,
+    )
+
+    # F: the repair verified, and the reviewer still decided. Nothing was
+    # auto-approved and nothing was skipped.
+    assert result.outcome is LoopOutcome.APPROVED
+    assert result.approved
+    assert not coder.answers
+
+    # Exactly one repair, filed under exactly one attempt number.
+    assert result.verification_repairs_used == 1
+    assert result.verification_repair_attempt == 3
+    assert result.attempts_used == 3, "the repair is a coding attempt and is counted"
+    assert result.cycles_used == 2
+
+    first, correction, repair = result.iterations
+    assert [item.attempt for item in result.iterations] == [1, 2, 3]
+    assert first.correction_source is CorrectionSource.INITIAL
+    assert not first.verification_repair
+
+    # The turn that grants is the turn the verifier rejected, not the repair.
+    assert correction.correction_source is CorrectionSource.REVIEW
+    assert correction.repair_granted
+    assert not correction.verification_repair
+    assert correction.verification is not None
+    assert not correction.verification.no_new_regressions
+    assert correction.action is FailureAction.SEND_TO_CODER
+    assert correction.failure_reason is not FailureReason.RETRY_EXHAUSTED
+
+    # The repair itself: it is the repair, it was told to fix the verification,
+    # and it did not grant itself a successor.
+    assert repair.verification_repair
+    assert repair.correction_source is CorrectionSource.VERIFICATION
+    assert not repair.repair_granted
+    assert repair.review is not None and repair.review.approved
+    assert repair.review.cycle == 2
+
+    # Requirement 3: the repair's primary instruction is the deterministic
+    # failure, not the reviewer's findings. The earlier reviewer guidance may
+    # ride along behind it -- that is the existing anti-regression carry -- but
+    # the failing command is what the prompt leads with.
+    sent = coder.feedback_sent[-1]
+    assert sent is not None
+    assert f"{PYTHON} tools/test.py" in sent
+    assert sent.index(f"{PYTHON} tools/test.py") < len(sent) // 2
+    head = sent.split("Earlier correction guidance")[0]
+    assert _MISSING_GUARD["requiredFix"] not in head
+
+    # J: the grant is on the run's event stream, with the numbers a reader
+    # needs, and in the loop's own artifact.
+    (grant,) = _repair_grants(session, run)
+    assert grant["granted_after_attempt"] == 2
+    assert grant["repair_attempt"] == 3
+    assert grant["ceiling"] == 2
+    assert grant["allowance"] == 1
+    assert grant["granted_total"] == 1
+    assert grant["correction_source"] == CorrectionSource.REVIEW.value
+
+    recorded = json.loads(_artifact(loop_settings, result.artifacts[FIX_LOOP_ARTIFACT]))
+    assert recorded["verification_repairs_used"] == 1
+    assert recorded["verification_repair_attempt"] == 3
+    assert [item["correction_source"] for item in recorded["iterations"]] == [
+        "INITIAL",
+        "REVIEW",
+        "VERIFICATION",
+    ]
+    assert [item["verification_repair"] for item in recorded["iterations"]] == [
+        False,
+        False,
+        True,
+    ]
+    assert [
+        item["verification_repair_granted"] for item in recorded["iterations"]
+    ] == [False, True, False]
+
+    # The repair's artifacts are its own: a directory no ordinary attempt of
+    # this run could have written, because the budget stopped at two.
+    root = loop_settings.artifact_root / "runs"
+    stored = {
+        artifact.path
+        for artifact in ArtifactRepository(session).list_for_run(run.id)
+    }
+    assert any("attempt-3-cycle-2/" in path for path in stored), stored
+    assert root.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_repair_the_verifier_rejects_escalates_with_no_second_allowance(
+    session: Session,
+    task_factory,
+    loop_settings: Settings,
+):
+    """E. The verifier keeps its authority, and the allowance is spent once."""
+    task = _two_attempt_task(task_factory)
+    run = create_run(session, task.id)
+    workspace = prepare_workspace(session, run.id, settings=loop_settings)
+    coder = ScriptedModel(_code(WORKING), _code(BROKEN), _code(BROKEN))
+
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=coder,
+        reviewer=reviewer(_CHANGES),
+        settings=loop_settings,
+    )
+
+    assert result.outcome is LoopOutcome.ESCALATED
+    assert result.failure_reason is FailureReason.RETRY_EXHAUSTED
+    assert not coder.answers, "no fourth coding turn was asked for"
+    assert result.verification_repairs_used == 1
+    assert len(_repair_grants(session, run)) == 1
+
+    repair = result.iterations[-1]
+    assert repair.attempt == 3
+    assert repair.verification_repair
+    assert not repair.repair_granted, "the repair cannot grant itself another"
+    assert repair.failure_reason is FailureReason.RETRY_EXHAUSTED
+    assert repair.action is FailureAction.ESCALATE
+    assert repair.verification is not None
+    assert not repair.verification.no_new_regressions
+
+    # The escalation tells the truth about both budgets: the task's two
+    # attempts, and the one repair they were extended by.
+    assert result.escalation is not None
+    summary = result.escalation.summary
+    assert f"2 of the task's {task.limits.max_attempts} permitted" in summary
+    assert "bounded verification repair" in summary
+    assert "attempt 3" in summary
+    assert "is not granted twice" in summary
+    assert _status(session, task) is TaskStatus.HUMAN_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_a_provider_failure_during_the_correction_earns_nothing(
+    session: Session,
+    task_factory,
+    loop_settings: Settings,
+):
+    """I. No candidate means nothing a verifier rejected.
+
+    The reviewer-driven provenance is there, the budget is spent, and the
+    allowance still must not fire: what failed was the provider, and a repair
+    turn would have no verification evidence to be given.
+    """
+    task = _two_attempt_task(task_factory)
+    run = create_run(session, task.id)
+    workspace = prepare_workspace(session, run.id, settings=loop_settings)
+    coder = ScriptedModel(
+        _code(WORKING),
+        ModelTimeout("coder timed out after 600s", timeout_seconds=600),
+    )
+
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=coder,
+        reviewer=reviewer(_CHANGES),
+        settings=loop_settings,
+    )
+
+    assert result.outcome is LoopOutcome.ESCALATED
+    assert result.failure_reason is FailureReason.RETRY_EXHAUSTED
+    assert result.attempts_used == 2
+    assert result.verification_repairs_used == 0
+    assert _repair_grants(session, run) == []
+
+    stranded = result.iterations[-1]
+    assert stranded.correction_source is CorrectionSource.REVIEW
+    assert stranded.coding.failure_reason is FailureReason.MODEL_TIMEOUT
+    assert stranded.verification is None, "there was no candidate to verify"
+    assert not stranded.repair_granted
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_blocking_dispute_still_escalates_and_earns_nothing(
+    session: Session,
+    task_factory,
+    loop_settings: Settings,
+):
+    """H. The dispute safeguard is untouched by the allowance.
+
+    The reviewer-driven correction verifies cleanly here and the reviewer
+    re-raises the same blocking finding. That is a coder/reviewer disagreement,
+    which has its own route to a person, and the allowance -- which only ever
+    fires on a *verification* failure -- never comes near it.
+    """
+    task = _two_attempt_task(task_factory)
+    run = create_run(session, task.id)
+    workspace = prepare_workspace(session, run.id, settings=loop_settings)
+    coder = ScriptedModel(_code(WORKING), _code(REVIEWED))
+
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=coder,
+        reviewer=reviewer(_CHANGES, _CHANGES),
+        settings=loop_settings,
+    )
+
+    assert result.outcome is LoopOutcome.ESCALATED
+    assert result.failure_reason is FailureReason.HUMAN_DECISION_REQUIRED
+    assert result.verification_repairs_used == 0
+    assert _repair_grants(session, run) == []
+    assert result.attempts_used == 2
+    final = result.iterations[-1]
+    assert final.correction_source is CorrectionSource.REVIEW
+    assert final.verification is not None and final.verification.no_new_regressions
+    assert not final.repair_granted

@@ -389,6 +389,46 @@ class RunEventType(StrEnum):
     #: had produced it, which is exactly the false completion provenance this
     #: operation exists to avoid.
     BASELINE_CORRECTION_APPLIED = "BASELINE_CORRECTION_APPLIED"
+    #: Concern 79. The run was granted its one bounded verification repair:
+    #: a reviewer-driven correction produced a candidate that deterministic
+    #: verification rejected, and it happened on the last attempt the task's
+    #: budget allowed.
+    #:
+    #: This is the allowance's book of record, not a log line. The grant is
+    #: appended before the repair turn is made and inside the same durable
+    #: turn boundary, so a reader -- and a resumed run -- can tell a run that
+    #: has spent its allowance from one that still has it. There is at most one
+    #: per run; see ``domain.limits.VERIFICATION_REPAIR_ALLOWANCE``.
+    VERIFICATION_REPAIR_GRANTED = "VERIFICATION_REPAIR_GRANTED"
+
+
+class CorrectionSource(StrEnum):
+    """Where the instruction a coding turn was given came from (concern 79).
+
+    The fix loop has always handed one ``feedback`` string to the next turn
+    without recording which of the three things that write one produced it: a
+    deterministic verification report, a reviewer's blocking findings, or a
+    person answering an escalation. For routing a correction that did not
+    matter -- the text is the text. For concern 79's allowance it is the whole
+    question, because the allowance exists for exactly one provenance and must
+    not be inferred from an attempt number or from the shape of the text.
+
+    ``CODING`` is the turn whose predecessor never reached a verifier at all --
+    a refused edit set, an unusable response. It is kept distinct from
+    ``INITIAL`` so that "nothing has been tried yet" and "the last try
+    produced nothing to verify" are not the same answer.
+    """
+
+    #: The first coding turn of a run: nobody has asked for anything.
+    INITIAL = "INITIAL"
+    #: A person's answer to an escalation, carried in ``initial_feedback``.
+    HUMAN = "HUMAN"
+    #: The previous turn failed before verification could run.
+    CODING = "CODING"
+    #: Deterministic verification evidence: the real command and its output.
+    VERIFICATION = "VERIFICATION"
+    #: A reviewer's actionable blocking findings.
+    REVIEW = "REVIEW"
 
 
 class WorkerProfile(StrEnum):
