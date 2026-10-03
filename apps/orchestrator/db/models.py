@@ -8,6 +8,7 @@ hash (section 8).
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -50,7 +51,7 @@ from ..domain.enums import (
     WorkerProfile,
 )
 from .base import Base, Timestamps, UUIDPrimaryKey
-from .types import StrEnumType
+from .types import ExactDecimal, StrEnumType
 
 
 class ProjectRow(UUIDPrimaryKey, Timestamps, Base):
@@ -439,6 +440,24 @@ class ModelRunRow(UUIDPrimaryKey, Base):
     error_detail: Mapped[str | None] = mapped_column(Text)
     attempt: Mapped[int | None] = mapped_column(Integer)
     review_cycle: Mapped[int | None] = mapped_column(Integer)
+    #: Concern 78. The financial snapshot of this call, written when the call
+    #: is recorded and never recomputed. These six columns are *history*: if an
+    #: operator corrects a price tomorrow, the rows already written keep the
+    #: prices they were costed against, because the question they answer is
+    #: what this call cost, not what it would cost now.
+    #:
+    #: All six are nullable, and NULL means UNKNOWN rather than zero -- the
+    #: model had no pricing configured, or the endpoint reported no usage.
+    #: Every row written before this revision is in exactly that state, and
+    #: nothing backfills them: today's prices are not evidence about last
+    #: month's calls. An explicit zero cost comes only from a model whose
+    #: pricing declares zero, and is stored as 0, not NULL.
+    pricing_currency: Mapped[str | None] = mapped_column(String(8))
+    input_price_per_million: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    output_price_per_million: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    input_cost: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    output_cost: Mapped[Decimal | None] = mapped_column(ExactDecimal())
+    total_cost: Mapped[Decimal | None] = mapped_column(ExactDecimal())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

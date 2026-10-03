@@ -10,6 +10,7 @@ from ..db.session import get_db, get_session_factory
 from ..schemas.runs import (
     RecoverabilityResponse,
     RunRecoveryResponse,
+    RunUsageResponse,
     TaskRunResponse,
 )
 from ..schemas.tasks import (
@@ -20,6 +21,7 @@ from ..schemas.tasks import (
     TaskResponse,
 )
 from ..services import abandon as abandon_service
+from ..services import model_usage as usage_service
 from ..services import pauses as pause_service
 from ..services import retry as retry_service
 from ..services import run_recovery as recovery_service
@@ -92,6 +94,28 @@ def list_task_runs(task_id: UUID, session: Session = Depends(get_db)) -> list[Ta
 @router.get("/runs/{run_id}", response_model=TaskRunResponse)
 def get_run(run_id: UUID, session: Session = Depends(get_db)) -> TaskRunResponse:
     return TaskRunResponse.from_domain(run_service.get_run(session, run_id))
+
+
+@router.get("/runs/{run_id}/usage", response_model=RunUsageResponse)
+def get_run_usage(run_id: UUID, session: Session = Depends(get_db)) -> RunUsageResponse:
+    """What this run spent on models: tokens, duration and persisted cost.
+
+    Concern 78. Read-only and derived entirely from ``model_runs``, so asking
+    costs nothing and changes nothing. The run is fetched first so that an
+    unknown ``run_id`` is a 404 rather than an empty usage report, which would
+    otherwise be indistinguishable from a real run that made no model calls.
+
+    Costs are the ones persisted when each call was made. They are not
+    recalculated from the model's current pricing, so this answer about a past
+    run does not change when an operator edits a price.
+
+    Raises:
+        EntityNotFound: no such run. Mapped to 404.
+    """
+    run = run_service.get_run(session, run_id)
+    return RunUsageResponse.from_summary(
+        usage_service.usage_for_run(session, run.id), run_id=run.id
+    )
 
 
 @router.post("/runs/{run_id}/abandon", response_model=TaskRunResponse)

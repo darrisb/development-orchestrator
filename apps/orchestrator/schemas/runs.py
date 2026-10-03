@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
 from pydantic import BaseModel
 
-from ..domain.enums import RunStatus
+from ..domain.enums import ModelPurpose, RunStatus
 from ..domain.models import TaskRun
+from ..services.model_usage import ModelCallUsage, UsageSummary
 from ..services.run_recovery import (
     RecoverabilityReport,
     RecoveryAuthorization,
@@ -175,3 +177,144 @@ class ProjectRunResponse(BaseModel):
     outcome: str | None = None
     state: dict[str, object] | None = None
     no_task_reason: str | None = None
+
+
+def _money(value: Decimal | None) -> str | None:
+    """A monetary value as a plain decimal string, or ``None`` for unknown.
+
+    ``format(..., "f")`` rather than ``str()`` because a quantized zero is
+    ``Decimal("0E-12")``, whose ``str()`` is ``"0E-12"`` -- exponent notation
+    that a client parsing with a plain decimal reader will reject, for a value
+    that is simply zero. Every cost therefore goes out in the same fixed-point
+    shape at the column's scale.
+    """
+    return format(value, "f") if value is not None else None
+
+
+class ModelCallUsageResponse(BaseModel):
+    """One model call's usage and its persisted cost (concern 78).
+
+    ``cost`` is a decimal *string*, not a float. The value can be a small
+    fraction of a cent and a client will sum many of them; serialising through
+    a binary float would reintroduce exactly the error the persisted column
+    exists to avoid. ``null`` means the cost is unknown -- no pricing was
+    configured for the model, or the endpoint reported no usage -- and is not
+    the same as ``"0"``, which is what a model priced at zero records.
+    """
+
+    model_run_id: UUID
+    model_id: UUID
+    model: str
+    provider: str
+    purpose: ModelPurpose
+    status: RunStatus
+    input_tokens: int | None
+    output_tokens: int | None
+    duration_ms: int | None
+    cost: str | None
+    currency: str | None
+    attempt: int | None
+    review_cycle: int | None
+
+    @classmethod
+    def from_domain(cls, call: ModelCallUsage) -> ModelCallUsageResponse:
+        return cls(
+            model_run_id=call.model_run_id,
+            model_id=call.model_id,
+            model=call.model_name,
+            provider=call.provider,
+            purpose=call.purpose,
+            status=call.status,
+            input_tokens=call.input_tokens,
+            output_tokens=call.output_tokens,
+            duration_ms=call.duration_ms,
+            cost=_money(call.cost),
+            currency=call.currency,
+            attempt=call.attempt,
+            review_cycle=call.review_cycle,
+        )
+
+
+class UsageSummaryResponse(BaseModel):
+    """Totals over a set of model calls, with the unknowns declared.
+
+    ``known_cost`` is the sum of the calls that *could* be priced, and
+    ``has_unknown_cost`` says whether that is the whole story. They are
+    reported as two fields rather than one total on purpose: a run where one
+    call could not be priced has no total, and publishing the known part as
+    though it were one would understate the spend in the direction nobody
+    checks.
+
+    ``known_cost`` and ``currency`` are ``null`` when the priced calls do not
+    share a single currency; ``known_cost_by_currency`` then carries the
+    separate totals. Nothing converts between currencies.
+    """
+
+    model_calls: int
+    input_tokens: int
+    output_tokens: int
+    #: Calls that reported no tokens at all, so the token totals are a floor.
+    calls_without_usage: int
+    known_cost: str | None
+    currency: str | None
+    has_unknown_cost: bool
+    mixed_currencies: bool
+    known_cost_by_currency: dict[str, str]
+
+    @classmethod
+    def from_domain(cls, summary: UsageSummary) -> UsageSummaryResponse:
+        return cls(
+            model_calls=summary.model_calls,
+            input_tokens=summary.input_tokens,
+            output_tokens=summary.output_tokens,
+            calls_without_usage=summary.calls_without_usage,
+            known_cost=_money(summary.known_cost),
+            currency=summary.currency,
+            has_unknown_cost=summary.has_unknown_cost,
+            mixed_currencies=summary.mixed_currencies,
+            known_cost_by_currency={
+                currency: format(amount, "f")
+                for currency, amount in sorted(summary.known_cost_by_currency.items())
+            },
+        )
+
+
+class RunUsageResponse(BaseModel):
+    """``GET /runs/{run_id}/usage`` and ``GET /projects/{id}/usage``.
+
+    The per-call list is included rather than only the totals because the
+    question this endpoint exists to answer is usually comparative -- what did
+    the cloud coder cost next to the local reviewer -- and a single total
+    cannot answer it. ``by_purpose`` and ``by_model`` are the same calls
+    re-totalled, so each breakdown carries its own ``has_unknown_cost``.
+    """
+
+    run_id: UUID | None = None
+    project_id: UUID | None = None
+    totals: UsageSummaryResponse
+    calls: list[ModelCallUsageResponse]
+    by_purpose: dict[str, UsageSummaryResponse]
+    by_model: dict[str, UsageSummaryResponse]
+
+    @classmethod
+    def from_summary(
+        cls,
+        summary: UsageSummary,
+        *,
+        run_id: UUID | None = None,
+        project_id: UUID | None = None,
+    ) -> RunUsageResponse:
+        return cls(
+            run_id=run_id,
+            project_id=project_id,
+            totals=UsageSummaryResponse.from_domain(summary),
+            calls=[ModelCallUsageResponse.from_domain(call) for call in summary.calls],
+            by_purpose={
+                purpose.value: UsageSummaryResponse.from_domain(part)
+                for purpose, part in summary.by_purpose().items()
+            },
+            by_model={
+                name: UsageSummaryResponse.from_domain(part)
+                for name, part in summary.by_model().items()
+            },
+        )

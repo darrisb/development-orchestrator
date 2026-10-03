@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 from ..config.logging import get_logger
 from ..domain.enums import ModelPurpose, RunStatus
 from ..domain.models import Model, ModelRun
+from ..domain.pricing import CallCost, InvalidPricing, ModelPricing
 from ..domain.redaction import Redactor
 from ..providers import ModelResponse, ProviderConfig, TokenUsage
 from ..providers.registry import OPENAI_COMPATIBLE
@@ -69,6 +70,46 @@ def describe_error(error: BaseException) -> str:
         return collapsed
     return collapsed[: MAX_ERROR_DETAIL_CHARS - 1] + "…"
 
+
+
+def cost_for_call(model: Model, usage: TokenUsage | None) -> CallCost:
+    """The financial snapshot for one call to ``model``.
+
+    The single place a cost is calculated. It is here, at the recording
+    boundary, rather than in the coder, the planner and the reviewer, because
+    three implementations of the same arithmetic are three chances for a run's
+    purposes to be costed by different rules -- and because section 35's
+    comparisons are only meaningful if every purpose was measured the same way.
+    Every call recorded is costed, whatever its purpose and whatever its
+    status.
+
+    Pricing comes from the ``models`` row, which is the only thing both an
+    environment-configured provider and a registered one are guaranteed to
+    have. A row with no ``pricing`` metadata yields an unknown cost -- never a
+    zero; see ``domain.pricing``.
+
+    Malformed pricing on the row is recorded as unknown and logged loudly
+    rather than raised. A typo is caught where it is introduced, by
+    ``services.model_providers.register_model``, which validates pricing before
+    it reaches the database; by the time a call has already been made to the
+    endpoint, failing here would discard a completed model call's record to
+    report a configuration fault, and losing the audit row is the worse of the
+    two outcomes.
+    """
+    try:
+        pricing = ModelPricing.from_metadata(model.metadata)
+    except InvalidPricing as error:
+        logger.warning(
+            "model_pricing_invalid",
+            model_id=str(model.id),
+            model_name=model.model_name,
+            detail=str(error),
+        )
+        return CallCost()
+    if pricing is None:
+        return CallCost()
+    resolved = usage or TokenUsage()
+    return pricing.cost_for(resolved.input_tokens, resolved.output_tokens)
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +212,12 @@ def record_model_call(
     """
     model = ensure_model(session, config)
     completed = datetime.now(UTC)
+    # Concern 78: cost the call here, once, from whatever usage it reported.
+    # Status is deliberately not consulted -- a call that failed after the
+    # endpoint had already charged for its prompt still costs what its reported
+    # usage says it costs, and a failure that reported no usage is unknown for
+    # the same reason a success that reported none is.
+    cost = cost_for_call(model, usage)
     model_run = ModelRunRepository(session).add(
         ModelRun(
             task_run_id=task_run_id,
@@ -185,6 +232,16 @@ def record_model_call(
             error_detail=error_detail,
             attempt=attempt,
             review_cycle=review_cycle,
+            pricing_currency=cost.currency,
+            input_price_per_million=(
+                cost.pricing.input_per_million if cost.pricing else None
+            ),
+            output_price_per_million=(
+                cost.pricing.output_per_million if cost.pricing else None
+            ),
+            input_cost=cost.input_cost,
+            output_cost=cost.output_cost,
+            total_cost=cost.total_cost,
             started_at=started_at or completed - timedelta(milliseconds=duration_ms),
             completed_at=completed,
         )
@@ -199,6 +256,8 @@ def record_model_call(
         duration_ms=duration_ms,
         input_tokens=model_run.input_tokens,
         output_tokens=model_run.output_tokens,
+        total_cost=format(cost.total_cost, "f") if cost.is_known else None,
+        pricing_currency=cost.currency,
         attempt=attempt,
         review_cycle=review_cycle,
         error_detail=error_detail,
@@ -282,6 +341,7 @@ __all__ = [
     "MAX_ERROR_DETAIL_CHARS",
     "RecordedCall",
     "coding_purpose",
+    "cost_for_call",
     "describe_error",
     "ensure_model",
     "record_model_call",

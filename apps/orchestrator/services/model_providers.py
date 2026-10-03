@@ -19,6 +19,7 @@ from ..config.settings import Settings, get_settings
 from ..domain.enums import Complexity, ModelRole
 from ..domain.model_policy import ModelPolicy
 from ..domain.models import Model
+from ..domain.pricing import InvalidPricing, ModelPricing
 from ..providers import (
     ConnectionReport,
     ProviderConfig,
@@ -211,6 +212,14 @@ def _validated_metadata(metadata: dict[str, object]) -> dict[str, object]:
             "Model metadata must not contain raw credentials; use api_key_env "
             f"instead of: {', '.join(forbidden)}"
         )
+    # Concern 78: pricing is checked here, at the only point an operator can
+    # still be told about it. Once a row is saved, every call it costs reads
+    # this metadata after the endpoint has already answered, where refusing
+    # would throw away the audit record rather than the mistake.
+    try:
+        ModelPricing.from_metadata(metadata)
+    except InvalidPricing as error:
+        raise EntityConflict(f"Model metadata declares invalid pricing: {error}") from error
     return dict(metadata)
 
 

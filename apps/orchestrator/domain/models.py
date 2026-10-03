@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 from .enums import (
@@ -355,9 +356,27 @@ class ModelRun:
     attempt: int | None = None
     #: Which review cycle the call answered.
     review_cycle: int | None = None
+    #: The financial snapshot (concern 78), fixed when the call was recorded.
+    #: ``None`` throughout means the cost is UNKNOWN -- no pricing configured
+    #: for the model, or no usage reported by the endpoint -- which is not the
+    #: same fact as a cost of zero. A model whose pricing explicitly declares
+    #: zero produces ``Decimal("0")`` here, and that zero is a measurement.
+    #: These values are never recomputed from current pricing; see
+    #: ``domain.pricing``.
+    pricing_currency: str | None = None
+    input_price_per_million: Decimal | None = None
+    output_price_per_million: Decimal | None = None
+    input_cost: Decimal | None = None
+    output_cost: Decimal | None = None
+    total_cost: Decimal | None = None
     id: UUID = field(default_factory=_new_id)
     started_at: datetime | None = None
     completed_at: datetime | None = None
+
+    @property
+    def has_known_cost(self) -> bool:
+        """Whether this call's cost is a number rather than an unknown."""
+        return self.total_cost is not None
 
 
 @dataclass(slots=True)

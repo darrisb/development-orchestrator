@@ -14,8 +14,9 @@ from ..schemas.projects import (
     ProjectCreateRequest,
     ProjectResponse,
 )
-from ..schemas.runs import ProjectRunResponse
+from ..schemas.runs import ProjectRunResponse, RunUsageResponse
 from ..schemas.tasks import NextTaskResponse, TaskResponse
+from ..services import model_usage as usage_service
 from ..services import projects as project_service
 from ..services import tasks as task_service
 from ..services.manifest_loader import load_manifest, manifest_path_for
@@ -90,6 +91,23 @@ def list_project_tasks(
         TaskResponse.from_domain(task)
         for task in task_service.list_tasks(session, project_id, task_status)
     ]
+
+
+@router.get("/{project_id}/usage", response_model=RunUsageResponse)
+def project_usage(project_id: UUID, session: Session = Depends(get_db)) -> RunUsageResponse:
+    """What every model call on this project's tasks spent (concern 78).
+
+    The project-wide counterpart of ``GET /runs/{run_id}/usage``, and the wider
+    of the two figures: it includes the runs that were retried or abandoned,
+    because those calls were made and charged whatever the run went on to do.
+
+    Raises:
+        EntityNotFound: no such project. Mapped to 404.
+    """
+    project = project_service.get_project(session, project_id)
+    return RunUsageResponse.from_summary(
+        usage_service.usage_for_project(session, project.id), project_id=project.id
+    )
 
 
 @router.get("/{project_id}/next-task", response_model=NextTaskResponse)
