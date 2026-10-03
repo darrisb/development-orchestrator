@@ -41,6 +41,7 @@ from .errors import (
     ModelTimeout,
     ModelUnavailable,
 )
+from .strict_schema import normalise_strict_payload, to_strict_schema
 from .structured import parse_structured, strip_reasoning
 
 logger = get_logger(__name__)
@@ -203,11 +204,20 @@ class OpenAICompatibleProvider:
         if request.max_output_tokens is not None:
             payload["max_output_tokens"] = request.max_output_tokens
         if request.schema is not None:
+            # Strict structured output here is narrower than JSON Schema: the
+            # canonical schema is adapted for the wire rather than changed
+            # (see ``strict_schema``), and the reply is normalised back before
+            # any domain parsing sees it.
+            wire_schema = (
+                to_strict_schema(request.schema.schema)
+                if request.schema.strict
+                else dict(request.schema.schema)
+            )
             payload["text"] = {
                 "format": {
                     "type": "json_schema",
                     "name": request.schema.name,
-                    "schema": dict(request.schema.schema),
+                    "schema": wire_schema,
                     "strict": request.schema.strict,
                 }
             }
@@ -253,9 +263,18 @@ class OpenAICompatibleProvider:
                     f"Model response for schema '{request.schema.name}' was truncated "
                     "at the output-token limit"
                 )
-            data = parse_structured(
+            parsed = parse_structured(
                 text, request.schema.schema, schema_name=request.schema.name
             )
+            # The nulls the strict transport schema required are placeholders
+            # for absence, not values: they are removed here so the canonical
+            # parser is handed the same shape a local provider produces.
+            normalised = (
+                normalise_strict_payload(parsed, request.schema.schema)
+                if request.schema.strict
+                else parsed
+            )
+            data = normalised if isinstance(normalised, Mapping) else parsed
 
         return ModelResponse(
             text=text,
