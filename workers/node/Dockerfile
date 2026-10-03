@@ -18,6 +18,8 @@ FROM node:22-bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        chromium \
+        chromium-sandbox \
         g++ \
         git \
         make \
@@ -26,9 +28,17 @@ RUN apt-get update \
 
 # A writable HOME for an unknown uid. The service also points every package
 # manager's cache at /tmp, which is a tmpfs discarded with the container.
+# Browser tests run inside the worker's existing Docker security boundary.
+# Chromium's own Linux sandbox cannot initialize under no-new-privileges, so
+# Karma launches this wrapper while Docker isolation remains fully enforced.
+RUN printf '#!/bin/sh\nexec /usr/bin/chromium --headless --no-sandbox "$@"\n' \
+        > /usr/local/bin/orchestrator-chromium \
+    && chmod 0755 /usr/local/bin/orchestrator-chromium
+
 ENV HOME=/tmp \
     NPM_CONFIG_CACHE=/tmp/.npm \
     NPM_CONFIG_UPDATE_NOTIFIER=false \
+    CHROME_BIN=/usr/local/bin/orchestrator-chromium \
     CI=true
 
 # Group 0 with group-write on the workdir: an arbitrary uid still belongs to
