@@ -28,13 +28,11 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
-from sqlalchemy.orm import Session
 
-from apps.orchestrator.config.settings import Settings
 from apps.orchestrator.domain.enums import EscalationStatus, RunEventType, WorkerProfile
+from apps.orchestrator.domain.git import INTEGRATION_BRANCH
 from apps.orchestrator.domain.models import Project
 from apps.orchestrator.domain.verification import VerificationProfile
-from apps.orchestrator.domain.git import INTEGRATION_BRANCH
 from apps.orchestrator.repositories import (
     EscalationRepository,
     ModelRunRepository,
@@ -51,8 +49,8 @@ from apps.orchestrator.services.integration import (
 from apps.orchestrator.services.runs import create_run
 from apps.orchestrator.services.workspace import prepare_workspace, repository_service
 from tests.integration.test_integration_baseline import (
-    PYTHON,
     _BASE,
+    PYTHON,
     _accepted_candidate_on_a_diverged_baseline,
     _factory,
     _project,
