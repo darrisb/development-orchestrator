@@ -7,6 +7,8 @@ guard and are asserted in ``test_scope_guard.py``.
 
 from __future__ import annotations
 
+import pytest
+
 from apps.orchestrator.domain.enums import ScopePolicyDecision
 from apps.orchestrator.domain.git import ChangeType, DiffSummary, FileChange
 from apps.orchestrator.domain.security import (
@@ -261,3 +263,136 @@ def test_an_exception_never_excuses_credential_material():
 
     assert assessment.decision is ScopePolicyDecision.BLOCK
     assert assessment.findings[0].kind is SecurityFindingKind.FORBIDDEN_FILE
+
+
+# ----------------------------- a name beside a bare word is not a credential
+#
+# Found by a real campaign. UI-002 run #2 built, tested and then failed the
+# security scan alone, on two diff lines that read:
+#
+#     readonly totalTokens: number;
+#
+# ``TOKEN`` is a secret-name hint and must stay one, the ``named_value`` shape
+# accepts ``:`` as a separator, and ``number`` is six characters, is no
+# environment lookup and is no known placeholder. So every ingredient of a
+# credential was present except a credential: what follows the colon is the
+# *type* of the value, and the value is not on the line at all.
+#
+# The scanner does not try to recognise declarations -- that would mean
+# knowing six languages' grammars. It asks whether there is enough evidence to
+# block: a colon, an unquoted value and a bare identifier leave the *name* as
+# the only thing suggesting a secret, and a name is not evidence of a value.
+# These tests are therefore about where that evidence runs out, and about
+# everything that still has enough of it.
+
+
+def ts_declaration(*lines: str):
+    """Scan added lines as a TypeScript source file."""
+    return scan_candidate(diff_adding(*lines), summary(changed("src/state.ts")))
+
+
+def test_a_typed_token_property_is_not_credential_material():
+    """The campaign line, exactly as it appeared in the diff."""
+    assessment = ts_declaration("  readonly totalTokens: number;")
+
+    assert assessment.decision is ScopePolicyDecision.ALLOW
+    assert assessment.findings == ()
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # The reported line and its family: a credential-shaped name, a colon,
+        # and a bare word where a secret would be. No list of type names is
+        # consulted, so a project's own types are covered by the same rule as
+        # the language's.
+        "  readonly totalTokens: number;",
+        "  apiKey: string;",
+        "  totalTokens: TokenCount;",
+        "  credentialMode: RequestCredentials[];",
+        "  tokenStream: Observable<string>;",
+        "  authInstant: java.time.Instant;",
+        # No terminator and no modifier either: the evidence is absent whatever
+        # surrounds the match.
+        "export function rotate(apiKey: string) {",
+        # Names that a built-in-type dictionary would have got wrong, because
+        # digits in a type name are not digits in a secret.
+        "  authCount: int32;",
+        "  oauthToken: OAuth2Token;",
+        "  keyEncoder: Base64Encoder;",
+        # The ``auth_header`` shape reaches the same false conclusion about an
+        # Angular property, so it is held to the same rule.
+        "  authorization: HttpHeaders;",
+    ],
+)
+def test_a_name_beside_a_bare_identifier_does_not_block(line: str):
+    assessment = ts_declaration(line)
+
+    assert assessment.decision is ScopePolicyDecision.ALLOW, line
+    assert assessment.findings == (), line
+
+
+# ------------------------------- and every high-confidence shape still blocks
+
+
+@pytest.mark.parametrize(
+    ("line", "why"),
+    [
+        # Synthetic throughout: none of these is a real credential.
+        #
+        # ``=`` is an assignment wherever it is spelled that way.
+        ("TOKEN=Zx91fakefakenotrealvalue", "named assignment"),
+        ("export AUTH_SECRET=Zx91fakefakenotrealvalue", "named assignment"),
+        ('DATABASE_PASSWORD = "hunter2-not-a-real-password"', "named assignment"),
+        # A quoted value is data, not an annotation.
+        ('  "api_token": "Zx91fakefakenotrealvalue",', "quoted JSON value"),
+        ("  password: 'Zx91fakefakenotrealvalue'", "quoted value"),
+        # Unquoted after a colon, but credential punctuation cannot be spelled
+        # as an identifier.
+        ("api_token: Zx91-fakefake-notreal-value;", "punctuated value"),
+        ("secret_key: Zx91fakefake/notreal+value;", "punctuated value"),
+        # An Authorization scheme puts the value after the scheme, not after
+        # the colon.
+        (
+            "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.ZZfakebodyZZfake.ZZfakesigZZfake",
+            "auth header",
+        ),
+        ("authorization: basic dXNlcjpwYXNzd29yZA==", "auth header"),
+        # The content-identifying shapes are outside the rule and act as its
+        # backstop: these block even though the line is otherwise excused.
+        (
+            "  authToken: eyJhbGciOiJIUzI1NiJ9.ZZfakebodyZZfake.ZZfakesigZZfake;",
+            "JWT backstop on an excused line",
+        ),
+        # Not AWS's own ``AKIAIOSFODNN7EXAMPLE``: that contains "EXAMPLE" and
+        # is correctly allowed by the placeholder rule, which predates this.
+        ("  aws_access_key: AKIAZZ91FAKEFAKEFAKE;", "AWS prefix backstop"),
+        ('const key = "sk-ZZfakefakefakefakefake1234";', "provider prefix"),
+        ("token = 'ghp_ZZfakefakefakefakefakefake123456'", "provider prefix"),
+    ],
+)
+def test_high_confidence_credential_material_still_blocks(line: str, why: str):
+    assessment = ts_declaration(line)
+
+    assert assessment.blocked, f"{why}: {line}"
+    assert assessment.findings[0].kind is SecurityFindingKind.SECRET_MATERIAL
+    # The finding must not republish what it found (see the test above).
+    assert "Zx91fakefake" not in assessment.summary(), line
+
+
+def test_a_declaration_does_not_excuse_a_private_key_on_the_same_line():
+    """PEM detection is outside the rule entirely."""
+    assessment = ts_declaration(
+        "  readonly key: string = '-----BEGIN RSA PRIVATE KEY-----';"
+    )
+
+    assert assessment.blocked
+    assert assessment.findings[0].kind is SecurityFindingKind.SECRET_MATERIAL
+
+
+def test_the_name_itself_is_never_what_excuses_a_line():
+    """``TOKEN`` remains a secret-name hint and ``totalTokens`` is on no
+    allow-list. The same name blocks or allows according to whether there is
+    evidence of a value beside it."""
+    assert ts_declaration("  totalTokens: number;").decision is ScopePolicyDecision.ALLOW
+    assert ts_declaration("totalTokens=Zx91fakefakenotrealvalue").blocked

@@ -143,3 +143,46 @@ def test_an_environment_is_logged_with_its_secret_values_masked_by_name():
     )
 
     assert masked == {"PATH": "/usr/bin", "CI": "true", "NPM_TOKEN": PLACEHOLDER}
+
+
+# ----------------------------------- redaction stays eager where the scan does not
+#
+# The candidate scanner stopped treating ``readonly totalTokens: number;`` as
+# credential material, because blocking a candidate needs confidence that the
+# line assigns a secret rather than declares a type. Redaction makes the
+# opposite trade on purpose: masking an innocent value in a build log costs a
+# word of readability, so it keeps the benefit of the doubt.
+#
+# These tests pin that asymmetry. If a later change moves the scanner's
+# judgement down into ``SHAPE_PATTERNS``, they fail.
+
+
+@pytest.mark.parametrize(
+    ("text", "masked_part"),
+    [
+        ("readonly totalTokens: number;", "number"),
+        ("  apiKey: string;", "string"),
+        ("  authorization: HttpHeaders;", "HttpHeaders"),
+    ],
+)
+def test_a_type_declaration_in_a_log_is_still_masked_eagerly(
+    text: str, masked_part: str
+):
+    """The shared shapes did not get looser to make the scanner more accurate.
+
+    A log line is not a candidate: there is no cost to masking this and no
+    assurance to be had from leaving it, so the conservative half of the
+    design is unchanged.
+    """
+    masked = Redactor().redact(text)
+
+    assert PLACEHOLDER in masked
+    assert masked_part not in masked
+
+
+def test_the_name_hints_still_include_token():
+    """Dropping ``TOKEN`` would have been the cheap fix and the wrong one: it
+    is the hint that catches ``API_TOKEN=...`` in a printed environment."""
+    assert is_secret_name("API_TOKEN")
+    assert is_secret_name("totalTokens")
+    assert PLACEHOLDER in Redactor().redact("API_TOKEN=Zx91fakefakenotrealvalue")

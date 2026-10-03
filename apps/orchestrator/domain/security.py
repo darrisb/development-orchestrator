@@ -122,6 +122,29 @@ _PLACEHOLDER_MARKERS: tuple[str, ...] = (
     PLACEHOLDER.casefold(),
 )
 
+#: The shapes that infer a credential from a *name* beside a value, rather
+#: than from the material itself.
+#:
+#: The split is what makes the rule in ``_insufficient_evidence`` safe.
+#: ``private_key`` and ``prefixed_key`` recognise credential material by its
+#: own content -- a PEM body, an ``sk-``/``ghp_``/``AKIA``/JWT prefix -- so no
+#: surrounding syntax can make such a value innocent and they are never
+#: exempted. They are also the backstop: a line excused below is still offered
+#: to them, so genuine material on an excused line still blocks.
+_NAME_INFERRED_SHAPES: frozenset[str] = frozenset({"named_value", "auth_header"})
+
+#: A value spelled as a plain identifier: optionally qualified, generic or an
+#: array. Deliberately a shape, not a vocabulary -- it says nothing about which
+#: identifiers are types in which language, only that credential material
+#: cannot be spelled this way. A secret carries ``-``, ``/``, ``+``, ``=`` or a
+#: provider prefix; an identifier carries none of those.
+_IDENTIFIER_VALUE = re.compile(
+    r"^[A-Za-z_$][A-Za-z0-9_$]*"         # Foo
+    r"(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*"   # ...or java.time.Instant
+    r"(?:<[^>]*>?)?"                     # ...or Observable<string>
+    r"(?:\[\])*$"                        # ...or Foo[][]
+)
+
 #: A PEM header on its own line. See ``_secret_findings``.
 _PEM_HEADER = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 
@@ -305,6 +328,8 @@ def _secret_findings(added: tuple[tuple[int, str], ...]) -> list[SecurityFinding
             match = pattern.search(text)
             if match is None or not _is_literal_secret(match.group("secret")):
                 continue
+            if name in _NAME_INFERRED_SHAPES and _insufficient_evidence(text, match):
+                continue
             # One finding per line, named for the first shape that matched:
             # a key that is both "prefixed" and "named" is still one secret,
             # and reporting it twice makes a diff look worse than it is.
@@ -336,6 +361,54 @@ def _is_literal_secret(value: str) -> bool:
     if any(marker.casefold() in lowered for marker in _REFERENCE_MARKERS):
         return False
     return not any(marker in lowered for marker in _PLACEHOLDER_MARKERS)
+
+
+def _insufficient_evidence(text: str, match: re.Match[str]) -> bool:
+    """Whether a name-inferred match is too weak to block a candidate on.
+
+    The third thing, after references and placeholders, that wears a
+    credential's shape without being one: a type annotation. The campaign line
+    was ``readonly totalTokens: number;`` -- ``TOKEN`` is a secret-name hint
+    and must stay one, the shared shape accepts ``:`` as a separator, and
+    ``number`` is six characters, is no environment lookup and is no known
+    placeholder. Every ingredient of a secret was there except a secret: what
+    follows the colon is the *type* of the value, and the value is not on the
+    line.
+
+    Rather than prove the line is a declaration -- which would mean knowing the
+    grammar of every language the orchestrator builds for -- this asks the
+    cheaper and sounder question: **is there enough evidence here to block?**
+    Three structural facts, all taken from the match itself, and a genuine
+    credential contradicts at least one:
+
+    1. **The separator is ``:``, not ``=``.** ``NAME=value`` is an assignment
+       wherever it is spelled that way, and nothing annotates a type with
+       ``=``. This alone keeps every ``TOKEN=...`` finding.
+    2. **The value is unquoted.** A quoted value is data. This alone keeps
+       every JSON and YAML string credential, which is where a colon and a
+       real secret legitimately meet.
+    3. **The value is spelled as a plain identifier.** Credential material is
+       not: it carries punctuation or a provider prefix, and both are what the
+       content-identifying shapes read.
+
+    All three together leave a name, a colon and a bare word -- which is the
+    shape of ``totalTokens: number``, of ``apiKey: string`` and of every
+    project type beside them. The name is the only thing suggesting a
+    credential, and a name is not evidence of a value.
+
+    This is a decision not to *block*, not a decision that the line is safe.
+    The loop continues to the content-identifying shapes, so a real key on the
+    same line still fails closed, and redaction -- which pays nothing for a
+    false positive -- goes on masking all of it.
+    """
+    before = text[: match.start("secret")]
+    # The shape consumes an opening quote before the value, so a quote here
+    # means the value was quoted: data, not an annotation.
+    if before.endswith(('"', "'")):
+        return False
+    if not before.rstrip().endswith(":"):
+        return False
+    return bool(_IDENTIFIER_VALUE.match(match.group("secret")))
 
 
 def _path_findings(
