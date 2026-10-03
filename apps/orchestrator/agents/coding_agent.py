@@ -158,6 +158,7 @@ async def run_coding_attempt(
     workspace: TaskWorkspace,
     *,
     provider: ModelProvider,
+    planner_provider: ModelProvider | None = None,
     settings: Settings | None = None,
     review_feedback: str | None = None,
     context: ContextBuildResult | None = None,
@@ -172,6 +173,8 @@ async def run_coding_attempt(
             managed repository is never touched.
         provider: the coder. Selected by the caller, because which model serves
             a role is routing policy (section 31) and not the agent's choice.
+        planner_provider: the model that creates a plan. Defaults to the coder
+            for installations without a separately configured planner.
         review_feedback: findings from the previous cycle, for a fix attempt
             (section 23). Passed through to the prompt untouched.
         context: a pre-built context package, for a retry that should use the
@@ -194,6 +197,7 @@ async def run_coding_attempt(
         ContextBudgetTooSmall: the configured budget cannot hold the task.
     """
     config = settings or get_settings()
+    planner = planner_provider or provider
     run, task, project = load_run_context(session, workspace.task_run_id)
     policy = ScopePolicy.for_task(task, project)
     sink = _ArtifactSink(
@@ -252,12 +256,12 @@ async def run_coding_attempt(
     if requires_plan(task) if plan_required is None else plan_required:
         _transition(session, task, TaskStatus.PLANNING)
         plan, assessment, plan_usage = await _request_plan(
-            session, run, task, project, built, provider, policy, sink,
+            session, run, task, project, built, planner, policy, sink,
             review_cycle=review_cycle, checkpoint_call=checkpoint_call,
         )
         if not assessment.approved or assessment.needs_human:
             return _refused_plan_attempt(
-                session, run, task, project, built, provider, plan, assessment,
+                session, run, task, project, built, planner, plan, assessment,
                 plan_usage, sink,
             )
 

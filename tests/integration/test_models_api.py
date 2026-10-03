@@ -109,6 +109,27 @@ def test_a_credential_is_never_stored_only_its_variable_name(
     assert stored.metadata == {"api_key_env": "MY_REVIEWER_TOKEN"}
 
 
+def test_registering_a_raw_credential_is_rejected(
+    client: TestClient, session: Session
+) -> None:
+    response = client.post(
+        "/models",
+        json={
+            "model_name": "gpt-5-mini",
+            "role": "reviewer",
+            "endpoint": "https://api.openai.com/v1",
+            "metadata": {"api_key": "sk-secret-value"},
+        },
+    )
+
+    assert response.status_code == 409
+    assert "api_key_env" in response.text
+    assert "sk-secret-value" not in response.text
+    assert provider_service.resolve_for_role(
+        session, ModelRole.CODER
+    ).model_name == "qwen-coder-30b"
+
+
 def test_an_unknown_provider_id_is_reported_as_unavailable(client: TestClient) -> None:
     """Probing a provider that does not exist must not look like a pass."""
     response = client.post("/models/connection-test?provider_id=env:nonexistent")
@@ -175,3 +196,96 @@ def test_resolving_a_role_with_nothing_configured_raises(session: Session) -> No
 
     with pytest.raises(ProviderNotConfigured, match="role 'reviewer'"):
         provider_service.resolve_for_role(session, ModelRole.REVIEWER, settings=empty)
+
+
+def test_a_cloud_reviewer_can_coexist_with_the_environment_coder(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from apps.orchestrator.config.settings import Settings
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-value")
+    settings = Settings(
+        _env_file=None,
+        default_local_model_base_url="http://model-host:8080/v1",
+        default_local_model="qwen-coder-30b",
+        review_base_url="",
+        review_model="",
+    )
+    provider_service.register_model(
+        session,
+        provider="openai_compatible",
+        model_name="openai-reviewer",
+        external_model_id="gpt-5-mini",
+        role=ModelRole.REVIEWER,
+        endpoint="https://api.openai.com/v1",
+        metadata={"api_key_env": "OPENAI_API_KEY"},
+    )
+
+    coder = provider_service.resolve_for_role(session, ModelRole.CODER, settings=settings)
+    reviewer = provider_service.resolve_for_role(session, ModelRole.REVIEWER, settings=settings)
+
+    assert coder.model_name == "qwen-coder-30b"
+    assert coder.api_key is None
+    assert reviewer.model_name == "gpt-5-mini"
+    assert reviewer.api_key == "sk-secret-value"
+
+
+def test_a_cloud_coder_can_coexist_with_the_environment_reviewer(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from apps.orchestrator.config.settings import Settings
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-value")
+    settings = Settings(
+        _env_file=None,
+        default_local_model_base_url="http://model-host:8080/v1",
+        default_local_model="qwen-coder-30b",
+        review_base_url="http://reviewer-host:9000/v1",
+        review_model="local-reviewer",
+    )
+    provider_service.register_model(
+        session,
+        provider="openai_compatible",
+        model_name="openai-coder",
+        external_model_id="gpt-5-mini",
+        role=ModelRole.CODER,
+        endpoint="https://api.openai.com/v1",
+        metadata={"api_key_env": "OPENAI_API_KEY"},
+    )
+
+    coder = provider_service.resolve_for_role(session, ModelRole.CODER, settings=settings)
+    reviewer = provider_service.resolve_for_role(session, ModelRole.REVIEWER, settings=settings)
+
+    assert coder.model_name == "gpt-5-mini"
+    assert coder.api_key == "sk-secret-value"
+    assert reviewer.model_name == "local-reviewer"
+    assert reviewer.api_key is None
+
+
+def test_a_selected_cloud_provider_with_a_missing_key_does_not_fall_back(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from apps.orchestrator.config.settings import Settings
+    from apps.orchestrator.providers import build_provider
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    settings = Settings(
+        _env_file=None,
+        default_local_model_base_url="http://model-host:8080/v1",
+        default_local_model="qwen-coder-30b",
+    )
+    provider_service.register_model(
+        session,
+        provider="openai_compatible",
+        model_name="openai-coder",
+        external_model_id="gpt-5-mini",
+        role=ModelRole.CODER,
+        endpoint="https://api.openai.com/v1",
+        metadata={"api_key_env": "OPENAI_API_KEY"},
+    )
+
+    selected = provider_service.resolve_for_role(session, ModelRole.CODER, settings=settings)
+
+    assert selected.model_name == "gpt-5-mini"
+    with pytest.raises(ProviderNotConfigured, match="OPENAI_API_KEY"):
+        build_provider(selected)

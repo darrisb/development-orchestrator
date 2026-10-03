@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 from apps.orchestrator.domain.enums import FailureReason, ModelRole
+from apps.orchestrator.domain.models import Model
 from apps.orchestrator.providers import (
     InvalidModelResponse,
     ModelRequest,
@@ -26,6 +27,7 @@ from apps.orchestrator.providers import (
     PromptTooLarge,
     ProviderConfig,
     StructuredSchema,
+    config_from_model,
 )
 
 pytestmark = pytest.mark.integration
@@ -148,6 +150,24 @@ async def test_sampling_settings_are_passed_through(request_: ModelRequest) -> N
 
 
 @pytest.mark.asyncio
+async def test_the_output_limit_parameter_is_configurable_for_openai_reasoning_models(
+    request_: ModelRequest,
+) -> None:
+    captured: dict = {}
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(http_request.content))
+        return httpx.Response(200, json=completion("ok"))
+
+    await make_provider(handler, max_output_tokens_parameter="max_completion_tokens").generate(
+        dataclasses.replace(request_, max_output_tokens=2048)
+    )
+
+    assert captured["max_completion_tokens"] == 2048
+    assert "max_tokens" not in captured
+
+
+@pytest.mark.asyncio
 async def test_endpoint_specific_options_are_merged_into_the_body(
     request_: ModelRequest,
 ) -> None:
@@ -190,6 +210,59 @@ async def test_an_api_key_becomes_a_bearer_header_and_is_not_logged() -> None:
 
     assert seen["authorization"] == "Bearer sk-secret-value"
     assert "sk-secret-value" not in str(config.describe())
+
+
+@pytest.mark.asyncio
+async def test_a_local_provider_continues_without_authentication(
+    request_: ModelRequest,
+) -> None:
+    seen: dict[str, str | None] = {}
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = http_request.headers.get("authorization")
+        return httpx.Response(200, json=completion("ok"))
+
+    await make_provider(handler).generate(request_)
+
+    assert seen["authorization"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_registered_openai_model_uses_the_named_environment_key(
+    request_: ModelRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-value")
+    seen: dict[str, str] = {}
+    config = config_from_model(
+        Model(
+            provider="openai_compatible",
+            model_name="openai-reviewer",
+            external_model_id="gpt-5-mini",
+            role=ModelRole.REVIEWER,
+            endpoint="https://api.openai.com/v1",
+            metadata={"api_key_env": "OPENAI_API_KEY"},
+        )
+    )
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = http_request.headers.get("authorization", "")
+        seen["path"] = http_request.url.path
+        return httpx.Response(200, json=completion("ok", model="gpt-5-mini"))
+
+    provider = OpenAICompatibleProvider(config)
+    provider._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url=config.base_url,
+        headers=provider._headers(),
+    )
+
+    response = await provider.generate(request_)
+
+    assert seen == {
+        "authorization": "Bearer sk-secret-value",
+        "path": "/v1/chat/completions",
+    }
+    assert response.model_name == "gpt-5-mini"
 
 
 # --- Structured output -------------------------------------------------------

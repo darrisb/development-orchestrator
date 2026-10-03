@@ -30,6 +30,18 @@ from ..providers import (
 from ..repositories import ModelRepository
 from .errors import EntityConflict, EntityNotFound
 
+_FORBIDDEN_METADATA_CREDENTIAL_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "apiKey",
+        "authorization",
+        "bearer_token",
+        "access_token",
+        "token",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ConfiguredProvider:
@@ -103,6 +115,7 @@ def register_model(
     Raises:
         EntityConflict: this provider/model/role is already registered.
     """
+    safe_metadata = _validated_metadata(metadata or {})
     repository = ModelRepository(session)
     existing = [
         candidate
@@ -123,9 +136,21 @@ def register_model(
         timeout_seconds=timeout_seconds,
         context_window=context_window,
         enabled=enabled,
-        metadata=metadata or {},
+        metadata=safe_metadata,
     )
     return repository.add(model)
+
+
+def _validated_metadata(metadata: dict[str, object]) -> dict[str, object]:
+    forbidden = sorted(
+        key for key in metadata if key in _FORBIDDEN_METADATA_CREDENTIAL_KEYS
+    )
+    if forbidden:
+        raise EntityConflict(
+            "Model metadata must not contain raw credentials; use api_key_env "
+            f"instead of: {', '.join(forbidden)}"
+        )
+    return dict(metadata)
 
 
 def get_model(session: Session, model_id: UUID) -> Model:

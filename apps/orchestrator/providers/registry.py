@@ -53,6 +53,11 @@ def build_provider(
     """
     if not config.enabled:
         raise ProviderNotConfigured(f"Provider '{config.provider_id}' is disabled")
+    if config.api_key_env and not config.api_key:
+        raise ProviderNotConfigured(
+            f"Provider '{config.provider_id}' requires API key environment variable "
+            f"'{config.api_key_env}', but it is not set"
+        )
     return OpenAICompatibleProvider(config, client=client)
 
 
@@ -87,18 +92,34 @@ def config_from_model(model: Model) -> ProviderConfig:
         model_name=model.external_model_id or model.model_name,
         role=model.role,
         api_key=_api_key_from_metadata(metadata),
+        api_key_env=_api_key_env_from_metadata(metadata),
         timeout_seconds=float(model.timeout_seconds),
         context_window=model.context_window,
         enabled=model.enabled,
+        max_output_tokens_parameter=_max_output_tokens_parameter_from_metadata(metadata),
         extra_body=extra_body if isinstance(extra_body, Mapping) else {},
     )
 
 
 def _api_key_from_metadata(metadata: Mapping[str, object]) -> str | None:
-    variable = metadata.get("api_key_env")
-    if isinstance(variable, str) and variable:
+    variable = _api_key_env_from_metadata(metadata)
+    if variable:
         return os.environ.get(variable) or None
     return None
+
+
+def _api_key_env_from_metadata(metadata: Mapping[str, object]) -> str | None:
+    variable = metadata.get("api_key_env")
+    if isinstance(variable, str) and variable:
+        return variable
+    return None
+
+
+def _max_output_tokens_parameter_from_metadata(metadata: Mapping[str, object]) -> str:
+    parameter = metadata.get("max_output_tokens_parameter")
+    if parameter in {"max_tokens", "max_completion_tokens"}:
+        return str(parameter)
+    return "max_tokens"
 
 
 def coder_config_from_settings(settings: Settings | None = None) -> ProviderConfig:

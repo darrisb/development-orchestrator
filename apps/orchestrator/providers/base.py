@@ -176,8 +176,14 @@ class ProviderConfig:
         model_name: the name sent to the endpoint.
         role: what this provider is allowed to be used for.
         api_key: never logged, never serialised, never sent to a reviewer.
+        api_key_env: the environment variable name required to provide
+            ``api_key``. Safe to keep in configuration; the secret value is not.
         context_window: the *served* window, not the model's trained maximum.
         enabled: a disabled provider is never selected and never probed.
+        max_output_tokens_parameter: wire parameter used for
+            ``ModelRequest.max_output_tokens``. Defaults to OpenAI-compatible
+            servers' historical ``max_tokens``; newer OpenAI reasoning models
+            can opt into ``max_completion_tokens`` via model metadata.
     """
 
     provider_id: str
@@ -185,9 +191,11 @@ class ProviderConfig:
     model_name: str
     role: ModelRole
     api_key: str | None = field(default=None, repr=False)
+    api_key_env: str | None = field(default=None, repr=False)
     timeout_seconds: float = 600.0
     context_window: int | None = None
     enabled: bool = True
+    max_output_tokens_parameter: str = "max_tokens"
     #: Endpoint-specific extras merged into the request body (e.g. llama.cpp's
     #: ``cache_prompt``). Kept out of the domain: section 2 forbids making one
     #: server's concepts part of the model.

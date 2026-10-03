@@ -22,6 +22,8 @@ from apps.orchestrator.providers import (
     reviewer_config_from_settings,
     select_for_role,
 )
+from apps.orchestrator.services import model_providers as provider_service
+from apps.orchestrator.services.errors import EntityConflict
 
 
 def config(role: ModelRole, model_name: str, *, enabled: bool = True) -> ProviderConfig:
@@ -181,11 +183,33 @@ def test_an_api_key_is_read_from_the_named_environment_variable(
     built = config_from_model(registered(metadata={"api_key_env": "REVIEWER_TOKEN"}))
 
     assert built.api_key == "sk-from-env"
+    assert built.api_key_env == "REVIEWER_TOKEN"
 
 
-def test_an_unset_key_variable_yields_no_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_an_unset_key_variable_is_remembered_but_not_guessed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("REVIEWER_TOKEN", raising=False)
-    assert config_from_model(registered(metadata={"api_key_env": "REVIEWER_TOKEN"})).api_key is None
+    built = config_from_model(registered(metadata={"api_key_env": "REVIEWER_TOKEN"}))
+
+    assert built.api_key is None
+    assert built.api_key_env == "REVIEWER_TOKEN"
+
+
+def test_a_provider_requiring_a_missing_key_fails_clearly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    config = config_from_model(
+        registered(
+            model_name="gpt-5-mini",
+            endpoint="https://api.openai.com/v1",
+            metadata={"api_key_env": "OPENAI_API_KEY"},
+        )
+    )
+
+    with pytest.raises(ProviderNotConfigured, match="OPENAI_API_KEY"):
+        build_provider(config)
 
 
 def test_a_row_naming_an_unimplemented_provider_raises() -> None:
@@ -202,3 +226,40 @@ def test_endpoint_specific_options_travel_in_extra_body() -> None:
     """llama.cpp's knobs must not become part of the domain (section 2)."""
     built = config_from_model(registered(metadata={"extra_body": {"cache_prompt": True}}))
     assert built.extra_body == {"cache_prompt": True}
+
+
+def test_a_registered_model_can_select_the_openai_token_limit_parameter() -> None:
+    built = config_from_model(
+        registered(metadata={"max_output_tokens_parameter": "max_completion_tokens"})
+    )
+
+    assert built.max_output_tokens_parameter == "max_completion_tokens"
+
+
+def test_a_raw_api_key_is_rejected_before_it_can_be_persisted(session) -> None:
+    with pytest.raises(EntityConflict, match="api_key_env"):
+        provider_service.register_model(
+            session,
+            provider="openai_compatible",
+            model_name="gpt-5-mini",
+            role=ModelRole.REVIEWER,
+            endpoint="https://api.openai.com/v1",
+            metadata={"api_key": "sk-secret-value"},
+        )
+
+
+def test_api_key_does_not_appear_in_descriptions_or_repr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-value")
+    built = config_from_model(
+        registered(
+            model_name="gpt-5-mini",
+            endpoint="https://api.openai.com/v1",
+            metadata={"api_key_env": "OPENAI_API_KEY"},
+        )
+    )
+
+    assert "sk-secret-value" not in repr(built)
+    assert "sk-secret-value" not in str(built.describe())
+    assert built.describe()["authenticated"] is True

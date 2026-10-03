@@ -123,7 +123,7 @@ class OpenAICompatibleProvider:
         if request.top_p is not None:
             payload["top_p"] = request.top_p
         if request.max_output_tokens is not None:
-            payload["max_tokens"] = request.max_output_tokens
+            payload[self.config.max_output_tokens_parameter] = request.max_output_tokens
         if request.seed is not None:
             payload["seed"] = request.seed
         if request.stop:

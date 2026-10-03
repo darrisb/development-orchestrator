@@ -85,8 +85,8 @@ from ..domain.review import (
     HumanApprovalPolicy,
     ReviewRouting,
     issue_fingerprint,
-    reraised_unresolved_blocking_issues,
     render_review_feedback,
+    reraised_unresolved_blocking_issues,
     unreraised_issues,
 )
 from ..domain.state_machine import can_transition
@@ -349,6 +349,7 @@ async def run_fix_loop(
     workspace: TaskWorkspace,
     *,
     coder: ModelProvider,
+    planner: ModelProvider | None = None,
     reviewer: ReviewProvider,
     settings: Settings | None = None,
     policy: HumanApprovalPolicy | None = None,
@@ -370,6 +371,8 @@ async def run_fix_loop(
         workspace: the run's isolated worktree. Every write lands here.
         coder: the model that writes the code. Selected by the caller, because
             which model serves a role is routing policy (section 31).
+        planner: the model that writes initial plans. Defaults to the coder for
+            installations without a separately configured planner.
         reviewer: the model that judges it.
         policy: the human-approval policy (section 37), passed to every review
             so that all cycles of one run are judged against the same gate.
@@ -560,6 +563,7 @@ async def run_fix_loop(
             number=len(iterations) + 1,
             cycle=cycle,
             coder=coder,
+            planner=planner,
             reviewer=reviewer,
             feedback=feedback,
             config=config,
@@ -687,6 +691,7 @@ async def _turn(
     number: int,
     cycle: int,
     coder: ModelProvider,
+    planner: ModelProvider | None,
     reviewer: ReviewProvider,
     feedback: str | None,
     config: Settings,
@@ -710,6 +715,7 @@ async def _turn(
             session,
             workspace,
             provider=coder,
+            planner_provider=planner,
             settings=config,
             review_feedback=feedback,
             # A correction attempt does not re-plan: see ``run_coding_attempt``.

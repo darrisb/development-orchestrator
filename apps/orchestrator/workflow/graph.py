@@ -33,7 +33,12 @@ from ..domain.escalation import EscalationIntent
 from ..domain.models import RunEvent
 from ..domain.state_machine import can_transition
 from ..domain.workflow import WorkflowOutcome, WorkflowPhase
-from ..providers import ModelProvider, build_provider, build_review_provider
+from ..providers import (
+    ModelProvider,
+    ProviderNotConfigured,
+    build_provider,
+    build_review_provider,
+)
 from ..providers.review import ReviewProvider
 from ..repositories import (
     EscalationRepository,
@@ -115,12 +120,15 @@ class WorkflowRunner:
         session_factory: sessionmaker[Session],
         *,
         coder: ModelProvider,
+        planner: ModelProvider | None = None,
         reviewer: ReviewProvider,
         settings: Settings | None = None,
         checkpointer: SqlAlchemyCheckpointSaver | None = None,
-    ) -> None:
+        ) -> None:
         self.session_factory = session_factory
         self.coder = coder
+        self.planner = planner or coder
+        self._planner_is_coder = planner is None
         self.reviewer = reviewer
         self.settings = settings or get_settings()
         self.checkpointer = checkpointer or SqlAlchemyCheckpointSaver(session_factory)
@@ -139,12 +147,21 @@ class WorkflowRunner:
             coder_config = resolve_for_role(
                 session, ModelRole.CODER, settings=config
             )
+            try:
+                planner_config = resolve_for_role(
+                    session, ModelRole.PLANNER, settings=config
+                )
+            except ProviderNotConfigured:
+                planner_config = coder_config
             reviewer_config = resolve_for_role(
                 session, ModelRole.REVIEWER, settings=config
             )
         return cls(
             session_factory,
             coder=build_provider(coder_config),
+            planner=None
+            if planner_config is coder_config
+            else build_provider(planner_config),
             reviewer=build_review_provider(reviewer_config, settings=config),
             settings=config,
         )
@@ -152,6 +169,8 @@ class WorkflowRunner:
     async def aclose(self) -> None:
         """Release provider transports owned by this runner."""
         await self.coder.aclose()
+        if not self._planner_is_coder:
+            await self.planner.aclose()
         await self.reviewer.aclose()
 
     async def run_next(self, project_id: UUID) -> tuple[Selection, WorkflowState | None]:
@@ -494,6 +513,7 @@ class WorkflowRunner:
                 session,
                 workspace,
                 coder=self.coder,
+                planner=self.planner,
                 reviewer=self.reviewer,
                 settings=self.settings,
                 initial_feedback=self._human_feedback(session, task.id, run.started_at),
