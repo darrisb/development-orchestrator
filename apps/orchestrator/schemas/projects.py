@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from ..domain.enums import ProjectStatus, WorkerProfile
 from ..domain.models import Project
 from ..domain.verification import VerificationProfile
+from ..services.baseline_correction import BaselineCorrection
 from ..services.task_importer import ImportReport
 
 
@@ -136,4 +137,71 @@ class ImportTasksResponse(BaseModel):
             ready=list(report.ready),
             blocked=list(report.blocked),
             warnings=list(report.warnings),
+        )
+
+
+class BaselineCorrectionRequest(BaseModel):
+    """An operator's request to carry a specification fix into the baseline."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    commit_sha: str = Field(
+        min_length=1,
+        description=(
+            "The operator's correction commit. Any revision Git resolves; the "
+            "full SHA is what is recorded."
+        ),
+    )
+    reason: str = Field(
+        min_length=1,
+        description="Why this correction is being applied. Recorded in the provenance.",
+    )
+    requested_by: str = Field(
+        min_length=1,
+        description="Operator identity. Recorded in the provenance.",
+    )
+
+
+class BaselineCorrectionResponse(BaseModel):
+    """Exactly what the correction moved, so the operation is auditable.
+
+    ``applied`` and ``already_applied`` are separate fields rather than one
+    tri-state: a replay has to be distinguishable from a fresh application
+    without the caller parsing prose, and ``applied=false,
+    already_applied=true`` is the truthful reading of "it was already there".
+    """
+
+    project_id: UUID
+    applied: bool
+    already_applied: bool
+    previous_sha: str
+    baseline_sha: str
+    correction_sha: str
+    merged_sha: str | None
+    changed_paths: list[str]
+    reason: str
+    requested_by: str
+    event_id: UUID | None
+    #: What re-synchronising the corrected manifest changed. Absent on a replay.
+    tasks: ImportTasksResponse | None
+
+    @classmethod
+    def from_correction(cls, correction: BaselineCorrection) -> BaselineCorrectionResponse:
+        return cls(
+            project_id=correction.project_id,
+            applied=correction.applied,
+            already_applied=correction.already_applied,
+            previous_sha=correction.previous_sha,
+            baseline_sha=correction.baseline_sha,
+            correction_sha=correction.correction_sha,
+            merged_sha=correction.merged_sha,
+            changed_paths=list(correction.changed_paths),
+            reason=correction.reason,
+            requested_by=correction.requested_by,
+            event_id=correction.event_id,
+            tasks=(
+                ImportTasksResponse.from_report(correction.import_report)
+                if correction.import_report is not None
+                else None
+            ),
         )

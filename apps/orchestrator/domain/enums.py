@@ -379,6 +379,16 @@ class RunEventType(StrEnum):
     #: the reason it stopped is worth one append-only line next to the attempt
     #: that was interrupted. Exactly one of these is written per settlement.
     RUN_CANCELLED = "RUN_CANCELLED"
+    #: An operator's project-specification correction was merged into the
+    #: cumulative accepted baseline.
+    #:
+    #: About a *project*, which no other event type is: it carries a project id
+    #: and a null ``task_run_id`` *and* a null ``task_id``, because the
+    #: correction belongs to no task and no execution. That is the point --
+    #: attaching it to a task would record a specification fix as if some task
+    #: had produced it, which is exactly the false completion provenance this
+    #: operation exists to avoid.
+    BASELINE_CORRECTION_APPLIED = "BASELINE_CORRECTION_APPLIED"
 
 
 class WorkerProfile(StrEnum):

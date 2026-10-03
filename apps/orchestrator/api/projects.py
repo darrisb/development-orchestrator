@@ -9,6 +9,8 @@ from sqlalchemy.orm import Session
 from ..db.session import get_db, get_session_factory
 from ..domain.enums import TaskStatus
 from ..schemas.projects import (
+    BaselineCorrectionRequest,
+    BaselineCorrectionResponse,
     ImportTasksRequest,
     ImportTasksResponse,
     ProjectCreateRequest,
@@ -19,6 +21,7 @@ from ..schemas.tasks import NextTaskResponse, TaskResponse
 from ..services import model_usage as usage_service
 from ..services import projects as project_service
 from ..services import tasks as task_service
+from ..services.baseline_correction import apply_baseline_correction
 from ..services.campaign import CampaignRunner
 from ..services.manifest_loader import load_manifest, manifest_path_for
 from ..services.scheduler import select_next_task
@@ -80,6 +83,36 @@ def import_tasks(
     manifest = load_manifest(Path(requested))
     report = import_manifest(session, manifest, project_id=project.id)
     return ImportTasksResponse.from_report(report)
+
+
+@router.post(
+    "/{project_id}/baseline-corrections",
+    response_model=BaselineCorrectionResponse,
+    status_code=status.HTTP_200_OK,
+)
+def create_baseline_correction(
+    project_id: UUID,
+    payload: BaselineCorrectionRequest,
+    session: Session = Depends(get_db),
+) -> BaselineCorrectionResponse:
+    """Carry an operator's specification correction into the accepted baseline.
+
+    Not an integration: no task is completed, no run is created and no
+    task-completion provenance is written. See
+    ``services.baseline_correction``.
+
+    200 rather than 201 for both outcomes, including the replay: the resource
+    being reported on is the project's baseline, which already existed, and a
+    replay creates nothing at all.
+    """
+    correction = apply_baseline_correction(
+        session,
+        project_id,
+        commit_sha=payload.commit_sha,
+        reason=payload.reason,
+        requested_by=payload.requested_by,
+    )
+    return BaselineCorrectionResponse.from_correction(correction)
 
 
 @router.get("/{project_id}/tasks", response_model=list[TaskResponse])
