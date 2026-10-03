@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import NotRequired, TypedDict
 from uuid import UUID
@@ -22,20 +23,20 @@ from ..config.settings import Settings, get_settings
 from ..db.session import rollback_preserving_original
 from ..domain.enums import (
     IN_FLIGHT_RUN_STATUSES,
+    Complexity,
     EscalationStatus,
-    ModelRole,
     RunEventType,
     RunStatus,
     TaskStatus,
 )
 from ..domain.errors import AbandonedRunError, RunOwnershipLostError
 from ..domain.escalation import EscalationIntent
-from ..domain.models import RunEvent
+from ..domain.model_policy import ModelPolicy
+from ..domain.models import Project, RunEvent, Task
 from ..domain.state_machine import can_transition
 from ..domain.workflow import WorkflowOutcome, WorkflowPhase
 from ..providers import (
     ModelProvider,
-    ProviderNotConfigured,
     build_provider,
     build_review_provider,
 )
@@ -49,7 +50,7 @@ from ..repositories import (
 )
 from ..services.delivery import deliver_candidate
 from ..services.errors import EntityConflict, EntityNotFound
-from ..services.model_providers import resolve_for_role
+from ..services.model_providers import resolve_roles
 from ..services.runs import create_run
 from ..services.runtime import begin_active_runtime, end_active_runtime
 from ..services.scheduler import Selection, select_next_task
@@ -112,6 +113,32 @@ class WorkflowState(TypedDict):
     execution_generation: NotRequired[int]
 
 
+@dataclass(frozen=True, slots=True)
+class _TaskProviders:
+    """The providers one task's roles run on, and who owns their transports.
+
+    ``owned`` is the whole point: a routed task gets instances built for it
+    and closes them when it is done, while an unrouted one borrows the
+    runner's and must not close anything -- the runner's providers outlive
+    every task and are released by ``WorkflowRunner.aclose``.
+    """
+
+    coder: ModelProvider
+    planner: ModelProvider
+    reviewer: ReviewProvider
+    owned: bool
+
+    async def aclose(self) -> None:
+        if not self.owned:
+            return
+        await self.coder.aclose()
+        # A planner that fell back to the coder *is* the coder: closing it
+        # again would close the same transport twice.
+        if self.planner is not self.coder:
+            await self.planner.aclose()
+        await self.reviewer.aclose()
+
+
 class WorkflowRunner:
     """Compile and invoke the one-task-at-a-time V1 graph."""
 
@@ -124,12 +151,20 @@ class WorkflowRunner:
         reviewer: ReviewProvider,
         settings: Settings | None = None,
         checkpointer: SqlAlchemyCheckpointSaver | None = None,
+        route_by_project_policy: bool = False,
         ) -> None:
         self.session_factory = session_factory
         self.coder = coder
         self.planner = planner or coder
         self._planner_is_coder = planner is None
         self.reviewer = reviewer
+        #: Whether a task's roles are re-resolved from its project's model
+        #: policy (section 31). True for a runner built by ``configured``,
+        #: which resolved the providers above itself and can resolve others
+        #: the same way. False when they were handed in: a caller that chose
+        #: the providers explicitly gets the providers it chose, and the
+        #: runner has no configuration from which to build a substitute.
+        self._routes_by_project_policy = route_by_project_policy
         self.settings = settings or get_settings()
         self.checkpointer = checkpointer or SqlAlchemyCheckpointSaver(session_factory)
         self.graph = self._build_graph()
@@ -141,29 +176,27 @@ class WorkflowRunner:
         *,
         settings: Settings | None = None,
     ) -> WorkflowRunner:
-        """Build the runner from the configured coder and reviewer roles."""
+        """Build the runner from the configured coder and reviewer roles.
+
+        These are the installation's providers, resolved with no project
+        policy: the runner serves many projects and is built before it knows
+        which task it will run. A project that declared a policy has its
+        task's roles re-resolved in ``_execute``.
+        """
         config = settings or get_settings()
         with session_factory() as session:
-            coder_config = resolve_for_role(
-                session, ModelRole.CODER, settings=config
-            )
-            try:
-                planner_config = resolve_for_role(
-                    session, ModelRole.PLANNER, settings=config
-                )
-            except ProviderNotConfigured:
-                planner_config = coder_config
-            reviewer_config = resolve_for_role(
-                session, ModelRole.REVIEWER, settings=config
+            selection = resolve_roles(
+                session, ModelPolicy(), Complexity.MEDIUM, settings=config
             )
         return cls(
             session_factory,
-            coder=build_provider(coder_config),
+            coder=build_provider(selection.coder),
             planner=None
-            if planner_config is coder_config
-            else build_provider(planner_config),
-            reviewer=build_review_provider(reviewer_config, settings=config),
+            if selection.planner is None
+            else build_provider(selection.planner),
+            reviewer=build_review_provider(selection.reviewer, settings=config),
             settings=config,
+            route_by_project_policy=True,
         )
 
     async def aclose(self) -> None:
@@ -172,6 +205,45 @@ class WorkflowRunner:
         if not self._planner_is_coder:
             await self.planner.aclose()
         await self.reviewer.aclose()
+
+    async def _task_providers(
+        self, session: Session, task: Task, project: Project
+    ) -> _TaskProviders:
+        """The providers this task's roles run on (section 31).
+
+        The runner's own providers unless this runner resolves its own *and*
+        the project declared a policy. A project with no policy therefore
+        behaves exactly as it did before policies existed, down to using the
+        same provider instances and opening no additional transport.
+
+        Raises:
+            ProviderNotConfigured: the policy named a model that is not
+                registered and enabled for the role it was named for. Nothing
+                is built before resolution finishes, so a failure here leaks
+                nothing.
+        """
+        policy = project.model_policy
+        if not self._routes_by_project_policy or policy.is_empty:
+            return _TaskProviders(self.coder, self.planner, self.reviewer, owned=False)
+        selection = resolve_roles(session, policy, task.complexity, settings=self.settings)
+        built: list[ModelProvider] = []
+        try:
+            coder = build_provider(selection.coder)
+            built.append(coder)
+            # No planner registered means planning runs on *this task's*
+            # coder, not on whichever coder the runner was built with.
+            planner = coder
+            if selection.planner is not None:
+                planner = build_provider(selection.planner)
+                built.append(planner)
+            reviewer = build_review_provider(selection.reviewer, settings=self.settings)
+        except BaseException:
+            # A later role failing to build must not strand the transports the
+            # earlier ones already opened.
+            for provider in built:
+                await provider.aclose()
+            raise
+        return _TaskProviders(coder, planner, reviewer, owned=True)
 
     async def run_next(self, project_id: UUID) -> tuple[Selection, WorkflowState | None]:
         """Select, create and execute the project's next eligible task."""
@@ -483,7 +555,7 @@ class WorkflowRunner:
     async def _execute(self, state: WorkflowState) -> dict[str, object]:
         session = self.session_factory()
         try:
-            run, task, _ = load_run_context(session, UUID(state["run_id"]))
+            run, task, project = load_run_context(session, UUID(state["run_id"]))
             # Concern 64: fencing check. If the run was abandoned by an operator,
             # do not proceed with execution.
             if run.status is RunStatus.ABANDONED:
@@ -509,32 +581,47 @@ class WorkflowRunner:
             # This boundary must survive a provider failure, transaction
             # rollback, or process death.  All loop work happens after it.
             session.commit()
-            result = await run_fix_loop(
-                session,
-                workspace,
-                coder=self.coder,
-                planner=self.planner,
-                reviewer=self.reviewer,
-                settings=self.settings,
-                initial_feedback=self._human_feedback(session, task.id, run.started_at),
-                deadline=budget.runtime_deadline,
-                worker_deadline=budget.worker_deadline,
-                runtime_budget=budget,
-                # Concern 64: the turn's commit is behind the run row's lock, so
-                # an operator's transaction that committed while this call was in
-                # flight stops the turn instead of being overwritten by it. The
-                # fences in the graph above are reads and cannot do this; see
-                # agents.fix_loop.durable_checkpoint.
-                checkpoint_turn=durable_checkpoint(
+            # Section 31: which models this task runs on is the project's
+            # declaration, read per task because complexity is a task fact.
+            # A policy naming a model nobody registered raises here, before
+            # any turn: the run fails the way any provider failure does and
+            # is never quietly served by a different model.
+            providers = await self._task_providers(session, task, project)
+            try:
+                result = await run_fix_loop(
                     session,
-                    run.id,
-                    session.commit,
-                    # Concern 67: the token this dispatch acquired. Every turn
-                    # boundary quotes it back to the database, so an executor recovered out
-                    # from under itself cannot commit what it was doing.
-                    expected_generation=state.get("execution_generation"),
-                ),
-            )
+                    workspace,
+                    coder=providers.coder,
+                    planner=providers.planner,
+                    reviewer=providers.reviewer,
+                    settings=self.settings,
+                    initial_feedback=self._human_feedback(
+                        session, task.id, run.started_at
+                    ),
+                    deadline=budget.runtime_deadline,
+                    worker_deadline=budget.worker_deadline,
+                    runtime_budget=budget,
+                    # Concern 64: the turn's commit is behind the run row's lock,
+                    # so an operator's transaction that committed while this call
+                    # was in flight stops the turn instead of being overwritten by
+                    # it. The fences in the graph above are reads and cannot do
+                    # this; see agents.fix_loop.durable_checkpoint.
+                    checkpoint_turn=durable_checkpoint(
+                        session,
+                        run.id,
+                        session.commit,
+                        # Concern 67: the token this dispatch acquired. Every turn
+                        # boundary quotes it back to the database, so an executor
+                        # recovered out from under itself cannot commit what it
+                        # was doing.
+                        expected_generation=state.get("execution_generation"),
+                    ),
+                )
+            finally:
+                # Exactly once, however the loop ended: a task that owns its
+                # providers must not leave an httpx client behind, and one that
+                # borrowed the runner's must not close them.
+                await providers.aclose()
             end_active_runtime(
                 session,
                 run.id,

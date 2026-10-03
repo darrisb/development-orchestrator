@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from ..config.logging import get_logger
 from ..domain.enums import ProjectStatus, WorkerProfile
+from ..domain.model_policy import ModelPolicy
 from ..domain.models import PauseRequest, Project
 from ..domain.verification import VerificationProfile
 from ..repositories import PauseRequestRepository, ProjectRepository
@@ -34,6 +35,7 @@ def create_project(
     dependency_bootstrap_commands: list[str] | None = None,
     approval_gated_categories: list[str] | None = None,
     verification: VerificationProfile | None = None,
+    model_policy: ModelPolicy | None = None,
     milestone_interval: int | None = None,
 ) -> Project:
     """Register a repository as a managed project.
@@ -59,6 +61,7 @@ def create_project(
             dependency_bootstrap_commands=list(dependency_bootstrap_commands or []),
             approval_gated_categories=approval_gated_categories,
             verification=verification or VerificationProfile(),
+            model_policy=model_policy or ModelPolicy(),
             milestone_interval=milestone_interval,
         )
     )

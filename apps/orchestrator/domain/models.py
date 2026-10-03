@@ -32,6 +32,7 @@ from .enums import (
     WorkerProfile,
 )
 from .escalation import EscalationIntent, EscalationOption
+from .model_policy import ModelPolicy
 from .verification import VerificationProfile
 
 
@@ -70,6 +71,10 @@ class Project:
     #: Project-controlled and declared in the manifest: the orchestrator runs
     #: exactly these, and a model never adds one.
     verification: VerificationProfile = field(default_factory=VerificationProfile)
+    #: Which registered model each role runs on (section 31). Declared in the
+    #: manifest and persisted here; an empty policy means no preference, and
+    #: the role's first enabled provider is used as it always was.
+    model_policy: ModelPolicy = field(default_factory=ModelPolicy)
     milestone_interval: int | None = None
     id: UUID = field(default_factory=_new_id)
     created_at: datetime | None = None

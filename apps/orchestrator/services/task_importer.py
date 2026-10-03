@@ -232,13 +232,20 @@ def _resolve_project(
             else None
         ),
         verification=manifest.verification,
+        model_policy=manifest.model_policy,
         milestone_interval=manifest.milestone_interval,
     )
     return created, True
 
 
+#: Columns whose stored form is a mapping the manifest declared, compared in
+#: that form rather than through the domain object the repository builds from
+#: it. Each needs its own entry in ``_current_project_fields``.
+_DESCRIBED_PROJECT_COLUMNS = frozenset({"verification_profile", "model_policy"})
+
+
 def _project_changes(project: Project, manifest: ProjectManifest) -> dict[str, object]:
-    # Keyed by column, because the verification profile is stored as the
+    # Keyed by column, because the described settings are stored as the
     # mapping the manifest declared and compared in that form.
     desired: dict[str, object] = {
         "name": manifest.name,
@@ -256,11 +263,17 @@ def _project_changes(project: Project, manifest: ProjectManifest) -> dict[str, o
             else None
         ),
         "verification_profile": manifest.verification.describe(),
+        "model_policy": manifest.model_policy.describe(),
         "milestone_interval": manifest.milestone_interval,
     }
     current: dict[str, object] = {
-        **{key: getattr(project, key) for key in desired if key != "verification_profile"},
+        **{
+            key: getattr(project, key)
+            for key in desired
+            if key not in _DESCRIBED_PROJECT_COLUMNS
+        },
         "verification_profile": project.verification.describe(),
+        "model_policy": project.model_policy.describe(),
     }
     return {key: value for key, value in desired.items() if current[key] != value}
 

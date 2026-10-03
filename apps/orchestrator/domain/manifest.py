@@ -20,6 +20,7 @@ from typing import Any
 from .dependencies import validate_graph
 from .enums import Complexity, RiskLevel, TaskStatus, WorkerProfile
 from .errors import ManifestError
+from .model_policy import ModelPolicy
 from .models import TaskLimits
 from .relevance import normalise_path
 from .verification import VerificationProfile
@@ -84,15 +85,6 @@ _LIMIT_KEYS = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
-class ManifestModelPolicy:
-    """Declared model preferences, resolved to real models in a later phase."""
-
-    default_coder: str | None = None
-    high_complexity_coder: str | None = None
-    reviewer: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class ManifestTask:
     external_id: str
     title: str
@@ -119,7 +111,9 @@ class ProjectManifest:
     default_branch: str = "main"
     worker_profile: WorkerProfile = WorkerProfile.NODE
     max_parallel_tasks: int = 1
-    model_policy: ManifestModelPolicy = field(default_factory=ManifestModelPolicy)
+    #: Which registered model each role should use (section 31). Persisted
+    #: on the project at import and honoured per task by the workflow.
+    model_policy: ModelPolicy = field(default_factory=ModelPolicy)
     #: The project's verification commands, per category (section 18). The
     #: orchestrator runs exactly these; a model never supplies one.
     verification: VerificationProfile = field(default_factory=VerificationProfile)
@@ -237,10 +231,10 @@ def _parse_verification_profile(verification: Mapping[str, Any]) -> Verification
     )
 
 
-def _parse_model_policy(value: Any) -> ManifestModelPolicy:
+def _parse_model_policy(value: Any) -> ModelPolicy:
     policy = _optional_mapping(value, "model_policy")
     _reject_unknown_keys(policy, _MODEL_POLICY_KEYS, "model_policy")
-    return ManifestModelPolicy(
+    return ModelPolicy(
         default_coder=_optional_str(policy.get("default_coder"), "model_policy.default_coder"),
         high_complexity_coder=_optional_str(
             policy.get("high_complexity_coder"), "model_policy.high_complexity_coder"

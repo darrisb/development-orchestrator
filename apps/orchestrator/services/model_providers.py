@@ -16,7 +16,8 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from ..config.settings import Settings, get_settings
-from ..domain.enums import ModelRole
+from ..domain.enums import Complexity, ModelRole
+from ..domain.model_policy import ModelPolicy
 from ..domain.models import Model
 from ..providers import (
     ConnectionReport,
@@ -91,6 +92,64 @@ def resolve_for_role(
     """
     configs = [provider.config for provider in list_providers(session, settings)]
     return select_for_role(role, configs, preferred_model=preferred_model)
+
+
+@dataclass(frozen=True, slots=True)
+class RoleSelection:
+    """The providers one task's three roles resolve to.
+
+    ``planner`` is ``None`` when no PLANNER is registered, which is the normal
+    case: the planning turns then run on ``coder``. Keeping it ``None`` rather
+    than copying ``coder`` in is what lets the caller tell a planner it owns a
+    transport for from one that shares the coder's (see
+    ``WorkflowRunner.aclose``).
+    """
+
+    coder: ProviderConfig
+    planner: ProviderConfig | None
+    reviewer: ProviderConfig
+
+
+def resolve_roles(
+    session: Session,
+    policy: ModelPolicy,
+    complexity: Complexity,
+    *,
+    settings: Settings | None = None,
+) -> RoleSelection:
+    """Resolve every role a task needs under the project's ``policy``.
+
+    The one place role resolution happens, so a task's coder and the planner
+    that falls back to it cannot be chosen by different rules.
+
+    Raises:
+        ProviderNotConfigured: a role has no enabled provider, or the policy
+            named a model that is not registered for the role it was named
+            for. Explicit configuration fails closed: a declared model is
+            never substituted for another one (principle 10).
+    """
+    coder = resolve_for_role(
+        session,
+        ModelRole.CODER,
+        preferred_model=policy.coder_for(complexity),
+        settings=settings,
+    )
+    try:
+        # No manifest field selects a planner, so there is no preference to
+        # pass: a separately registered PLANNER is used, and otherwise the
+        # caller runs planning on the coder resolved above.
+        planner: ProviderConfig | None = resolve_for_role(
+            session, ModelRole.PLANNER, settings=settings
+        )
+    except ProviderNotConfigured:
+        planner = None
+    reviewer = resolve_for_role(
+        session,
+        ModelRole.REVIEWER,
+        preferred_model=policy.reviewer,
+        settings=settings,
+    )
+    return RoleSelection(coder=coder, planner=planner, reviewer=reviewer)
 
 
 def register_model(

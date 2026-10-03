@@ -6,6 +6,7 @@ from sqlalchemy import select
 
 from ..db.models import ProjectRow
 from ..domain.enums import ProjectStatus
+from ..domain.model_policy import ModelPolicy
 from ..domain.models import Project
 from ..domain.verification import VerificationProfile
 from .base import Repository
@@ -36,6 +37,7 @@ class ProjectRepository(Repository[ProjectRow, Project]):
                 else None
             ),
             verification=VerificationProfile.from_mapping(row.verification_profile),
+            model_policy=ModelPolicy.from_mapping(row.model_policy),
             milestone_interval=row.milestone_interval,
             created_at=row.created_at,
             updated_at=row.updated_at,
@@ -57,6 +59,7 @@ class ProjectRepository(Repository[ProjectRow, Project]):
             dependency_bootstrap_commands=list(project.dependency_bootstrap_commands),
             approval_gated_categories=project.approval_gated_categories,
             verification_profile=project.verification.describe(),
+            model_policy=project.model_policy.describe(),
             milestone_interval=project.milestone_interval,
         )
         self.session.add(row)

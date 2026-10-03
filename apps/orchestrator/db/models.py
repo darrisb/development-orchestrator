@@ -85,6 +85,14 @@ class ProjectRow(UUIDPrimaryKey, Timestamps, Base):
     #: "tests": [...], "security": [...]}. Stored as declared so a re-import
     #: can tell a changed profile from an unchanged one.
     verification_profile: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    #: The model policy (section 31): the subset of {"default_coder",
+    #: "high_complexity_coder", "reviewer"} the project named, each mapped to a
+    #: model name. ``{}`` -- what an existing row and a policy-less manifest
+    #: both produce -- means no preference. ``server_default`` matches the
+    #: migration that added the column, as above.
+    model_policy: Mapped[dict] = mapped_column(
+        JSON, nullable=False, default=dict, server_default=text("'{}'")
+    )
     milestone_interval: Mapped[int | None] = mapped_column(Integer)
 
     tasks: Mapped[list[TaskRow]] = relationship(
