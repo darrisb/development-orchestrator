@@ -5,6 +5,12 @@ llama.cpp's server, Ollama and the remote reviewers all implement. Nothing
 specific to any one of them is in the domain: server-specific knobs travel in
 ``ProviderConfig.extra_body`` (section 2).
 
+Some OpenAI models are not served on ``/chat/completions`` at all and require
+``POST /responses`` instead. That is a transport difference, not a domain one,
+so it is selected by ``ProviderConfig.api_mode`` and absorbed here: the same
+``ModelRequest`` goes in and the same ``ModelResponse`` comes out, and no
+agent, planner, reviewer or fix loop learns that two APIs exist.
+
 The provider does not retry. A retry is a workflow decision with a ceiling
 attached (sections 23 and 25); a provider that quietly retried would spend
 that ceiling without the orchestrator knowing, and would turn one timeout
@@ -21,7 +27,9 @@ import httpx
 
 from ..config.logging import get_logger
 from .base import (
+    ApiMode,
     ConnectionReport,
+    MessageRole,
     ModelRequest,
     ModelResponse,
     ProviderConfig,
@@ -80,24 +88,33 @@ class OpenAICompatibleProvider:
                 satisfy the requested schema.
         """
         request.assert_fits(self.config.context_window)
-        payload = self._build_payload(request)
+        responses_api = self.config.api_mode is ApiMode.RESPONSES
+        path = "/responses" if responses_api else "/chat/completions"
+        payload = (
+            self._build_responses_payload(request)
+            if responses_api
+            else self._build_payload(request)
+        )
         timeout = request.timeout_seconds or self.config.timeout_seconds
 
         logger.info(
             "model_request_started",
             provider_id=self.config.provider_id,
             model_name=self.config.model_name,
+            api_mode=self.config.api_mode.value,
             estimated_prompt_tokens=request.estimated_prompt_tokens(),
             structured=request.schema is not None,
             timeout_seconds=timeout,
         )
         started = time.monotonic()
-        body = await self._post_json(
-            "/chat/completions", payload, timeout=timeout, operation="generate"
-        )
+        body = await self._post_json(path, payload, timeout=timeout, operation="generate")
         duration_ms = int((time.monotonic() - started) * 1000)
 
-        response = self._to_response(body, request, duration_ms)
+        response = (
+            self._to_response_from_responses_api(body, request, duration_ms)
+            if responses_api
+            else self._to_response(body, request, duration_ms)
+        )
         logger.info(
             "model_request_completed",
             provider_id=self.config.provider_id,
@@ -142,6 +159,114 @@ class OpenAICompatibleProvider:
             }
         payload.update(self.config.extra_body)
         return payload
+
+    def _build_responses_payload(self, request: ModelRequest) -> dict[str, Any]:
+        """Translate a ``ModelRequest`` into a Responses API request body.
+
+        The mapping is deliberately narrow:
+
+        *   system instructions become ``instructions``;
+        *   history, then the assembled task/context/review-feedback message,
+            become the ``input`` turns, in the same order
+            ``ModelRequest.messages()`` puts them;
+        *   ``max_output_tokens`` is the API's own parameter name, so
+            ``max_output_tokens_parameter`` does not apply here;
+        *   a schema becomes ``text.format``.
+
+        ``temperature``, ``top_p``, ``seed`` and ``stop`` are not sent.
+        ``seed`` and ``stop`` have no equivalent in this API, and the
+        reasoning models that require it reject the two sampling parameters
+        outright -- sending them would make every call a 400. An endpoint that
+        does accept them can be given them through ``extra_body``, which is
+        where endpoint-specific knobs already live (section 2).
+        """
+        messages = request.messages()
+        payload: dict[str, Any] = {
+            "model": self.config.model_name,
+            "instructions": messages[0].content,
+            "input": [
+                {
+                    "role": message.role.value,
+                    "content": [
+                        {
+                            "type": "output_text"
+                            if message.role is MessageRole.ASSISTANT
+                            else "input_text",
+                            "text": message.content,
+                        }
+                    ],
+                }
+                for message in messages[1:]
+            ],
+            "stream": False,
+        }
+        if request.max_output_tokens is not None:
+            payload["max_output_tokens"] = request.max_output_tokens
+        if request.schema is not None:
+            payload["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": request.schema.name,
+                    "schema": dict(request.schema.schema),
+                    "strict": request.schema.strict,
+                }
+            }
+        payload.update(self.config.extra_body)
+        return payload
+
+    def _to_response_from_responses_api(
+        self, body: Mapping[str, Any], request: ModelRequest, duration_ms: int
+    ) -> ModelResponse:
+        """Normalise a Responses API reply into the one ``ModelResponse``.
+
+        Fails closed: a refused, failed or empty reply is an
+        ``InvalidModelResponse`` rather than an empty answer handed on to a
+        patch applier.
+        """
+        status = body.get("status")
+        if status in {"failed", "cancelled"}:
+            raise InvalidModelResponse(
+                f"{self.config.provider_id} returned status '{status}': "
+                f"{_responses_error_detail(body)}"
+            )
+
+        raw_text, refusal = _responses_output_text(body)
+        if refusal is not None and not raw_text.strip():
+            raise InvalidModelResponse(
+                f"{self.config.provider_id} refused the request: {refusal[:200]}"
+            )
+
+        finish_reason = _responses_finish_reason(body)
+        text = strip_reasoning(raw_text)
+        if not text:
+            detail = (
+                "Model returned only a reasoning block with no answer"
+                if raw_text.strip()
+                else "Model returned empty content"
+            )
+            raise InvalidModelResponse(detail)
+
+        data = None
+        if request.schema is not None:
+            if finish_reason == "length":
+                raise InvalidModelResponse(
+                    f"Model response for schema '{request.schema.name}' was truncated "
+                    "at the output-token limit"
+                )
+            data = parse_structured(
+                text, request.schema.schema, schema_name=request.schema.name
+            )
+
+        return ModelResponse(
+            text=text,
+            raw_text=raw_text,
+            model_name=str(body.get("model") or self.config.model_name),
+            provider_id=self.config.provider_id,
+            data=data,
+            finish_reason=finish_reason,
+            usage=_responses_usage_from(body.get("usage")),
+            duration_ms=duration_ms,
+        )
 
     def _to_response(
         self, body: Mapping[str, Any], request: ModelRequest, duration_ms: int
@@ -314,6 +439,73 @@ def _usage_from(usage: object) -> TokenUsage:
         input_tokens=_int_or_none(usage.get("prompt_tokens")),
         output_tokens=_int_or_none(usage.get("completion_tokens")),
     )
+
+
+def _responses_usage_from(usage: object) -> TokenUsage:
+    """Responses API usage, which names its fields differently from chat."""
+    if not isinstance(usage, Mapping):
+        return TokenUsage()
+    return TokenUsage(
+        input_tokens=_int_or_none(usage.get("input_tokens")),
+        output_tokens=_int_or_none(usage.get("output_tokens")),
+    )
+
+
+def _responses_output_text(body: Mapping[str, Any]) -> tuple[str, str | None]:
+    """The assistant text and any refusal from a Responses API reply.
+
+    ``output`` is a list of items -- reasoning, tool calls, messages -- and
+    only the message items carry an answer. ``output_text`` is accepted when
+    the endpoint provides it, because some do and it costs nothing to use.
+    """
+    direct = body.get("output_text")
+    if isinstance(direct, str) and direct:
+        return direct, None
+
+    items = body.get("output")
+    if not isinstance(items, list):
+        return "", None
+    parts: list[str] = []
+    refusal: str | None = None
+    for item in items:
+        if not isinstance(item, Mapping) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, Mapping):
+                continue
+            if part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+            elif part.get("type") == "refusal" and isinstance(part.get("refusal"), str):
+                refusal = part["refusal"]
+    return "".join(parts), refusal
+
+
+def _responses_finish_reason(body: Mapping[str, Any]) -> str | None:
+    """Map Responses API completion state onto the chat ``finish_reason``.
+
+    ``"length"`` keeps its meaning across both APIs, which is what
+    ``ModelResponse.truncated`` and the structured-output guard rely on.
+    """
+    status = body.get("status")
+    if status == "incomplete":
+        details = body.get("incomplete_details")
+        reason = details.get("reason") if isinstance(details, Mapping) else None
+        if reason == "max_output_tokens":
+            return "length"
+        return str(reason) if isinstance(reason, str) else "incomplete"
+    if status == "completed":
+        return "stop"
+    return str(status) if isinstance(status, str) else None
+
+
+def _responses_error_detail(body: Mapping[str, Any], limit: int = 200) -> str:
+    error = body.get("error")
+    if isinstance(error, Mapping) and isinstance(error.get("message"), str):
+        return str(error["message"])[:limit]
+    return "no error detail"
 
 
 def _int_or_none(value: object) -> int | None:

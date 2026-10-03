@@ -28,6 +28,19 @@ from .errors import PromptTooLarge
 DEFAULT_OUTPUT_RESERVE = 0.25
 
 
+class ApiMode(StrEnum):
+    """Which generation API a provider's endpoint speaks.
+
+    The two OpenAI generation APIs are not variations of one request shape,
+    so the choice is configuration rather than inference: nothing here reads
+    a model name. ``CHAT_COMPLETIONS`` is the default because it is what every
+    local server (llama.cpp, Ollama, vLLM) implements.
+    """
+
+    CHAT_COMPLETIONS = "chat_completions"
+    RESPONSES = "responses"
+
+
 class MessageRole(StrEnum):
     SYSTEM = "system"
     USER = "user"
@@ -180,6 +193,10 @@ class ProviderConfig:
             ``api_key``. Safe to keep in configuration; the secret value is not.
         context_window: the *served* window, not the model's trained maximum.
         enabled: a disabled provider is never selected and never probed.
+        api_mode: which generation API the endpoint speaks. Defaults to
+            ``chat_completions``; ``responses`` is required by OpenAI models
+            that are not served on ``/chat/completions``. The provider hides
+            the difference, so no caller above the boundary reads this.
         max_output_tokens_parameter: wire parameter used for
             ``ModelRequest.max_output_tokens``. Defaults to OpenAI-compatible
             servers' historical ``max_tokens``; newer OpenAI reasoning models
@@ -195,6 +212,7 @@ class ProviderConfig:
     timeout_seconds: float = 600.0
     context_window: int | None = None
     enabled: bool = True
+    api_mode: ApiMode = ApiMode.CHAT_COMPLETIONS
     max_output_tokens_parameter: str = "max_tokens"
     #: Endpoint-specific extras merged into the request body (e.g. llama.cpp's
     #: ``cache_prompt``). Kept out of the domain: section 2 forbids making one
@@ -210,6 +228,7 @@ class ProviderConfig:
             "role": self.role.value,
             "context_window": self.context_window,
             "enabled": self.enabled,
+            "api_mode": self.api_mode.value,
             "authenticated": bool(self.api_key),
         }
 

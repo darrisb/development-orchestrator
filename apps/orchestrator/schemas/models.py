@@ -26,7 +26,9 @@ class ModelRegisterRequest(BaseModel):
     timeout_seconds: int = Field(default=600, ge=1)
     context_window: int | None = Field(default=None, ge=1)
     enabled: bool = True
-    #: May carry ``api_key_env`` (a variable *name*) and ``extra_body``.
+    #: May carry ``api_key_env`` (a variable *name*), ``extra_body``,
+    #: ``max_output_tokens_parameter`` and ``api_mode``
+    #: (``"chat_completions"``, the default, or ``"responses"``).
     #: A credential value is never accepted here.
     metadata: dict[str, object] = Field(default_factory=dict)
 

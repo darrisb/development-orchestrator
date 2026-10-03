@@ -168,8 +168,10 @@ def register_model(
     """Register an endpoint the orchestrator may call.
 
     ``metadata`` may carry ``api_key_env`` (the *name* of an environment
-    variable) and ``extra_body``. A credential itself is never accepted here,
-    so it cannot reach the database or a run artifact (section 36).
+    variable), ``extra_body`` and ``api_mode`` (``"chat_completions"``, the
+    default, or ``"responses"`` for OpenAI models not served on
+    ``/chat/completions``). A credential itself is never accepted here, so it
+    cannot reach the database or a run artifact (section 36).
 
     Raises:
         EntityConflict: this provider/model/role is already registered.

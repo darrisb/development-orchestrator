@@ -18,7 +18,10 @@ import pytest
 from apps.orchestrator.domain.enums import FailureReason, ModelRole
 from apps.orchestrator.domain.models import Model
 from apps.orchestrator.providers import (
+    ApiMode,
     InvalidModelResponse,
+    Message,
+    MessageRole,
     ModelRequest,
     ModelRequestRejected,
     ModelTimeout,
@@ -533,6 +536,417 @@ async def test_the_context_window_guard_runs_before_the_request_is_sent(
         return httpx.Response(200, json=completion("ok"))
 
     provider = make_provider(handler, context_window=4096)
+
+    with pytest.raises(PromptTooLarge):
+        await provider.generate(dataclasses.replace(request_, context="x" * 100_000))
+
+    assert calls == 0
+
+
+# --- The Responses API transport ---------------------------------------------
+#
+# A second generation API behind the same provider boundary. Every test here
+# asserts that the difference stops at the boundary: the request is still a
+# `ModelRequest` and the result is still a `ModelResponse`.
+
+
+def responses_body(
+    text: str,
+    *,
+    status: str = "completed",
+    usage: dict | None = None,
+    model: str = "gpt-5.3-codex",
+    incomplete_details: dict | None = None,
+) -> dict:
+    body: dict = {
+        "id": "resp_1",
+        "object": "response",
+        "model": model,
+        "status": status,
+        "output": [
+            {"id": "rs_1", "type": "reasoning", "summary": []},
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "status": status,
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            },
+        ],
+    }
+    if usage is not None:
+        body["usage"] = usage
+    if incomplete_details is not None:
+        body["incomplete_details"] = incomplete_details
+    return body
+
+
+def make_responses_provider(
+    handler: Callable[[httpx.Request], httpx.Response], **config_overrides
+) -> OpenAICompatibleProvider:
+    return make_provider(handler, api_mode=ApiMode.RESPONSES, **config_overrides)
+
+
+@pytest.mark.asyncio
+async def test_the_default_api_mode_still_posts_to_chat_completions(
+    request_: ModelRequest,
+) -> None:
+    """Local llama.cpp/Qwen providers must be untouched by the new option."""
+    seen: dict[str, object] = {}
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        seen["path"] = http_request.url.path
+        seen["body"] = json.loads(http_request.content)
+        return httpx.Response(200, json=completion("ok"))
+
+    provider = make_provider(handler)
+
+    assert provider.config.api_mode is ApiMode.CHAT_COMPLETIONS
+    await provider.generate(request_)
+
+    assert seen["path"] == "/v1/chat/completions"
+    assert "messages" in seen["body"]  # type: ignore[operator]
+
+
+@pytest.mark.asyncio
+async def test_responses_mode_posts_to_the_responses_endpoint(
+    request_: ModelRequest,
+) -> None:
+    seen: dict[str, object] = {}
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        seen["path"] = http_request.url.path
+        seen["body"] = json.loads(http_request.content)
+        return httpx.Response(200, json=responses_body("ok"))
+
+    await make_responses_provider(handler).generate(request_)
+
+    assert seen["path"] == "/v1/responses"
+    assert "messages" not in seen["body"]  # type: ignore[operator]
+
+
+@pytest.mark.asyncio
+async def test_the_responses_request_carries_the_whole_model_request(
+    request_: ModelRequest,
+) -> None:
+    """System, history, task, context and review feedback all survive the
+    translation, in the order `ModelRequest.messages()` fixes."""
+    captured: dict = {}
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(http_request.content))
+        return httpx.Response(200, json=responses_body("ok"))
+
+    await make_responses_provider(handler).generate(
+        dataclasses.replace(
+            request_,
+            context="def health(): ...",
+            review_feedback="Missing a test.",
+            history=(Message(MessageRole.ASSISTANT, "Earlier attempt."),),
+            max_output_tokens=4096,
+        )
+    )
+
+    assert captured["model"] == "qwen"
+    assert captured["instructions"] == "You are a coding agent."
+    assert captured["max_output_tokens"] == 4096
+    assert [turn["role"] for turn in captured["input"]] == ["assistant", "user"]
+    assert captured["input"][0]["content"][0]["type"] == "output_text"
+    user_text = captured["input"][1]["content"][0]["text"]
+    assert captured["input"][1]["content"][0]["type"] == "input_text"
+    assert "TS-001: add a health endpoint." in user_text
+    assert "def health(): ..." in user_text
+    assert "Missing a test." in user_text
+
+
+@pytest.mark.asyncio
+async def test_responses_mode_omits_parameters_that_api_rejects(
+    request_: ModelRequest,
+) -> None:
+    """`seed` and `stop` do not exist in this API, and the reasoning models
+    that need it reject the sampling knobs. Sending them would 400 every
+    call; an endpoint that accepts them can get them via `extra_body`."""
+    captured: dict = {}
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(http_request.content))
+        return httpx.Response(200, json=responses_body("ok"))
+
+    await make_responses_provider(handler, extra_body={"reasoning": {"effort": "high"}}).generate(
+        dataclasses.replace(request_, temperature=0.9, top_p=0.5, seed=7, stop=("</patch>",))
+    )
+
+    assert "temperature" not in captured
+    assert "top_p" not in captured
+    assert "seed" not in captured
+    assert "stop" not in captured
+    assert "max_tokens" not in captured
+    assert captured["reasoning"] == {"effort": "high"}
+
+
+@pytest.mark.asyncio
+async def test_a_responses_reply_becomes_an_ordinary_model_response(
+    request_: ModelRequest,
+) -> None:
+    provider = make_responses_provider(
+        responds(
+            responses_body(
+                "diff --git a/app.py b/app.py",
+                usage={"input_tokens": 1200, "output_tokens": 300},
+            )
+        )
+    )
+
+    response = await provider.generate(request_)
+
+    assert response.text == "diff --git a/app.py b/app.py"
+    assert response.raw_text == "diff --git a/app.py b/app.py"
+    assert response.model_name == "gpt-5.3-codex"
+    assert response.provider_id == "test-coder"
+    assert response.finish_reason == "stop"
+    assert response.truncated is False
+    assert response.duration_ms >= 0
+
+
+@pytest.mark.asyncio
+async def test_responses_token_usage_is_mapped_onto_token_usage(
+    request_: ModelRequest,
+) -> None:
+    """This API names the fields differently from chat completions."""
+    provider = make_responses_provider(
+        responds(responses_body("ok", usage={"input_tokens": 1200, "output_tokens": 300}))
+    )
+
+    response = await provider.generate(request_)
+
+    assert response.usage.input_tokens == 1200
+    assert response.usage.output_tokens == 300
+    assert response.usage.total == 1500
+
+
+@pytest.mark.asyncio
+async def test_missing_responses_usage_is_recorded_as_unknown(
+    request_: ModelRequest,
+) -> None:
+    response = await make_responses_provider(responds(responses_body("ok"))).generate(request_)
+
+    assert response.usage.input_tokens is None
+    assert response.usage.total is None
+
+
+@pytest.mark.asyncio
+async def test_an_output_text_shortcut_is_used_when_the_endpoint_sends_one(
+    request_: ModelRequest,
+) -> None:
+    body = responses_body("ignored")
+    body["output_text"] = "the answer"
+
+    response = await make_responses_provider(responds(body)).generate(request_)
+
+    assert response.text == "the answer"
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_responses_reply_is_flagged_as_length(
+    request_: ModelRequest,
+) -> None:
+    provider = make_responses_provider(
+        responds(
+            responses_body(
+                "diff --git",
+                status="incomplete",
+                incomplete_details={"reason": "max_output_tokens"},
+            )
+        )
+    )
+
+    response = await provider.generate(request_)
+
+    assert response.finish_reason == "length"
+    assert response.truncated is True
+
+
+# --- Responses API structured output -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_responses_schema_request_asks_for_constrained_decoding(
+    request_: ModelRequest,
+) -> None:
+    captured: dict = {}
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(http_request.content))
+        return httpx.Response(200, json=responses_body('{"filesToModify": ["a.py"]}'))
+
+    response = await make_responses_provider(handler).generate(
+        dataclasses.replace(request_, schema=PLAN_SCHEMA)
+    )
+
+    assert captured["text"]["format"]["type"] == "json_schema"
+    assert captured["text"]["format"]["name"] == "plan"
+    assert captured["text"]["format"]["schema"] == {
+        "type": "object",
+        "required": ["filesToModify"],
+    }
+    assert response.data == {"filesToModify": ["a.py"]}
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_responses_schema_answer_fails_closed(
+    request_: ModelRequest,
+) -> None:
+    provider = make_responses_provider(responds(responses_body("I will edit app.py.")))
+
+    with pytest.raises(InvalidModelResponse) as caught:
+        await provider.generate(dataclasses.replace(request_, schema=PLAN_SCHEMA))
+
+    assert caught.value.reason is FailureReason.INVALID_MODEL_RESPONSE
+
+
+@pytest.mark.asyncio
+async def test_truncated_responses_structured_output_is_refused(
+    request_: ModelRequest,
+) -> None:
+    provider = make_responses_provider(
+        responds(
+            responses_body(
+                '{"filesToModify": ["a.py"]}',
+                status="incomplete",
+                incomplete_details={"reason": "max_output_tokens"},
+            )
+        )
+    )
+
+    with pytest.raises(InvalidModelResponse, match="truncated"):
+        await provider.generate(dataclasses.replace(request_, schema=PLAN_SCHEMA))
+
+
+# --- Responses API failure mapping -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_responses_refusal_is_an_invalid_response(request_: ModelRequest) -> None:
+    body = responses_body("")
+    body["output"][1]["content"] = [{"type": "refusal", "refusal": "I cannot help."}]
+
+    with pytest.raises(InvalidModelResponse, match="refused"):
+        await make_responses_provider(responds(body)).generate(request_)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_responses_status_is_an_invalid_response(
+    request_: ModelRequest,
+) -> None:
+    body = responses_body("", status="failed")
+    body["error"] = {"message": "server had a problem"}
+
+    with pytest.raises(InvalidModelResponse, match="failed"):
+        await make_responses_provider(responds(body)).generate(request_)
+
+
+@pytest.mark.asyncio
+async def test_an_empty_responses_output_is_an_invalid_response(
+    request_: ModelRequest,
+) -> None:
+    with pytest.raises(InvalidModelResponse, match="empty content"):
+        await make_responses_provider(responds(responses_body(""))).generate(request_)
+
+
+@pytest.mark.asyncio
+async def test_responses_mode_maps_transport_failures_the_same_way(
+    request_: ModelRequest,
+) -> None:
+    def timing_out(http_request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=http_request)
+
+    with pytest.raises(ModelTimeout):
+        await make_responses_provider(timing_out).generate(request_)
+
+    with pytest.raises(ModelRequestRejected) as caught:
+        await make_responses_provider(
+            responds({"error": {"message": "unsupported model"}}, 404)
+        ).generate(request_)
+    assert caught.value.status_code == 404
+
+    with pytest.raises(ModelUnavailable):
+        await make_responses_provider(responds({}, 429)).generate(request_)
+
+
+@pytest.mark.asyncio
+async def test_responses_mode_does_not_retry_on_its_own(request_: ModelRequest) -> None:
+    calls = 0
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("refused", request=http_request)
+
+    with pytest.raises(ModelUnavailable):
+        await make_responses_provider(handler).generate(request_)
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_responses_mode_still_authenticates_without_logging_the_key() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = http_request.headers.get("authorization", "")
+        seen["path"] = http_request.url.path
+        return httpx.Response(200, json=responses_body("ok"))
+
+    config = ProviderConfig(
+        provider_id="openai-coder",
+        base_url="https://api.openai.com/v1",
+        model_name="gpt-5.3-codex",
+        role=ModelRole.CODER,
+        api_key="sk-secret-value",
+        api_mode=ApiMode.RESPONSES,
+    )
+    provider = OpenAICompatibleProvider(config)
+    provider._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url=config.base_url,
+        headers=provider._headers(),
+    )
+
+    await provider.generate(
+        ModelRequest(system_instructions="s", task_instructions="Write a patch.")
+    )
+
+    assert seen == {"authorization": "Bearer sk-secret-value", "path": "/v1/responses"}
+    assert "sk-secret-value" not in str(config.describe())
+    assert "sk-secret-value" not in repr(config)
+    assert config.describe()["api_mode"] == "responses"
+
+
+@pytest.mark.asyncio
+async def test_the_connection_probe_is_unchanged_in_responses_mode() -> None:
+    """`GET /models` is the same on both transports; only generation differs."""
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        assert http_request.url.path == "/v1/models"
+        return httpx.Response(200, json={"data": [{"id": "qwen"}]})
+
+    report = await make_responses_provider(handler).check_connection()
+
+    assert report.healthy is True
+
+
+@pytest.mark.asyncio
+async def test_the_context_window_guard_runs_in_responses_mode_too(
+    request_: ModelRequest,
+) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=responses_body("ok"))
+
+    provider = make_responses_provider(handler, context_window=4096)
 
     with pytest.raises(PromptTooLarge):
         await provider.generate(dataclasses.replace(request_, context="x" * 100_000))

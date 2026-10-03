@@ -22,7 +22,7 @@ import httpx
 from ..config.settings import Settings, get_settings
 from ..domain.enums import ModelRole
 from ..domain.models import Model
-from .base import ModelProvider, ProviderConfig
+from .base import ApiMode, ModelProvider, ProviderConfig
 from .errors import ProviderNotConfigured
 from .openai_compatible import OpenAICompatibleProvider
 from .review import ModelReviewProvider, ReviewProvider
@@ -83,6 +83,9 @@ def config_from_model(model: Model) -> ProviderConfig:
 
     An API key is read from the row's metadata only as an environment
     variable *name*; a key itself is never stored in the database (section 36).
+
+    Raises:
+        ProviderNotConfigured: the row declares an unsupported ``api_mode``.
     """
     metadata: Mapping[str, object] = model.metadata or {}
     extra_body = metadata.get("extra_body")
@@ -96,6 +99,7 @@ def config_from_model(model: Model) -> ProviderConfig:
         timeout_seconds=float(model.timeout_seconds),
         context_window=model.context_window,
         enabled=model.enabled,
+        api_mode=_api_mode_from_metadata(metadata, model_name=model.model_name),
         max_output_tokens_parameter=_max_output_tokens_parameter_from_metadata(metadata),
         extra_body=extra_body if isinstance(extra_body, Mapping) else {},
     )
@@ -113,6 +117,36 @@ def _api_key_env_from_metadata(metadata: Mapping[str, object]) -> str | None:
     if isinstance(variable, str) and variable:
         return variable
     return None
+
+
+def _api_mode_from_metadata(
+    metadata: Mapping[str, object], *, model_name: str
+) -> ApiMode:
+    """Read ``api_mode`` from a row's metadata.
+
+    Absent means ``chat_completions``, which is what every provider
+    registered before this option existed is already using. A *present* but
+    unrecognised value is a configuration fault and fails closed: guessing a
+    transport for a row that asked for a different one is exactly the silent
+    substitution principle 10 forbids, and a typo that fell back would route
+    the request to an endpoint the operator did not choose. The mode is never
+    inferred from the model name.
+
+    Raises:
+        ProviderNotConfigured: ``api_mode`` is present and not a supported
+            value.
+    """
+    if "api_mode" not in metadata:
+        return ApiMode.CHAT_COMPLETIONS
+    mode = metadata["api_mode"]
+    try:
+        return ApiMode(mode)
+    except ValueError as exc:
+        supported = ", ".join(member.value for member in ApiMode)
+        raise ProviderNotConfigured(
+            f"Model '{model_name}' declares api_mode {mode!r}, which is not "
+            f"supported. Supported: {supported}"
+        ) from exc
 
 
 def _max_output_tokens_parameter_from_metadata(metadata: Mapping[str, object]) -> str:

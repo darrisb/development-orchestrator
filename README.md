@@ -458,6 +458,14 @@ Four rules are enforced in code (build.md sections 13 and 49):
   stores the *name* of an environment variable, never a key, and no prompt or
   response body is echoed into an error message.
 
+Generation normally goes to `POST /chat/completions`, which every local
+server speaks. Some OpenAI models are not served there at all and need
+`POST /responses` instead; a registered model asks for that transport with
+`{"api_mode": "responses"}` in its metadata. The mode is configuration, never
+inferred from a model name, it defaults to `chat_completions`, and the
+provider absorbs the difference -- the planner, coder, reviewer and fix loop
+see the same request and response shapes either way.
+
 `LOCAL_MODEL_CONTEXT_WINDOW` must track the endpoint's served `n_ctx`, not the
 model's trained maximum. A prompt that would not leave room for an answer is
 refused before the request is sent -- that is a backstop for a context-builder

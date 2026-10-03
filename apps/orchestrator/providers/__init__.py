@@ -6,6 +6,7 @@ provider can be replaced without touching an agent.
 
 from ..domain.tokens import CHARS_PER_TOKEN
 from .base import (
+    ApiMode,
     ConnectionReport,
     Message,
     MessageRole,
@@ -52,6 +53,7 @@ __all__ = [
     "ENV_CODER_PROVIDER_ID",
     "ENV_REVIEWER_PROVIDER_ID",
     "OPENAI_COMPATIBLE",
+    "ApiMode",
     "ConnectionReport",
     "InvalidModelResponse",
     "Message",

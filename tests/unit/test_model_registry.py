@@ -12,6 +12,7 @@ from apps.orchestrator.domain.enums import ModelRole
 from apps.orchestrator.domain.models import Model
 from apps.orchestrator.providers import (
     ENV_CODER_PROVIDER_ID,
+    ApiMode,
     ProviderConfig,
     ProviderNotConfigured,
     build_provider,
@@ -234,6 +235,81 @@ def test_a_registered_model_can_select_the_openai_token_limit_parameter() -> Non
     )
 
     assert built.max_output_tokens_parameter == "max_completion_tokens"
+
+
+def test_a_registered_model_defaults_to_the_chat_completions_api() -> None:
+    """Every provider configured before `api_mode` existed keeps its transport."""
+    assert config_from_model(registered()).api_mode is ApiMode.CHAT_COMPLETIONS
+    assert config_from_model(registered(metadata={})).api_mode is ApiMode.CHAT_COMPLETIONS
+    assert config(ModelRole.CODER, "qwen").api_mode is ApiMode.CHAT_COMPLETIONS
+    assert (
+        coder_config_from_settings(settings()).api_mode is ApiMode.CHAT_COMPLETIONS
+    )
+
+
+def test_a_registered_model_can_ask_for_the_responses_api() -> None:
+    built = config_from_model(
+        registered(
+            model_name="gpt-5.3-codex",
+            endpoint="https://api.openai.com/v1",
+            metadata={"api_key_env": "OPENAI_API_KEY", "api_mode": "responses"},
+        )
+    )
+
+    assert built.api_mode is ApiMode.RESPONSES
+
+
+def test_an_unsupported_api_mode_fails_closed() -> None:
+    """A typo must not pick a transport. Falling back to chat completions
+    would route the request to an endpoint the operator did not choose,
+    which is the silent substitution principle 10 forbids."""
+    for unsupported in ("response", "RESPONSES_V2", "chat", "", 1, True, None):
+        with pytest.raises(ProviderNotConfigured, match="api_mode"):
+            config_from_model(registered(metadata={"api_mode": unsupported}))
+
+
+def test_an_unsupported_api_mode_names_the_supported_values() -> None:
+    with pytest.raises(ProviderNotConfigured) as caught:
+        config_from_model(registered(metadata={"api_mode": "response"}))
+
+    assert "chat_completions" in str(caught.value)
+    assert "responses" in str(caught.value)
+
+
+def test_the_api_mode_is_never_inferred_from_a_model_name() -> None:
+    """Naming a model `gpt-5.3-codex` is not configuration (principle 10)."""
+    built = config_from_model(
+        registered(
+            model_name="gpt-5.3-codex",
+            external_model_id="gpt-5.3-codex",
+            endpoint="https://api.openai.com/v1",
+        )
+    )
+
+    assert built.api_mode is ApiMode.CHAT_COMPLETIONS
+
+
+def test_registering_a_responses_model_keeps_the_key_out_of_the_database(
+    session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-value")
+    model = provider_service.register_model(
+        session,
+        provider="openai_compatible",
+        model_name="gpt-5.3-codex",
+        role=ModelRole.CODER,
+        endpoint="https://api.openai.com/v1",
+        metadata={"api_key_env": "OPENAI_API_KEY", "api_mode": "responses"},
+    )
+
+    built = config_from_model(model)
+
+    assert model.metadata == {"api_key_env": "OPENAI_API_KEY", "api_mode": "responses"}
+    assert "sk-secret-value" not in str(model.metadata)
+    assert built.api_mode is ApiMode.RESPONSES
+    assert built.describe()["api_mode"] == "responses"
+    assert "sk-secret-value" not in str(built.describe())
+    assert "sk-secret-value" not in repr(built)
 
 
 def test_a_raw_api_key_is_rejected_before_it_can_be_persisted(session) -> None:
