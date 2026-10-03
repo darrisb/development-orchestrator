@@ -639,6 +639,36 @@ def _expand(declared: str, reader: RepositoryReader) -> list[str]:
         return [candidate for candidate in reader.paths if matches_pattern(candidate, path)]
     if path in reader.paths:
         return [path]
+    # An *exact* declaration is a statement about one file, and it is the task
+    # author's statement rather than a discovery heuristic's. ``reader.paths``
+    # is the candidate pool for *finding* relevant files, so it is filtered by
+    # ``is_text_path`` and ``is_excluded``; a file that fails those is one the
+    # builder would not have chosen on its own, which is a different question
+    # from whether the task may name it. ``.gitignore`` is the case that
+    # exposed this: tracked, readable, and absent from ``reader.paths`` because
+    # it has no suffix and is not in ``CONFIG_FILENAMES``.
+    #
+    # Without this branch the two halves of the package disagreed.
+    # ``_declared_paths`` called the file missing -- reported as "declared path
+    # not found in the repository" and omitted -- while
+    # ``_required_source_paths`` asked the filesystem, found it, and recorded it
+    # as a writable source that never arrived. The coding agent then refused
+    # the attempt before any model call, which was the correct response to an
+    # incomplete writable source and the wrong answer for a file that was there
+    # all along. One resolution rule, so the two cannot disagree again.
+    #
+    # Deliberately only for an exact path that resolves to a regular file:
+    # ``reader.resolve`` keeps it inside the repository, a declared *directory*
+    # is not a file and falls through to the tracked-prefix scan below, and a
+    # glob never reaches here. So an excluded directory or pattern still
+    # expands only to what discovery found, and nothing recursively bypasses
+    # the exclusions. Readability is still decided downstream by
+    # ``RepositoryReader.text_of`` -- size, binary sniff and boundary -- so an
+    # oversized or binary declared file becomes a recorded exclusion and an
+    # incomplete required source exactly as before.
+    target = reader.resolve(path)
+    if target is not None and target.is_file():
+        return [path]
     # A declared directory means everything tracked beneath it.
     prefix = f"{path}/"
     return [candidate for candidate in reader.paths if candidate.startswith(prefix)]

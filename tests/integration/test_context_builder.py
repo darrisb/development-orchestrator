@@ -30,6 +30,7 @@ from apps.orchestrator.repositories import (
 )
 from apps.orchestrator.services.context_builder import (
     CONTEXT_MANIFEST_ARTIFACT,
+    RepositoryReader,
     budget_from_settings,
     build_context_package,
     build_task_context,
@@ -323,6 +324,161 @@ def test_a_binary_or_oversized_file_never_reaches_a_prompt(
     assert "src/huge.ts" not in package.paths
     assert "binary content" in warnings
     assert "CONTEXT_MAX_FILE_BYTES" in warnings
+
+
+# --- explicitly declared files outside the discovery pool (UI-001) -----------
+#
+# ``RepositoryReader.paths`` is the pool the builder *searches* for relevant
+# files, so it is narrowed by ``is_text_path`` and ``is_excluded``. An exact
+# declaration is not a search: the task author named one file. These pin that
+# distinction, and that nothing else about discovery moved with it.
+
+
+def _declared_paths_in(package) -> list[str]:
+    return [
+        item.path for item in package.items if item.priority is ContextPriority.DECLARED_FILE
+    ]
+
+
+def _required(package, path: str):
+    return next(source for source in package.required_sources if source.path == path)
+
+
+def test_a_tracked_gitignore_declared_for_inspect_and_modify_arrives_complete(
+    session: Session, task: Task, context_repo: Path, git_settings: Settings
+):
+    """UI-001's exact shape: tracked, readable, outside the discovery pool.
+
+    ``.gitignore`` has no suffix and is not in ``CONFIG_FILENAMES``, so
+    ``is_text_path`` drops it from ``reader.paths`` -- which is why this was
+    reported as a missing file and simultaneously as a writable source that
+    never arrived.
+    """
+    (context_repo / ".gitignore").write_text("node_modules/\ndist/\n", encoding="utf-8")
+    run_git(context_repo, "add", "-A")
+    run_git(context_repo, "commit", "--quiet", "-m", "add gitignore")
+    task = TaskRepository(session).update_fields(
+        task.id, files_to_inspect=[".gitignore"], files_to_modify=[".gitignore"]
+    )
+
+    package = _package(task, context_repo, git_settings)
+
+    assert ".gitignore" in _declared_paths_in(package)
+    # Complete, because a file the coder may replace must be shown whole.
+    required = _required(package, ".gitignore")
+    assert required.complete is True and required.reason is None
+    assert "node_modules/" in package.render()
+    # And no longer reported as absent from the repository it is tracked in.
+    warnings = " ".join(package.manifest()["warnings"])
+    assert "declared path not found in the repository: .gitignore" not in warnings
+
+
+def test_an_exact_declared_file_outside_the_discovery_pool_is_still_included(
+    session: Session, task: Task, context_repo: Path, git_settings: Settings
+):
+    """The general rule, not just ``.gitignore``.
+
+    ``node_modules`` is in ``EXCLUDED_DIRECTORIES``, so this file cannot arrive
+    by discovery. Naming it exactly is the author overriding the heuristic for
+    one file -- and the next test proves that override does not generalise to
+    the directory.
+    """
+    task = TaskRepository(session).update_fields(
+        task.id, files_to_inspect=["node_modules/left-pad/index.js"]
+    )
+
+    package = _package(task, context_repo, git_settings)
+
+    assert "node_modules/left-pad/index.js" in _declared_paths_in(package)
+
+
+def test_an_oversized_or_binary_declared_writable_file_stays_incomplete(
+    session: Session, task: Task, context_repo: Path, git_settings: Settings
+):
+    """Reachability is not readability.
+
+    Resolving the path directly says the file is there; whether it can go in a
+    prompt is still ``RepositoryReader.text_of``'s answer. Both of these are
+    writable, so each has to come back as an *incomplete* required source --
+    which is what makes the coding agent refuse before any model call.
+    """
+    (context_repo / "blob").write_bytes(b"\x00\x01binary")
+    (context_repo / "huge").write_text("x = 1\n" * 20_000, encoding="utf-8")
+    run_git(context_repo, "add", "-A")
+    run_git(context_repo, "commit", "--quiet", "-m", "add unreadable files")
+    task = TaskRepository(session).update_fields(task.id, files_to_modify=["blob", "huge"])
+    # Tightened so the *file byte cap* is the guard that rejects ``huge``. At
+    # the default 256 KiB cap the context budget rejects it first -- also a
+    # real refusal, but a different guard from the one under test here.
+    tight = git_settings.model_copy(update={"context_max_file_bytes": 1_000})
+
+    package = _package(task, context_repo, tight)
+
+    # Present as required sources -- so the refusal is informed -- but neither
+    # is complete and neither reached the prompt.
+    assert _required(package, "blob").complete is False
+    assert "binary" in _required(package, "blob").reason
+    assert _required(package, "huge").complete is False
+    assert "CONTEXT_MAX_FILE_BYTES" in _required(package, "huge").reason
+    # Neither reached the prompt. Asserted per path rather than on an empty
+    # list: the fixture task also declares src/widgets/tree.ts, which is
+    # readable and should still arrive.
+    declared = _declared_paths_in(package)
+    assert "blob" not in declared and "huge" not in declared
+    assert "blob" not in package.paths and "huge" not in package.paths
+
+
+def test_a_create_target_that_does_not_exist_is_still_absent_and_not_required(
+    session: Session, task: Task, context_repo: Path, git_settings: Settings
+):
+    """Requirement 9. A file the task will create has nothing to resolve to."""
+    task = TaskRepository(session).update_fields(
+        task.id,
+        files_to_inspect=[],
+        files_to_modify=["src/navigationTree.ts"],
+        files_to_create=["src/navigationTree.ts"],
+    )
+
+    package = _package(task, context_repo, git_settings)
+
+    assert "src/navigationTree.ts" not in package.paths
+    # Nothing to supply, so it is not a required source and cannot be reported
+    # as one that failed to arrive.
+    assert [source.path for source in package.required_sources] == []
+    assert any(
+        "src/navigationTree.ts" in warning for warning in package.manifest()["warnings"]
+    )
+
+
+def test_an_excluded_directory_or_glob_declaration_does_not_bypass_exclusions(
+    session: Session, task: Task, context_repo: Path, git_settings: Settings
+):
+    """Requirement 6. The override is per named file, and does not recurse.
+
+    ``node_modules`` resolves to a directory and ``node_modules/**`` is a glob,
+    so neither reaches the exact-path branch; both still expand only over what
+    discovery found, which is nothing under an excluded directory.
+    """
+    task = TaskRepository(session).update_fields(
+        task.id, files_to_inspect=["node_modules"], files_to_modify=[]
+    )
+    assert _declared_paths_in(_package(task, context_repo, git_settings)) == []
+
+    task = TaskRepository(session).update_fields(task.id, files_to_inspect=["node_modules/**"])
+    assert _declared_paths_in(_package(task, context_repo, git_settings)) == []
+
+
+def test_general_repository_discovery_still_excludes_the_same_paths(
+    session: Session, task: Task, context_repo: Path, git_settings: Settings
+):
+    """Requirement 5. The discovery pool itself is untouched by the fix."""
+    reader = RepositoryReader(
+        context_repo, settings=git_settings, git=GitService(context_repo, settings=git_settings)
+    )
+
+    assert not any(path.startswith("node_modules/") for path in reader.paths)
+    assert ".gitignore" not in reader.paths
+    assert "src/navigation.ts" in reader.paths
 
 
 # --- budget and determinism ---------------------------------------------------
