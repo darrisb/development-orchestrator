@@ -67,6 +67,7 @@ from ..domain.enums import (
     VerificationStatus,
     VerificationType,
 )
+from ..domain.failure_identity import FailureComparison
 from ..domain.models import Project, RunEvent, Task, TaskRun, VerificationRun
 from ..domain.scope import ScopeAssessment, ScopePolicy, evaluate_scope
 from ..domain.security import SecurityAssessment, scan_candidate
@@ -91,6 +92,7 @@ from .dependency_bootstrap import (
     NETWORKLESS_VERIFICATION_NETWORK,
     bootstrap_dependencies,
 )
+from .verification_baseline import classify as classify_against_baseline
 from .worker_service import worker_session
 from .workspace import DiffCapture, TaskWorkspace, capture_diff, load_run_context
 
@@ -226,34 +228,52 @@ def verify_candidate(
                 "pass without being verified (VerificationReport.verified is False)"
             ),
         )
+    executed: list[tuple[VerificationType, CommandExecution]] = []
     steps.extend(
         _run_command_categories(
             session, run, task, project, workspace, profile, recorder,
-            prefix=prefix, settings=config, secrets=secrets,
+            prefix=prefix, settings=config, secrets=secrets, executed=executed,
         )
     )
 
-    if not any(step.failed for step in steps):
-        # --- security and diff policy, over the post-command worktree ------
-        rescan = capture_diff(workspace, max_bytes=MAX_DIFF_SCAN_BYTES)
-        security = scan_candidate(
-            rescan.text,
-            rescan.summary,
-            truncated=rescan.truncated,
-            generated_path_exceptions=tuple(project.generated_path_exceptions),
+    if any(step.failed for step in steps):
+        # Concern 78, stage 2. The commands have run and something failed; the
+        # remaining deterministic question is whether this candidate caused it.
+        # Asked here rather than inside the loop above because it needs the
+        # whole category's executions, passing ones included, and no model and
+        # no further command run is involved in answering it.
+        comparison = classify_against_baseline(
+            session,
+            project_id=project.id,
+            baseline_sha=workspace.starting_commit,
+            worker_profile=project.worker_profile,
+            executions=executed,
         )
-        steps.append(recorder.record(_security_step(security)))
-        review_reasons.extend(
-            finding.detail
-            for finding in security.findings
-            if finding.decision is ScopePolicyDecision.REQUIRE_REVIEW
+        return _finish(
+            session, run, task, project, steps, review_reasons, config, prefix,
+            comparison=comparison,
         )
-        if not steps[-1].failed:
-            final_scope = evaluate_scope(rescan.summary, policy)
-            steps.append(
-                recorder.record(_scope_step(VerificationType.DIFF_POLICY, final_scope, rescan))
-            )
-            review_reasons.extend(_review_reasons(final_scope))
+
+    # --- security and diff policy, over the post-command worktree ------
+    rescan = capture_diff(workspace, max_bytes=MAX_DIFF_SCAN_BYTES)
+    security = scan_candidate(
+        rescan.text,
+        rescan.summary,
+        truncated=rescan.truncated,
+        generated_path_exceptions=tuple(project.generated_path_exceptions),
+    )
+    steps.append(recorder.record(_security_step(security)))
+    review_reasons.extend(
+        finding.detail
+        for finding in security.findings
+        if finding.decision is ScopePolicyDecision.REQUIRE_REVIEW
+    )
+    if not steps[-1].failed:
+        final_scope = evaluate_scope(rescan.summary, policy)
+        steps.append(
+            recorder.record(_scope_step(VerificationType.DIFF_POLICY, final_scope, rescan))
+        )
+        review_reasons.extend(_review_reasons(final_scope))
 
     return _finish(session, run, task, project, steps, review_reasons, config, prefix)
 
@@ -273,6 +293,7 @@ def _run_command_categories(
     prefix: str,
     settings: Settings,
     secrets: Mapping[str, str] | None,
+    executed: list[tuple[VerificationType, CommandExecution]],
 ) -> list[VerificationStep]:
     """Build, lint, tests and security, in order, in one worker.
 
@@ -319,6 +340,11 @@ def _run_command_categories(
                     stop_on_failure=True,
                     deadline_monotonic=worker_deadline,
                 )
+                # Kept beside the steps, not derived from them: baseline
+                # classification needs the command's *source* text and its
+                # untruncated capture flags, and a ``VerificationStep`` carries
+                # neither (it holds the argv rendering and a tail of output).
+                executed.extend((category, execution) for execution in executions)
                 category_steps = [
                     recorder.record(_command_step(category, execution))
                     for execution in executions
@@ -481,6 +507,7 @@ def _finish(
     review_reasons: list[str],
     settings: Settings,
     prefix: str,
+    comparison: FailureComparison | None = None,
 ) -> VerificationReport:
     report = VerificationReport(
         task_run_id=run.id,
@@ -488,6 +515,7 @@ def _finish(
         attempt=run.attempt_number,
         steps=tuple(steps),
         human_review_reasons=tuple(dict.fromkeys(review_reasons)),
+        comparison=comparison,
     )
     stored = artifact_store.write_json(
         session,
@@ -499,12 +527,18 @@ def _finish(
     )
     report = replace(report, artifacts={VERIFICATION_ARTIFACT: stored.relative_path})
 
-    if report.passed:
+    if report.no_new_regressions:
         # The pipeline's own claim, and the only one it makes: every declared
-        # check was executed and returned a pass, so the candidate is worth a
-        # reviewer's time. Whether it is *good* is phase I's question.
+        # check was executed and returned a pass -- or, under concern 78 stage
+        # 2, every failure it returned was already failing in the recorded
+        # baseline for the exact tree this candidate started from. Either way
+        # the candidate broke nothing that was working, which is what earns a
+        # reviewer's time. Whether it is *good* is phase I's question, and the
+        # reviewer still runs: nothing here approves anything.
         _transition(session, task, TaskStatus.REVIEW_PENDING)
         _emit(session, run, task, project, RunEventType.TESTS_PASSED, {
+            "classification": report.classification.value,
+            "comparison": comparison.describe() if comparison else None,
             "verified": report.verified,
             "commands_run": len(report.commands_run),
             "checks_performed": len(report.performed),
@@ -514,6 +548,8 @@ def _finish(
     else:
         _emit(session, run, task, project, RunEventType.BUILD_FAILED, {
             "failure_reason": report.failure_reason.value if report.failure_reason else None,
+            "classification": report.classification.value,
+            "comparison": comparison.describe() if comparison else None,
             "summary": report.summary(),
             "steps": [step.describe() for step in report.failures],
         })
@@ -525,6 +561,8 @@ def _finish(
         attempt=run.attempt_number,
         passed=report.passed,
         verified=report.verified,
+        classification=report.classification.value,
+        no_new_regressions=report.no_new_regressions,
         commands_run=len(report.commands_run),
         failure_reason=report.failure_reason.value if report.failure_reason else None,
         requires_human_review=report.requires_human_review,

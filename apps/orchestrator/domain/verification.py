@@ -35,9 +35,11 @@ from uuid import UUID
 from .enums import (
     FailureReason,
     ScopePolicyDecision,
+    VerificationClassification,
     VerificationStatus,
     VerificationType,
 )
+from .failure_identity import MAX_RENDERED_IDENTITIES, FailureComparison
 
 #: The pipeline, in section 17's order. ``SCOPE`` runs before anything is
 #: executed -- a candidate that already broke its allowance should not get a
@@ -78,6 +80,16 @@ FAILED_STATUSES: frozenset[VerificationStatus] = frozenset(
     {VerificationStatus.FAILED, VerificationStatus.ERROR, VerificationStatus.TIMEOUT}
 )
 
+#: Classifications that mean "this candidate broke nothing that was working".
+#: ``KNOWN_BASELINE_ONLY`` belongs here and ``UNCLASSIFIED_FAILURE`` does not,
+#: which is the entire fail-closed rule expressed as a set.
+NON_REGRESSING_CLASSIFICATIONS: frozenset[VerificationClassification] = frozenset(
+    {
+        VerificationClassification.PASSED,
+        VerificationClassification.KNOWN_BASELINE_ONLY,
+    }
+)
+
 #: Lines of captured output sent back with a failure. Enough to hold a stack
 #: trace or a compiler's first complaints; not the whole suite.
 FEEDBACK_OUTPUT_LINES = 60
@@ -85,6 +97,13 @@ FEEDBACK_OUTPUT_LINES = 60
 #: Steps whose text goes into the feedback. A coder cannot act on the output
 #: of the command that ran *before* the one that broke.
 MAX_FEEDBACK_STEPS = 3
+
+#: Lines of captured output sent back per identified regression. Stage 2's
+#: reason for existing, in one number: once the orchestrator knows *which*
+#: tests the candidate broke, the repair prompt needs the output for those
+#: tests, not the whole suite's log. The log itself is unchanged on disk and
+#: referenced by path.
+MAX_REGRESSION_EXCERPT_LINES = 40
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +261,12 @@ class VerificationReport:
     #: checks: not failures, but not something to merge unseen either.
     human_review_reasons: tuple[str, ...] = ()
     artifacts: Mapping[str, str] = field(default_factory=dict)
+    #: Candidate failures against recorded baseline failures (concern 78,
+    #: stage 2), or ``None`` when no comparison was even attempted -- which is
+    #: the case for every passing report and for a failure in a category that
+    #: has no failure identities. Either way the classification is the same:
+    #: a failure nobody compared is unclassified, never clean.
+    comparison: FailureComparison | None = None
 
     @property
     def performed(self) -> tuple[VerificationStep, ...]:
@@ -299,9 +324,47 @@ class VerificationReport:
         return failures[0].failure_reason if failures else None
 
     @property
+    def classification(self) -> VerificationClassification:
+        """What this outcome means relative to the known baseline.
+
+        Derived, not stored, so it cannot disagree with the steps it is derived
+        from. The order of the branches is the fail-closed rule: a failing
+        report is only ever called ``KNOWN_BASELINE_ONLY`` when a comparison
+        was performed *and* said so, and anything else about a failing report
+        is ``UNCLASSIFIED_FAILURE``.
+        """
+        if self.passed:
+            return VerificationClassification.PASSED
+        comparison = self.comparison
+        if comparison is None or not comparison.available:
+            return VerificationClassification.UNCLASSIFIED_FAILURE
+        return (
+            VerificationClassification.NEW_REGRESSION
+            if comparison.new
+            else VerificationClassification.KNOWN_BASELINE_ONLY
+        )
+
+    @property
+    def no_new_regressions(self) -> bool:
+        """Evidence says this candidate broke nothing that was working.
+
+        Deliberately *not* ``passed`` and deliberately not an approval. It is
+        the one claim the deterministic layer earned: either everything passed,
+        or every failure was already failing in a baseline with valid
+        provenance for the exact tree this candidate started from. Whether the
+        candidate is *good* remains phase I's question, and a reviewer still
+        runs.
+        """
+        return self.classification in NON_REGRESSING_CLASSIFICATIONS
+
+    @property
     def feedback(self) -> str | None:
         """What to send back to the coder (section 17), or ``None`` on a pass."""
-        return render_feedback(self.failures) if self.failures else None
+        if not self.failures:
+            return None
+        if self.comparison is not None and self.comparison.available:
+            return render_classified_feedback(self.failures, self.comparison)
+        return render_feedback(self.failures)
 
     def step_for(self, category: VerificationType) -> VerificationStep | None:
         """The first step of ``category``, or ``None`` if it never ran.
@@ -328,10 +391,21 @@ class VerificationReport:
                 f"{len(self.performed)} check(s) in total)"
             )
         first = self.failures[0]
-        return (
+        line = (
             f"{first.verification_type.value.casefold()} {first.status.value.casefold()}: "
             f"{first.detail or first.command}"
         )
+        comparison = self.comparison
+        if comparison is not None and comparison.available:
+            # A failing report that broke nothing must not read like a failing
+            # report that did. Both halves are stated: the command really did
+            # fail, and the evidence says this candidate did not cause it.
+            line += (
+                f" -- {len(comparison.new)} new failure(s), "
+                f"{len(comparison.known)} already in the baseline"
+                + (f" ({comparison.baseline_sha})" if comparison.baseline_sha else "")
+            )
+        return line
 
     def describe(self) -> dict[str, object]:
         return {
@@ -343,6 +417,11 @@ class VerificationReport:
             "unverified_categories": [
                 category.value for category in self.unverified_categories
             ],
+            "classification": self.classification.value,
+            "no_new_regressions": self.no_new_regressions,
+            "comparison": (
+                self.comparison.describe() if self.comparison is not None else None
+            ),
             "failure_reason": self.failure_reason.value if self.failure_reason else None,
             "requires_human_review": self.requires_human_review,
             "human_review_reasons": list(self.human_review_reasons),
@@ -382,6 +461,106 @@ def status_for_decision(decision: ScopePolicyDecision) -> VerificationStatus:
         VerificationStatus.FAILED
         if decision is ScopePolicyDecision.BLOCK
         else VerificationStatus.PASSED
+    )
+
+
+def render_classified_feedback(
+    failures: Sequence[VerificationStep], comparison: FailureComparison
+) -> str:
+    """The repair instruction, once the orchestrator knows which tests broke.
+
+    This is what stage 2 buys. ``render_feedback`` sends the tail of whatever
+    the command printed, because without failure identities there is nothing
+    better to send; sixty lines of a full-suite log is mostly other people's
+    failures, and a coder given it will go and investigate them -- the exact
+    behaviour stage 1 removed from the prompt and stage 2 has to stop
+    *re-creating through the feedback*.
+
+    So when a comparison is available the feedback names the new failures and
+    carries only the output that mentions them. The whole log stays where it
+    already was, on disk, and is referenced by path rather than pasted.
+
+    The baseline-only case gets a message too, rather than ``None``. Any caller
+    that reads ``feedback`` without reading ``no_new_regressions`` would
+    otherwise send a coder an empty instruction, and the honest text here --
+    these failures predate your change, do not investigate them -- holds stage
+    1's boundary even on that path.
+    """
+    if not comparison.new:
+        lines = [
+            "Authoritative verification failed, and every observed failure is "
+            "already present in the established baseline for the tree this "
+            "change started from"
+            + (f" ({comparison.baseline_sha})." if comparison.baseline_sha else "."),
+            "",
+            "No new regression was attributed to this change. These failures "
+            "are pre-existing; do not investigate or try to fix them.",
+        ]
+        if comparison.known:
+            lines += ["", "Pre-existing failures:", _identity_list(comparison.known)]
+        return "\n".join(lines)
+
+    new_failures = sorted(comparison.new)
+    blocks: list[str] = [
+        f"Authoritative verification found {len(new_failures)} new "
+        f"regression(s) relative to the established baseline"
+        + (f" ({comparison.baseline_sha})." if comparison.baseline_sha else "."),
+        "New failure(s):\n" + _identity_list(comparison.new),
+    ]
+    for step in failures[:MAX_FEEDBACK_STEPS]:
+        excerpt = _excerpt_for(step.output, new_failures)
+        if not excerpt:
+            continue
+        reference = (
+            f" (full log: {step.log_artifact})" if step.log_artifact else ""
+        )
+        blocks.append(
+            f"Relevant failure output from `{step.command}`{reference}:\n{excerpt}"
+        )
+    if comparison.resolved:
+        blocks.append(
+            "For information only -- this change also resolved "
+            f"{len(comparison.resolved)} pre-existing failure(s). Leave them "
+            "fixed."
+        )
+    blocks.append(
+        "Repair the supplied regression(s). You may run the directly affected "
+        "tests to confirm the fix; the full verification suite will be run by "
+        "the orchestrator after you return the corrected candidate."
+    )
+    return "\n\n".join(blocks)
+
+
+def _identity_list(identities: frozenset[str]) -> str:
+    ordered = sorted(identities)
+    shown = ordered[:MAX_RENDERED_IDENTITIES]
+    lines = [f"- {identity}" for identity in shown]
+    if len(ordered) > len(shown):
+        lines.append(f"- [... {len(ordered) - len(shown)} more ...]")
+    return "\n".join(lines)
+
+
+def _excerpt_for(output: str, identities: Sequence[str]) -> str:
+    """The lines of ``output`` that mention one of ``identities``, bounded.
+
+    A substring match rather than a parse: the identity came *out* of this text
+    in the first place, and the lines around a failure that name it -- the
+    short-summary line, the traceback header -- are the ones worth sending.
+    """
+    if not output or not identities:
+        return ""
+    kept = [
+        line
+        for line in output.splitlines()
+        if any(identity in line for identity in identities)
+    ]
+    if not kept:
+        return ""
+    if len(kept) <= MAX_REGRESSION_EXCERPT_LINES:
+        return "\n".join(kept)
+    dropped = len(kept) - MAX_REGRESSION_EXCERPT_LINES
+    return "\n".join(
+        [*kept[:MAX_REGRESSION_EXCERPT_LINES], f"[... {dropped} more line(s) ...]"]
     )
 
 
@@ -445,6 +624,8 @@ def _string_tuple(value: object) -> tuple[str, ...]:
 
 __all__ = [
     "COMMAND_CATEGORIES",
+    "MAX_REGRESSION_EXCERPT_LINES",
+    "NON_REGRESSING_CLASSIFICATIONS",
     "FAILED_STATUSES",
     "FAILURE_REASONS",
     "FEEDBACK_OUTPUT_LINES",
@@ -454,6 +635,7 @@ __all__ = [
     "VerificationReport",
     "VerificationStep",
     "classify_command",
+    "render_classified_feedback",
     "render_feedback",
     "status_for_decision",
     "tail",

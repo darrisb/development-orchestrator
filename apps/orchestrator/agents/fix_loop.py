@@ -176,7 +176,7 @@ class FixIteration:
         """One line for an escalation's attempt history (section 24)."""
         if self.review is not None:
             detail = self.review.routing.summary()
-        elif self.verification is not None and not self.verification.passed:
+        elif self.verification is not None and not self.verification.no_new_regressions:
             detail = self.verification.summary()
         elif self.coding.failure_reason is not None:
             detail = self.coding.feedback or str(self.coding.failure_reason)
@@ -205,6 +205,7 @@ class FixIteration:
                 {
                     "passed": self.verification.passed,
                     "verified": self.verification.verified,
+                    "classification": self.verification.classification.value,
                     "failure_reason": (
                         self.verification.failure_reason.value
                         if self.verification.failure_reason
@@ -742,7 +743,17 @@ async def _turn(
         )
 
     report = verify_candidate(session, workspace, settings=config, secrets=secrets)
-    if not report.passed:
+    # ``no_new_regressions`` rather than ``passed`` (concern 78, stage 2). A
+    # candidate whose only failures are the ones the recorded baseline already
+    # had did not break anything, and sending it back to the coder asks for a
+    # fix to a defect it did not write -- the behaviour stage 1 removed from the
+    # prompt and this line would otherwise reintroduce through the feedback.
+    # ``no_new_regressions`` is not an approval and does not skip anything: the
+    # reviewer still runs, over a report that still carries the failing steps.
+    # When no baseline exists the classification is ``UNCLASSIFIED_FAILURE``,
+    # this reads exactly as ``not report.passed`` did, and the candidate goes
+    # back to the coder as before.
+    if not report.no_new_regressions:
         reason = report.failure_reason or FailureReason.TEST_FAILED
         return _stop(
             FixIteration(number=number, attempt=run.attempt_number, cycle=cycle,
@@ -1429,7 +1440,14 @@ def _blocker(iteration: FixIteration | None) -> str:
     """What actually stopped the run, for the escalation's own words."""
     if iteration is None:
         return "no attempt was made"
-    if iteration.verification is not None and not iteration.verification.passed:
+    # ``no_new_regressions``, not ``passed``: a report whose only failures were
+    # already in the baseline did not stop this run, and naming it as the
+    # blocker would point an operator at someone else's pre-existing failure
+    # instead of at the review that actually ended the attempt.
+    if (
+        iteration.verification is not None
+        and not iteration.verification.no_new_regressions
+    ):
         failures = iteration.verification.failures
         if failures:
             step = failures[0]

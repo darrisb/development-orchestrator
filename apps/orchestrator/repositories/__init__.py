@@ -9,7 +9,10 @@ from .reviews import ReviewRepository
 from .task_runs import TaskRunRepository
 from .tasks import TaskRepository
 from .training import TrainingExampleRepository
-from .verifications import VerificationRunRepository
+from .verifications import (
+    VerificationBaselineRepository,
+    VerificationRunRepository,
+)
 
 __all__ = [
     "ArtifactRepository",
@@ -24,5 +27,6 @@ __all__ = [
     "TaskRepository",
     "TaskRunRepository",
     "TrainingExampleRepository",
+    "VerificationBaselineRepository",
     "VerificationRunRepository",
 ]

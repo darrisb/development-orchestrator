@@ -318,8 +318,21 @@ def _render_verification(report: VerificationReport | None) -> str:
     lines = [
         f"Outcome: {report.summary()}",
         f"Verified by executed commands: {'yes' if report.verified else 'no'}",
+        f"Classification: {report.classification.value}",
         "",
     ]
+    if report.comparison is not None and report.comparison.available:
+        # A failing report can reach a reviewer under concern 78 stage 2, and
+        # it must not look like a passing one. The comparison is the reason it
+        # got here, so it is stated rather than left for the reviewer to infer
+        # from the step list below.
+        comparison = report.comparison
+        lines[-1:-1] = [
+            "Failures compared against the baseline recorded for "
+            f"{comparison.baseline_sha}: "
+            f"{len(comparison.known)} already known, {len(comparison.new)} new, "
+            f"{len(comparison.resolved)} resolved by this change.",
+        ]
     for step in report.steps:
         entry = f"- [{step.verification_type.value}] {step.status.value}"
         if step.command:

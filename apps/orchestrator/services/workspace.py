@@ -124,9 +124,26 @@ def prepare_workspace(
     # Imported inside the function because `services.integration` reaches the
     # worker to verify a merged tree, and that path imports this module: a
     # module-level import here would be a cycle. Only the read side is used.
-    from .integration import integration_baseline
+    from .integration import certify_baseline, integration_baseline
 
     starting_commit = integration_baseline(repository, project)
+
+    # Concern 78, stage 2's lifecycle owner. This is the function that decides
+    # what state a run starts from, so it is also where the orchestrator makes
+    # sure that state's own failures are on record -- before the worktree
+    # exists, and a graph node before the coder is ever invoked, so no model
+    # waits for it and no command runs in the candidate's tree.
+    #
+    # The suite runs when the *baseline* changes, not when a task starts: a
+    # tree already measured is reused and nothing is executed, so the second
+    # and every later task from one baseline cost nothing here. Certification
+    # is never fatal -- a baseline that could not be measured leaves candidate
+    # verification to classify as UNCLASSIFIED_FAILURE, which is how this
+    # behaved before stage 2.
+    certification = certify_baseline(
+        session, project, run, baseline_sha=starting_commit, settings=config
+    )
+
     branch = run_branch_name(task.external_task_id, task.title, run.run_number)
     directory = worktree_dir_name(task.external_task_id, run.run_number)
     path = config.worktree_root / str(project.id) / directory
@@ -148,6 +165,8 @@ def prepare_workspace(
                 "branch": branch,
                 "starting_commit": starting_commit,
                 "worktree_path": str(path),
+                "baseline_certified": certification.certified,
+                "baseline_reused": certification.reused,
             },
         )
     )
@@ -158,6 +177,8 @@ def prepare_workspace(
         branch=branch,
         starting_commit=starting_commit,
         path=str(path),
+        baseline_certified=certification.certified,
+        baseline_reused=certification.reused,
     )
     return TaskWorkspace(
         project_id=project.id,

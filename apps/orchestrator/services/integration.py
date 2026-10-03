@@ -52,6 +52,7 @@ from sqlalchemy.orm import Session
 
 from ..config.logging import get_logger
 from ..config.settings import Settings, get_settings
+from ..domain.commands import CommandRejected
 from ..domain.enums import (
     EscalationStatus,
     FailureReason,
@@ -75,12 +76,13 @@ from ..domain.models import (
 from ..domain.verification import COMMAND_CATEGORIES
 from ..repositories import (
     EscalationRepository,
+    ProjectRepository,
     RunEventRepository,
     TaskRepository,
     VerificationRunRepository,
 )
 from . import artifact_store
-from .command_execution import execute_commands
+from .command_execution import CommandExecution, execute_commands
 from .dependency_bootstrap import (
     DEPENDENCY_FAILURES,
     NETWORKLESS_VERIFICATION_NETWORK,
@@ -88,9 +90,10 @@ from .dependency_bootstrap import (
     prepopulate_dependencies,
     publish_dependencies,
 )
-from .errors import EntityConflict
+from .errors import EntityConflict, LockWaitTimeout
 from .git_errors import GitError, MergeConflict, WorktreeUnusable
 from .git_service import GitService
+from .verification_baseline import capture_baseline, is_recorded, record_executions
 from .worker_service import worker_session
 
 logger = get_logger(__name__)
@@ -193,6 +196,216 @@ def integration_baseline(repository: GitService, project: Project) -> str:
     return ensure_integration_branch(repository, project)
 
 
+@dataclass(frozen=True, slots=True)
+class BaselineCertification:
+    """What establishing the baseline's known failures did, or did not, do.
+
+    Three outcomes, and ``reused`` is the one that matters in steady state: a
+    tree that has already been measured is never measured again, so the second
+    task to start from a baseline costs nothing.
+    """
+
+    baseline_sha: str
+    #: Evidence for every declared command exists after this call.
+    certified: bool
+    #: Nothing ran: the evidence was already there.
+    reused: bool = False
+    #: Commands measured by this call. ``0`` whenever ``reused``.
+    commands_measured: int = 0
+    #: Why certification could not be performed, for a human.
+    detail: str = ""
+
+    def describe(self) -> dict[str, object]:
+        return {
+            "baseline_sha": self.baseline_sha,
+            "certified": self.certified,
+            "reused": self.reused,
+            "commands_measured": self.commands_measured,
+            "detail": self.detail,
+        }
+
+
+def certify_baseline(
+    session: Session,
+    project: Project,
+    run: TaskRun,
+    *,
+    baseline_sha: str,
+    settings: Settings | None = None,
+) -> BaselineCertification:
+    """Make sure the tree a run is about to start from has known failures on record.
+
+    Concern 78 stage 2's missing lifecycle owner. The classification in
+    ``services.verification`` is only as useful as the evidence it has, and
+    before this function the only way evidence appeared was a cumulative gate
+    that passes -- which a project with forty-two pre-existing failures never
+    does. So the measurement is made deliberately, here, once per tree.
+
+    Four properties, in the order they matter.
+
+    * **It reuses.** ``is_recorded`` is checked first, and a tree that has been
+      measured returns immediately having run nothing. The baseline suite
+      therefore runs when the baseline *changes*, not when a task starts: the
+      second, tenth and hundredth task from one baseline all reuse it.
+    * **It never touches the candidate.** The measurement runs in the
+      supervisor's integration worktree -- detached, disposable, reset to the
+      commit named, and already carrying the dependency tree -- so no Git state
+      the candidate depends on is moved and no command writes into the tree the
+      coder will work in. This is called *before* the run's own worktree
+      exists.
+    * **A failing baseline is still a baseline.** ``capture_baseline`` runs
+      every category with ``stop_on_failure=False`` and records what each
+      command found. Forty-two failing tests with readable node ids are valid
+      evidence about this tree; refusing to record them unless the suite were
+      green would make the whole mechanism useless on exactly the projects that
+      need it. Nothing here advances or integrates anything: the ref is not
+      touched, and a failing baseline has no consequence beyond being known.
+    * **Two workers cannot measure one tree at once.** The integration
+      worktree is shared per-project state, and the unique constraint on the
+      evidence protects only the row this ends with -- not the checkout it is
+      gathered from. So the measurement is serialized on the project row
+      (``ProjectRepository.lock``), and the check is **double**: once without
+      the lock, so the steady-state path takes no lock at all, and once again
+      after acquiring it, because between the first check and the lock another
+      worker may have finished the whole measurement. The second check is what
+      turns a race into a reuse.
+    * **It fails closed and never fatally.** Every failure path -- a Git
+      problem, a rejected command, an unusable worker, a dependency bootstrap
+      that will not run, a lock it could not get -- returns ``certified=False``
+      and leaves no evidence.
+      The run then proceeds exactly as it did before stage 2: its candidate
+      verification will find no baseline and classify as
+      ``UNCLASSIFIED_FAILURE``. A baseline that could not be measured must not
+      stop a task that does not need one.
+    """
+    config = settings or get_settings()
+    if project.verification.is_empty:
+        return BaselineCertification(
+            baseline_sha=baseline_sha,
+            certified=True,
+            reused=True,
+            detail="the project declares no verification commands",
+        )
+    # First check, deliberately unlocked. In steady state -- which is every
+    # task after the first on a given baseline -- the evidence is already
+    # there, and taking a project-wide lock to discover that would serialize
+    # the preparation of every task in the project behind each other for no
+    # reason. An unlocked read can only be wrong in the direction of taking the
+    # lock unnecessarily, which the second check then corrects.
+    if is_recorded(session, project, baseline_sha):
+        return _reused(baseline_sha, run, project)
+
+    try:
+        ProjectRepository(session).lock(project.id)
+    except LockWaitTimeout as error:
+        # Do not touch the shared worktree without the lock. Another worker is
+        # certifying this project right now; this run proceeds uncertified and
+        # its candidate verification classifies as UNCLASSIFIED_FAILURE, which
+        # is the fail-closed answer and is also self-healing -- the next task
+        # will find the evidence the other worker is writing.
+        return _uncertified(
+            baseline_sha,
+            run,
+            project,
+            detail=f"could not acquire the baseline certification lock: {error}",
+        )
+
+    # Second check, now under the lock, and it is not an optimisation. A worker
+    # that waited here waited for exactly the measurement it was about to make;
+    # without this re-check it would make it again, which is the duplicated
+    # full suite this whole mechanism exists to avoid.
+    if is_recorded(session, project, baseline_sha):
+        return _reused(baseline_sha, run, project)
+
+    # Imported inside the function for the same reason ``workspace`` imports
+    # this module that way: ``services.workspace`` imports the read side of
+    # this one, so a module-level import here would be a cycle.
+    from .workspace import repository_service
+
+    repository = repository_service(project, settings=config)
+    try:
+        worktree = _integration_worktree(
+            repository, project, baseline_sha, config=config
+        )
+        bootstrap_failed = _bootstrap_cumulative_dependencies(
+            session,
+            project,
+            run,
+            worktree,
+            integration_sha=baseline_sha,
+            settings=config,
+        )
+        if bootstrap_failed:
+            # Without its dependencies the suite fails for a reason that has
+            # nothing to do with the tree, and recording those failures as the
+            # baseline's would make every candidate's real failures look known.
+            return _uncertified(
+                baseline_sha,
+                run,
+                project,
+                detail=
+                "the baseline tree's dependencies could not be bootstrapped: "
+                + "; ".join(bootstrap_failed),
+            )
+        recorded = capture_baseline(
+            session,
+            project,
+            run,
+            worktree_path=worktree.path,
+            baseline_sha=baseline_sha,
+            settings=config,
+        )
+    except (GitError, WorktreeUnusable, OSError, CommandRejected) as error:
+        return _uncertified(baseline_sha, run, project, detail=str(error))
+
+    logger.info(
+        "baseline_certified",
+        project_id=str(project.id),
+        run_id=str(run.id),
+        baseline_sha=baseline_sha,
+        commands=len(recorded),
+        usable=sum(1 for entry in recorded if entry.usable),
+    )
+    # No run event. Every ``RunEventType`` names a phase of *a task run*, and
+    # certifying a tree is not one; borrowing ``BUILD_STARTED`` would make a
+    # reader of the stream think verification had begun. The durable record is
+    # the evidence itself, in ``verification_baselines``.
+    return BaselineCertification(
+        baseline_sha=baseline_sha,
+        certified=is_recorded(session, project, baseline_sha),
+        commands_measured=len(recorded),
+    )
+
+
+def _reused(
+    baseline_sha: str, run: TaskRun, project: Project
+) -> BaselineCertification:
+    logger.info(
+        "baseline_reused",
+        project_id=str(project.id),
+        run_id=str(run.id),
+        baseline_sha=baseline_sha,
+    )
+    return BaselineCertification(
+        baseline_sha=baseline_sha, certified=True, reused=True
+    )
+
+
+def _uncertified(
+    baseline_sha: str, run: TaskRun, project: Project, *, detail: str
+) -> BaselineCertification:
+    logger.warning(
+        "baseline_certification_failed",
+        project_id=str(project.id),
+        run_id=str(run.id),
+        baseline_sha=baseline_sha,
+        detail=detail,
+    )
+    return BaselineCertification(
+        baseline_sha=baseline_sha, certified=False, detail=detail
+    )
+
+
 def integrate_candidate(
     session: Session,
     project: Project,
@@ -228,6 +441,60 @@ def integrate_candidate(
     # replayed delivery into a settle instead of a second, divergent merge. On the
     # ordinary path the candidate is a brand-new commit and is never contained, so
     # this short-circuit cannot fire except on a genuine replay.
+    if repository.contains_commit(candidate_sha, ref=INTEGRATION_BRANCH):
+        logger.info(
+            "integration_candidate_already_in_baseline",
+            task=task.external_task_id,
+            run_id=str(run.id),
+            candidate_sha=candidate_sha,
+            baseline_sha=previous,
+        )
+        return _already_integrated(session, project, task, run, previous, candidate_sha)
+
+    # Concern 78, stage 2 completion. The shared resource is the project's
+    # integration worktree (``integration_worktree_path(project.id)``), and
+    # baseline certification is not the only thing that resets and runs commands
+    # in it -- this function does too. Certifying under the project row lock
+    # while integrating without it would serialize certification against itself
+    # and nothing else, so the same lock is taken here, for the same reason and
+    # with the same identity: whichever of the two gets the row owns the shared
+    # checkout, and unrelated projects lock different rows.
+    #
+    # Taken *after* the replay short-circuit, which is a read of Git that
+    # touches nothing, and *before* the first thing that does. From here to the
+    # end of the caller's transaction the lock is held, which covers opening the
+    # worktree, the merge, the cumulative gate, the ref move and the state that
+    # has to stay atomic with it (the baseline evidence, the task's integration
+    # flag, the event). It is not held through CODE, candidate verification or
+    # REVIEW: those are earlier phases in earlier transactions, and delivery is
+    # the first moment this function is reached.
+    try:
+        ProjectRepository(session).lock(project.id)
+    except LockWaitTimeout as error:
+        # Do not touch the shared worktree without the lock. The candidate is
+        # already committed and tagged, so this is reported the way every other
+        # non-advance is: the baseline stays where it is, the task is marked as
+        # holding an unintegrated commit, and an escalation offers the retry --
+        # which is exactly the recovery path for "try this integration again
+        # later", once whoever holds the worktree is done with it.
+        return _blocked(
+            session, project, task, run, previous,
+            candidate_sha=candidate_sha,
+            reason=(
+                "the project's integration worktree is in use by another "
+                "integration or baseline certification, so the merged tree "
+                "could not be prepared or verified"
+            ),
+            failed_commands=(f"integration worktree lock: {error}",),
+            settings=config,
+        )
+
+    # Re-read the baseline under the lock. Another integration may have advanced
+    # the ref between the unlocked read above and the lock, and merging onto a
+    # stale baseline would verify one tree and then force the ref to a commit
+    # that does not contain the other's work. On the uncontended path this
+    # resolves the same commit as before and changes nothing.
+    previous = ensure_integration_branch(repository, project)
     if repository.contains_commit(candidate_sha, ref=INTEGRATION_BRANCH):
         logger.info(
             "integration_candidate_already_in_baseline",
@@ -296,7 +563,7 @@ def integrate_candidate(
             settings=config,
         )
 
-    failed, ran = _verify_cumulative(
+    failed, ran, executions = _verify_cumulative(
         session, project, run, worktree_path=worktree.path, settings=config
     )
     if failed:
@@ -340,6 +607,21 @@ def integrate_candidate(
             settings=config,
         )
     advanced = repository.force_branch(INTEGRATION_BRANCH, merged)
+    # Concern 78, stage 2. The ref has moved, so ``advanced`` is now the tree
+    # every subsequent task worktree starts from, and the commands that just
+    # passed over it are a measurement of it with exact provenance. Recorded
+    # here, after the move, because evidence filed against a tree that never
+    # became the baseline would be a baseline nothing starts from -- and
+    # recorded from the gate's own executions, so no suite is run twice and no
+    # Git state is disturbed to obtain it.
+    record_executions(
+        session,
+        project_id=project.id,
+        baseline_sha=advanced,
+        worker_profile=project.worker_profile,
+        entries=executions,
+        source_task_run_id=run.id,
+    )
     # The task's output is in the baseline, so nothing of it is outstanding and
     # anything that depends on it may run (concern 51). Written here rather than
     # in `delivery` because this function is the only thing that knows whether
@@ -619,8 +901,17 @@ def _verify_cumulative(
     *,
     worktree_path: Path,
     settings: Settings,
-) -> tuple[tuple[str, ...], int]:
-    """Run the project's profile over the merged tree. Returns failures and count.
+) -> tuple[tuple[str, ...], int, tuple[tuple[VerificationType, CommandExecution], ...]]:
+    """Run the project's profile over the merged tree. Returns failures, count, executions.
+
+    The executions are returned as well as recorded, for concern 78 stage 2:
+    if this gate passes, the ref is about to move to the tree these commands
+    just ran against, which makes them exactly the evidence a later candidate
+    needs to tell its own regressions from the baseline's pre-existing
+    failures. Gathering it costs nothing, because the commands have already
+    run. Recording it is the *caller's* job and happens only once the ref has
+    actually moved -- a merged tree that never becomes the baseline must not
+    leave baseline evidence behind.
 
     The same commands, the same worker policy and the same per-command ceilings
     as an ordinary verification (section 17): what differs is only the tree they
@@ -651,7 +942,7 @@ def _verify_cumulative(
             run_id=str(run.id),
             detail="the project declares no verification commands",
         )
-        return (), 0
+        return (), 0, ()
 
     types = {
         category: _INTEGRATION_TYPES.get(category, VerificationType.INTEGRATION_TESTS)
@@ -659,6 +950,7 @@ def _verify_cumulative(
     }
     verifications = VerificationRunRepository(session)
     failures: list[str] = []
+    executed: list[tuple[VerificationType, CommandExecution]] = []
     ran = 0
     with worker_session(
         worktree_path,
@@ -682,6 +974,7 @@ def _verify_cumulative(
                 record_logs=True,
             )
             ran += len(executions)
+            executed.extend((category, execution) for execution in executions)
             for execution in executions:
                 # Written per command as it finishes rather than per category at
                 # the end: a kill between two commands in a profile must not
@@ -714,7 +1007,7 @@ def _verify_cumulative(
     # is the evidence the escalation points at, so it is written before the
     # branch that decides anything.
     session.flush()
-    return tuple(failures), ran
+    return tuple(failures), ran, tuple(executed)
 
 
 def _blocked(
@@ -931,6 +1224,13 @@ def integrate_human_commit(
             "Commit", f"{commit_sha} in repository {project.repository_path}"
         ) from exc
 
+    # Concern 78, stage 2 completion. The third user of the project's
+    # integration worktree, and therefore the third participant in the project
+    # row lock. Unlike the automated path this function raises for every failure
+    # by contract, so a lock it could not get propagates as ``LockWaitTimeout``
+    # and the caller rolls the escalation resolution back -- nothing in the
+    # shared checkout is touched and no integration state is partially advanced.
+    ProjectRepository(session).lock(project.id)
     previous = ensure_integration_branch(repository, project)
 
     if repository.contains_commit(commit_sha, ref=INTEGRATION_BRANCH):

@@ -27,6 +27,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
     text,
+    true,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -232,6 +233,75 @@ class VerificationRunRow(UUIDPrimaryKey, Base):
     )
 
     task_run: Mapped[TaskRunRow] = relationship(back_populates="verifications")
+
+
+class VerificationBaselineRow(UUIDPrimaryKey, Base):
+    """One command's verdict over one known repository state (concern 78).
+
+    Separate from ``verification_runs`` rather than a flag on it, and the
+    reason is the key. A verification run is evidence *about a task run*; this
+    is evidence *about a tree*, looked up by ``(project, sha, type, command)``
+    long after the run that produced it finished. Filing it in
+    ``verification_runs`` would mean no unique key could exist -- a run has
+    many rows per command across attempts -- so every reader would have to pick
+    a winner by timestamp, which is exactly the kind of guess the fail-closed
+    rule forbids.
+
+    The unique constraint is therefore load-bearing: one row per command per
+    tree, replaced in place when the same tree is measured again.
+    """
+
+    __tablename__ = "verification_baselines"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "baseline_sha", "verification_type", "command"
+        ),
+        Index("ix_verification_baselines_lookup", "project_id", "baseline_sha"),
+    )
+
+    project_id: Mapped[UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    baseline_sha: Mapped[str] = mapped_column(String(64), nullable=False)
+    verification_type: Mapped[VerificationType] = mapped_column(
+        StrEnumType(VerificationType, 32), nullable=False
+    )
+    command: Mapped[str] = mapped_column(Text, nullable=False)
+    #: Part of the provenance, not decoration. The same command text under
+    #: ``WorkerProfile.NODE`` and under ``WorkerProfile.PYTHON`` runs in a
+    #: different image against a different toolchain, so its failure set is not
+    #: the same measurement. A project whose profile changed has no baseline
+    #: until the new one is measured. It is *not* in the unique key: one row per
+    #: command per tree stays the rule, and a re-measurement under a new profile
+    #: replaces the old row rather than sitting beside it.
+    worker_profile: Mapped[WorkerProfile] = mapped_column(
+        StrEnumType(WorkerProfile, 32), nullable=False
+    )
+    status: Mapped[VerificationStatus] = mapped_column(
+        StrEnumType(VerificationStatus, 32), nullable=False
+    )
+    failure_identities: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list, server_default=text("'[]'")
+    )
+    #: ``sa.true()`` rather than ``text("1")``: this table is created by its
+    #: migration on PostgreSQL, where an integer default on a boolean column is
+    #: a type error, and by ``create_all`` on SQLite. The construct renders
+    #: correctly for both.
+    failures_available: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=true()
+    )
+    extractor: Mapped[str | None] = mapped_column(String(64))
+    exit_code: Mapped[int | None] = mapped_column(Integer)
+    stdout_artifact: Mapped[str | None] = mapped_column(String(1024))
+    #: Nullable and ``SET NULL``: the evidence outlives the run that gathered
+    #: it, and deleting an old run must not delete a baseline the current tree
+    #: is still classified against.
+    source_task_run_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("task_runs.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class ReviewRow(UUIDPrimaryKey, Base):

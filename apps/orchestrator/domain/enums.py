@@ -124,6 +124,36 @@ class VerificationStatus(StrEnum):
     SKIPPED = "SKIPPED"
 
 
+class VerificationClassification(StrEnum):
+    """What a verification outcome means *relative to the known baseline*.
+
+    ``VerificationStatus`` answers "what did this command return". This answers
+    the question concern 78 stage 2 exists for: a non-zero test command is not
+    by itself evidence that the candidate broke something, because the tree the
+    candidate started from may already have been failing. The orchestrator can
+    only say so deterministically, from recorded baseline evidence, and when it
+    cannot it must say *that* rather than guess.
+
+    So four states, and the asymmetry between the last two is the whole point:
+    ``KNOWN_BASELINE_ONLY`` is a positive finding backed by evidence, while
+    ``UNCLASSIFIED_FAILURE`` is the absence of one. No failure is ever called
+    known because it looked familiar.
+    """
+
+    #: Nothing that ran failed. No comparison was needed.
+    PASSED = "PASSED"
+    #: Verification failed, and every observed failure identity is present in a
+    #: valid baseline for the exact tree the candidate started from.
+    KNOWN_BASELINE_ONLY = "KNOWN_BASELINE_ONLY"
+    #: At least one failure identity is not in that baseline.
+    NEW_REGRESSION = "NEW_REGRESSION"
+    #: Verification failed and the orchestrator could not establish, from
+    #: evidence, that every failure was already known. The fail-closed state:
+    #: no baseline, stale provenance, an unparseable runner, a timeout, or a
+    #: failing category that has no stable failure identities at all.
+    UNCLASSIFIED_FAILURE = "UNCLASSIFIED_FAILURE"
+
+
 class ReviewDecision(StrEnum):
     """Allowed reviewer decisions (build.md section 21)."""
 

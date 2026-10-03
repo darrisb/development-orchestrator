@@ -181,6 +181,60 @@ class VerificationRun:
 
 
 @dataclass(slots=True)
+class VerificationBaseline:
+    """What one verification command did against one known tree (concern 78).
+
+    The durable half of stage 2's classification. A candidate's failures mean
+    nothing on their own; they mean something set against *these* failures, for
+    *this* repository state, from *this* command. So all three are columns, and
+    together they are the provenance: a row is only usable for a candidate
+    whose worktree started at ``baseline_sha`` and whose failing command text
+    matches ``command`` under the same ``verification_type``.
+
+    ``worker_profile`` is provenance too: see the column's own note. It is the
+    one execution-environment value included, because it is an existing,
+    stable, project-level field that decides *which image* runs the command.
+    Nothing else is fingerprinted.
+
+    ``failures_available`` is the field that keeps the fail-closed rule honest
+    in storage as well as in memory. ``False`` means the command failed and no
+    adapter could identify what failed -- an empty ``failure_identities`` with
+    ``failures_available`` set would claim the tree was green.
+    """
+
+    project_id: UUID
+    #: The commit the evidence describes. The integration baseline, in practice.
+    baseline_sha: str
+    verification_type: VerificationType
+    command: str
+    #: The image the command ran in. Provenance: the same command text under a
+    #: different profile is a different measurement, not a stale one.
+    worker_profile: WorkerProfile
+    status: VerificationStatus
+    failure_identities: list[str] = field(default_factory=list)
+    #: Whether ``failure_identities`` is a complete set for this command.
+    failures_available: bool = True
+    #: Which adapter read them, or "" for a passing command.
+    extractor: str | None = None
+    exit_code: int | None = None
+    #: The full log, kept where every other command log is kept.
+    stdout_artifact: str | None = None
+    #: The run whose work produced this evidence, for audit.
+    source_task_run_id: UUID | None = None
+    id: UUID = field(default_factory=_new_id)
+    created_at: datetime | None = None
+
+    @property
+    def usable(self) -> bool:
+        """Whether this row may be used as one side of a comparison."""
+        return self.status is VerificationStatus.PASSED or self.failures_available
+
+    @property
+    def identities(self) -> frozenset[str]:
+        return frozenset(self.failure_identities)
+
+
+@dataclass(slots=True)
 class ReviewIssue:
     severity: IssueSeverity
     category: IssueCategory

@@ -222,12 +222,21 @@ def test_missing_dependency_path_with_bootstrap_is_built(
     networks = _install_fake_worker(monkeypatch, _bootstrap_creates_vendor)
     project = _project(session, dependency_repo, bootstrap=True)
     _, _, workspace = _workspace(session, project, docker_settings)
+    # Preparing a workspace certifies the baseline before the candidate worktree
+    # exists, and a baseline whose declared dependency path does not exist yet
+    # has to be given one before it can be measured. That is the first `bridge`,
+    # in the detached integration worktree -- a different tree from the
+    # candidate's, not a second run of the candidate's bootstrap.
+    assert networks == ["bridge"]
+    networks.clear()
+
     _make_candidate_change(workspace)
 
     report = verify_candidate(session, workspace, settings=docker_settings)
 
     assert report.passed
     assert (workspace.path / "vendor" / "installed.txt").read_text(encoding="utf-8") == "bridge"
+    # The candidate's own bootstrap, then its verification worker.
     assert networks == ["bridge", "none"]
 
 
@@ -259,9 +268,20 @@ def test_worker_network_override_and_default_behavior(
     docker_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
 ):
+    """The override is bootstrap's alone; verification takes the default.
+
+    ``docker_settings`` declares ``worker_network="none"``, so this test is
+    about which of the three networked operations overrides it. Baseline
+    certification and candidate bootstrap both install dependencies, so both
+    are `bridge`; candidate verification runs the project's commands and is
+    left on the default.
+    """
     networks = _install_fake_worker(monkeypatch, _bootstrap_creates_vendor)
     project = _project(session, dependency_repo, bootstrap=True)
     _, _, workspace = _workspace(session, project, docker_settings)
+    assert networks == ["bridge"]
+    networks.clear()
+
     _make_candidate_change(workspace)
 
     verify_candidate(session, workspace, settings=docker_settings)
@@ -805,6 +825,11 @@ def test_file_valued_dependency_path_bootstraps_and_publishes(
         session, dependency_repo, bootstrap=True, dependency_paths=["vendor.tar"]
     )
     task, run, workspace = _workspace(session, project, docker_settings)
+    # Baseline certification bootstraps the file into the integration worktree
+    # before the candidate's worktree exists; the candidate bootstraps its own.
+    assert networks == ["bridge"]
+    networks.clear()
+
     (workspace.path / "README.md").write_text("# Changed\n", encoding="utf-8")
 
     report = verify_candidate(session, workspace, settings=docker_settings)
