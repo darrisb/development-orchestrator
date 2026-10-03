@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from apps.orchestrator.config.settings import Settings, WorkerBackend
 from apps.orchestrator.domain.commands import ApprovedCommand, CommandPolicy
 from apps.orchestrator.domain.enums import TaskStatus, VerificationType, WorkerProfile
+from apps.orchestrator.domain.git import INTEGRATION_BRANCH
 from apps.orchestrator.domain.models import Project, Task
 from apps.orchestrator.domain.verification import VerificationProfile
 from apps.orchestrator.repositories import ProjectRepository, TaskRepository
@@ -22,6 +23,7 @@ from apps.orchestrator.services import integration as integration_service
 from apps.orchestrator.services import verification as verification_service
 from apps.orchestrator.services.git_service import GitService
 from apps.orchestrator.services.integration import (
+    ensure_integration_branch,
     integrate_candidate,
     integrate_human_commit,
 )
@@ -1440,3 +1442,180 @@ def test_publication_lock_is_shared_across_worktree_roots(
     assert opened[0].parent == dependency_repo / ".git" / "orchestrator-locks"
     assert not (docker_settings.worktree_root / "locks").exists()
     assert not (other.worktree_root / "locks").exists()
+
+
+# --- item: the human path's merged tree gets the declared dependencies ------
+
+
+def _verify_requires_vendor(path: Path, command: ApprovedCommand, network: str) -> int:
+    """Bootstrap builds ``vendor``; the project's own commands need it to exist.
+
+    This is the shape of the greenfield failure: the verification command is not
+    on PATH until the declared dependency tree has been installed, so a merged
+    tree that was never bootstrapped fails the cumulative gate for the absence
+    of a tool rather than for anything the commit did.
+    """
+    _bootstrap_creates_vendor(path, command, network)
+    if command.source == VERIFY_COMMAND and not (path / "vendor").exists():
+        return 127
+    return 0
+
+
+def _operator_commit(repository: Path, name: str, body: str) -> str:
+    """A commit made outside the orchestrator, after the baseline already exists.
+
+    The baseline has to be pinned first, or the new commit is already reachable
+    from it and the integration is a no-op rather than a merge.
+    """
+    (repository / name).write_text(body, encoding="utf-8")
+    run_git(repository, "add", "-A")
+    run_git(repository, "commit", "--quiet", "-m", f"Operator writes {name}")
+    return run_git(repository, "rev-parse", "HEAD").strip()
+
+
+def test_human_commit_with_a_run_bootstraps_before_cumulative_verification(
+    session: Session,
+    dependency_repo: Path,
+    docker_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A merged human commit is verified against the declared dependency tree.
+
+    Nothing has ever built ``vendor`` for this project, so before the fix the
+    cumulative gate ran a command that was not there yet and the operator's
+    resolution was rolled back.
+    """
+    networks = _install_fake_worker(monkeypatch, _verify_requires_vendor)
+    project = _project(session, dependency_repo, bootstrap=True)
+    ensure_integration_branch(_repo_git(dependency_repo, docker_settings), project)
+    human_sha = _operator_commit(dependency_repo, "HAND.md", "# By hand\n")
+    human_task = _task(session, project, "T-HUMAN")
+    human_run = create_run(session, human_task.id)
+
+    integration = integrate_human_commit(
+        session,
+        project,
+        human_task,
+        human_sha,
+        task_run_id=human_run.id,
+        settings=docker_settings,
+    )
+
+    # Requirement: verification passed and the baseline moved.
+    assert integration.advanced
+    assert integration.commands_run == 1
+    git = _repo_git(dependency_repo, docker_settings)
+    assert git.contains_commit(human_sha, ref=INTEGRATION_BRANCH)
+    # Bootstrap on its permitted bootstrap network, then the cumulative gate on
+    # the networkless verification network -- in that order.
+    assert networks == ["bridge", "none"]
+
+
+def test_human_commit_bootstrap_failure_blocks_the_baseline(
+    session: Session,
+    dependency_repo: Path,
+    docker_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A tree whose dependencies could not be built is not verified or merged."""
+
+    def callback(path: Path, command: ApprovedCommand, network: str) -> int:
+        return 1 if command.source == BOOTSTRAP_COMMAND else 0
+
+    networks = _install_fake_worker(monkeypatch, callback)
+    project = _project(session, dependency_repo, bootstrap=True)
+    ensure_integration_branch(_repo_git(dependency_repo, docker_settings), project)
+    human_sha = _operator_commit(dependency_repo, "HAND.md", "# By hand\n")
+    human_task = _task(session, project, "T-HUMAN")
+    human_run = create_run(session, human_task.id)
+
+    with pytest.raises(integration_service.EntityConflict, match="dependency bootstrap"):
+        integrate_human_commit(
+            session,
+            project,
+            human_task,
+            human_sha,
+            task_run_id=human_run.id,
+            settings=docker_settings,
+        )
+
+    assert networks == ["bridge"], "the cumulative gate must not have been reached"
+    git = _repo_git(dependency_repo, docker_settings)
+    assert not git.contains_commit(human_sha, ref=INTEGRATION_BRANCH)
+
+
+def test_human_commit_bootstrap_preserves_historical_run_provenance(
+    session: Session,
+    dependency_repo: Path,
+    docker_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Borrowing a finished run to file logs must not rewrite what it says.
+
+    The run the escalation carries is the one that *failed*. Bootstrap updates
+    the worker image of the run it bootstraps for, which on this path would
+    claim the failed run ran in an image it never saw, so the human path opts
+    out of that write.
+    """
+    from apps.orchestrator.domain.enums import RunStatus
+    from apps.orchestrator.repositories import TaskRunRepository
+
+    _install_fake_worker(monkeypatch, _verify_requires_vendor)
+    project = _project(session, dependency_repo, bootstrap=True)
+    human_task = _task(session, project, "T-HUMAN")
+    human_run = create_run(session, human_task.id)
+    runs = TaskRunRepository(session)
+    runs.update_fields(human_run.id, worker_image="historical-worker:1")
+    runs.finish(human_run.id, RunStatus.FAILED, "RETRY_EXHAUSTED")
+
+    ensure_integration_branch(_repo_git(dependency_repo, docker_settings), project)
+    human_sha = _operator_commit(dependency_repo, "HAND.md", "# By hand\n")
+    assert integrate_human_commit(
+        session,
+        project,
+        human_task,
+        human_sha,
+        task_run_id=human_run.id,
+        settings=docker_settings,
+    ).advanced
+
+    after = runs.get(human_run.id)
+    assert after.status is RunStatus.FAILED
+    assert after.failure_reason == "RETRY_EXHAUSTED"
+    assert after.candidate_commit is None
+    assert after.worker_image == "historical-worker:1"
+
+
+def test_human_commit_without_a_run_keeps_its_existing_behaviour(
+    session: Session,
+    dependency_repo: Path,
+    docker_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """No run means nowhere to file bootstrap logs, so nothing is bootstrapped.
+
+    This is the pre-existing shape of the escalation that carries no TaskRun --
+    both bootstrap and the cumulative gate record against a run -- and the fix
+    leaves it exactly as it was. The project declares no verification commands
+    because that is the only way this path has ever worked.
+    """
+    networks = _install_fake_worker(monkeypatch, _bootstrap_creates_vendor)
+    project = _project(
+        session,
+        dependency_repo,
+        bootstrap=True,
+        verification=VerificationProfile(),
+    )
+    ensure_integration_branch(_repo_git(dependency_repo, docker_settings), project)
+    human_sha = _operator_commit(dependency_repo, "HAND.md", "# By hand\n")
+    human_task = _task(session, project, "T-HUMAN")
+
+    integration = integrate_human_commit(
+        session, project, human_task, human_sha, settings=docker_settings
+    )
+
+    assert integration.advanced
+    assert integration.commands_run == 0
+    assert networks == [], "no run to attribute a bootstrap to, so no bootstrap"
+    git = _repo_git(dependency_repo, docker_settings)
+    assert git.contains_commit(human_sha, ref=INTEGRATION_BRANCH)

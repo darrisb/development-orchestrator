@@ -79,6 +79,7 @@ from ..repositories import (
     ProjectRepository,
     RunEventRepository,
     TaskRepository,
+    TaskRunRepository,
     VerificationRunRepository,
 )
 from . import artifact_store
@@ -877,6 +878,7 @@ def _bootstrap_cumulative_dependencies(
     *,
     integration_sha: str,
     settings: Settings,
+    record_worker_image: bool = True,
 ) -> tuple[str, ...]:
     try:
         result = bootstrap_dependencies(
@@ -888,6 +890,7 @@ def _bootstrap_cumulative_dependencies(
             integration_sha=integration_sha,
             settings=settings,
             prefix="integration/",
+            record_worker_image=record_worker_image,
         )
     except DEPENDENCY_FAILURES as error:
         return (f"dependency bootstrap: {error}",)
@@ -1289,6 +1292,37 @@ def integrate_human_commit(
     except MergeConflict as conflict:
         raise MergeConflict(conflict.path, conflict.paths) from None
 
+    # The merged tree is verified with the project's own commands, and those
+    # commands are entitled to the project's declared dependencies -- the same
+    # entitlement the automated path grants between its merge and its
+    # cumulative gate. Without this, a project whose dependency tree is built
+    # rather than committed fails the gate for the absence of a tool, not for
+    # anything the operator's commit did.
+    #
+    # Bootstrap files command logs against a run, so it can only happen when
+    # the escalation carries one. An escalation without a run keeps its
+    # existing behaviour: the gate runs over the tree as prepared, exactly as
+    # before. The run it borrows is historical and already finished, so its
+    # recorded worker image is left alone (see ``bootstrap_dependencies``).
+    if task_run_id is not None:
+        run = TaskRunRepository(session).get(task_run_id)
+        if run is not None:
+            bootstrap_failed = _bootstrap_cumulative_dependencies(
+                session,
+                project,
+                run,
+                worktree,
+                integration_sha=merged,
+                settings=config,
+                record_worker_image=False,
+            )
+            if bootstrap_failed:
+                raise EntityConflict(
+                    f"Human commit {commit_sha} could not be integrated: "
+                    "dependency bootstrap failed for the merged integration "
+                    f"tree ({', '.join(bootstrap_failed)})"
+                )
+
     failed, ran = _verify_cumulative_human(
         session,
         project,
@@ -1356,6 +1390,12 @@ def _verify_cumulative_human(
     Similar to ``_verify_cumulative`` but does not require a TaskRun. If
     ``task_run_id`` is None, verification runs are not recorded but the
     commands still execute.
+
+    The worker network is stated explicitly, for the same reason the automated
+    cumulative gate states it: a verification worker gets no network whatever
+    the project's own default happens to be, and the one place a tree is
+    allowed to reach the network is dependency bootstrap, which has already
+    finished by the time this runs.
     """
     profile = project.verification
     if profile.is_empty:
@@ -1375,7 +1415,10 @@ def _verify_cumulative_human(
     failures: list[str] = []
     ran = 0
     with worker_session(
-        worktree_path, profile=project.worker_profile, settings=settings
+        worktree_path,
+        profile=project.worker_profile,
+        settings=settings,
+        worker_network=NETWORKLESS_VERIFICATION_NETWORK,
     ) as worker:
         for category in COMMAND_CATEGORIES:
             commands = profile.commands_for(category)

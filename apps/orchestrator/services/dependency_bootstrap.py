@@ -257,11 +257,20 @@ def bootstrap_dependencies(
     settings: Settings,
     prefix: str,
     secrets: Mapping[str, str] | None = None,
+    record_worker_image: bool = True,
 ) -> BootstrapResult:
     """Run dependency bootstrap *if needed*, then prove it changed only ignored paths.
 
     "If needed" is the point of the fingerprint: a worktree whose declared set
     is already certified for the current inputs starts no container at all.
+
+    ``record_worker_image`` is the one concession to callers that bootstrap *for*
+    a run rather than *as* a run. The automated paths bootstrap the tree the run
+    is about to be measured against, so the image is part of that run's own
+    provenance and is written back. The human-commit path borrows a historical,
+    already-finished run only so the bootstrap's command logs are filed
+    somewhere truthful, and overwriting that run's recorded image would rewrite
+    the provenance of work it never did, so it passes False.
 
     The markers are written **last**, after the commands succeeded, after every
     declared path was confirmed to exist, and after the visible-source check
@@ -303,9 +312,10 @@ def bootstrap_dependencies(
         secrets=secrets,
         worker_network=BOOTSTRAP_NETWORK,
     ) as worker:
-        TaskRunRepository(session).update_fields(
-            run.id, worker_image=worker.spec.runtime_description
-        )
+        if record_worker_image:
+            TaskRunRepository(session).update_fields(
+                run.id, worker_image=worker.spec.runtime_description
+            )
         from .command_execution import execute_commands
 
         executions = execute_commands(
