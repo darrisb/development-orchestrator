@@ -1140,3 +1140,166 @@ verified backups)
 - Durable evidence sources are named inline (concerns.md line ranges, commit SHAs, run
   artifact paths, git refs, backup metadata fields). Commit-message text was used only
   where no stronger artifact existed, and never as sole proof of a mechanism.
+
+
+## PART 9 — TraceStack3 independent validation campaign
+
+**Purpose:** Conduct an independent, evidence-backed validation campaign (TraceStack3) to revalidate the findings from the earlier TraceStack campaign. This is a documentation-only analysis of the completed campaign; no execution, repair, retry, recovery, or mutation of either repository was performed.
+
+**Campaign identity:** TraceStack3 (separate campaign from TraceStack2). Distinct campaign identity, run IDs, and artifacts. No cross-contamination of run identities between TraceStack2 and TraceStack3.
+
+**Baseline:** The campaign commenced from the TraceStack3 baseline (manifest at repo root). The repository `master` branch remains at the campaign baseline (`40c83d4 Add TraceStack 3 campaign manifest`).
+
+**Final integration ref:** `agent/integration` at `960bd11bd0619c31b5b9703da38c51d28b8aea52` ("TS-108: Push several entries in one call"). This commit corresponds to the terminal accepted integration state after the campaign.
+
+**Evidence sources:** Durable run artifacts under `data/runs/RUN-20261002-000012` through `RUN-20261002-000021` and `data/training/` where relevant (outcome.json, fix-loop.json, verification.json, review.json, completion-report.json, candidate.patch), plus Git history of `workspace/tracestack3` (logs, refs). TraceStack2 used for comparison only.
+
+**Read-only methodology:** Only read-only Git commands and artifact inspection performed. No file edits, no commits/pushes, no ref mutations, no worktree mutation, no orchestrator execution, no model invocation, no recovery/dispatch. Both repositories were treated as immutable historical artifacts for this analysis.
+
+**Relationship to earlier campaign:** TraceStack3 provides independent validation evidence (not a re-run or continuation). Where artifacts differ in detail, distinctions are documented. Parts 0–8 remain the historical record of the earlier campaign unchanged by this addendum.
+
+
+## PART 10 — TraceStack3 run matrix
+
+| Task | external_run_id | run_id | attempts | deterministic_verification | review_cycles | review_decisions | terminal_result (outcome/failure_reason) | candidate_commit | starting_baseline | containment |
+|---|---|---|---|---|---|---|---|---|---|---|
+| TS-101 | RUN-20261002-000012 | 3896cd39-87e2-4c00-b807-ce5eeef36037 | 1 | PASSED (verified via outcome/reviews) | 1 | APPROVED | SUCCEEDED/accepted | fb146a1125d39e658137d495117fd32b89925e70 | 40c83d4 | integrated (to agent/integration) |
+| TS-102 | RUN-20261002-000013 | 151598f8-d03b-4d25-8232-a05c89cc21fd | 3 | FAILED (BUILD_FAILED) on attempts 2 & 3; no verification artifact for attempt 1 in fix-loop sequence | 0 | — | FAILED/escalated (RETRY_EXHAUSTED) | (none) | fb146a1 | contained — no candidate integrated; baseline preserved |
+| TS-103 | RUN-20261002-000014 | 6ef54f30-5731-4333-84bd-fdf3294737fc | 1 | PASSED | 1 | APPROVED | SUCCEEDED/accepted | 1422e24d8075f048f029eae4b34d8a08061e102c | fb146a1 | integrated (to agent/integration) |
+| TS-104 | RUN-20261002-000015 | dc7b0e5d-c439-42b9-a087-c27034998427 | 1 | PASSED | 1 | APPROVED | SUCCEEDED/accepted | 9762f5aea15dc2871b65c3544d7e3c48ffa734ba | 1422e24 | integrated (to agent/integration) |
+| TS-105 | RUN-20261002-000016 | eb160622-2881-4455-b264-3c9396011a27 | 1 | PASSED | 1 | APPROVED | SUCCEEDED/accepted | e0e9b1f0642247d8535ffc6c529e7fd84388edae | 9762f5a | integrated (to agent/integration) |
+| TS-106 | RUN-20261002-000017 | d7945afc-e8a9-463e-b6eb-c5e33b5b5c6b | 3 | FAILED (TEST_FAILED) on attempts 2 & 3 | 0 | — | FAILED/escalated (RETRY_EXHAUSTED) | (none) | e0e9b1f | contained — no candidate integrated; baseline preserved |
+| TS-107 | RUN-20261002-000018 | 1fba0ab4-75d9-4e39-9f89-13301fb97573 | 2 | PASSED (on attempt that produced candidate) | 1 | APPROVED | SUCCEEDED/accepted (attempt 2 produced accepted candidate) | df8eb9531bd6fd770292aac6edb27f2114abac78 | e0e9b1f | integrated (to agent/integration); retry/self-correction demonstrated |
+| TS-108 | RUN-20261002-000019 | 170dc0c0-6bcb-464e-8708-0169899eb367 | 1 | PASSED | 1 | APPROVED | SUCCEEDED/accepted | 960bd11bd0619c31b5b9703da38c51d28b8aea52 | df8eb95 | integrated (to agent/integration) — terminal accepted state |
+| TS-109 | RUN-20261002-000020 | dbabcd55-7241-4175-a231-2abb45c5f252 | 3 | attempt 1: BUILD_FAILED (no candidate integrated); attempts 2–3: MODEL_TIMEOUT (coding phase timeouts); no verification artifacts for attempts 2–3 as coding failed before verification | 0 | — | FAILED/escalated (RETRY_EXHAUSTED) | (none) | 960bd11 | contained — no candidate integrated; agent/integration remains at 960bd11 |
+| TS-110 | RUN-20261002-000021 | b73951d6-138f-4a16-8766-873622b289a7 | 2 | PASSED (attempt 1: verification passed; attempt 2: after repair, verification context exists in sequence) | 2 | CHANGES_REQUESTED (cycle 1), CHANGES_REQUESTED (cycle 2) | FAILED/escalated (RETRY_EXHAUSTED) — review budget exhausted (2 cycles) | (none) | 960bd11 | contained — no candidate integrated; agent/integration remains at 960bd11 |
+
+**Evidence classification notes:** Deterministic verification, reviewer decisions, model timeouts, build/test failures, and retry exhaustion are recorded distinctly per the categories defined in HARD CONSTRAINTS (6).
+
+
+## PART 11 — C66–C76 revalidation matrix
+
+**Evidence classes:** DIRECTLY REVALIDATED | ADDITIONAL SUPPORT | PARTIALLY EXERCISED | NOT EXERCISED | NEW QUESTION
+
+| Concern | TraceStack3 evidence (from artifacts/refs) | Classification | Rationale |
+|---|---|---|---|
+| C66 (provider/timeout/integration interaction) | TS-109: attempt 1 BUILD_FAILED (no integration); attempts 2–3 MODEL_TIMEOUT (coding phase timeouts, ~600s-style timeouts as described by campaign context; fix-loop shows MODEL_TIMEOUT in coding stage, no verification). No durable artifact shows reproduction of the old database-transaction failure from earlier campaign. TS-109 remained contained (no candidate integrated); agent/integration stayed at 960bd11. | ADDITIONAL SUPPORT (stronger live timeout evidence) | Durable terminal states for TS-109 are BUILD_FAILED then two MODEL_TIMEOUTs leading to RETRY_EXHAUSTED with no integration. The specific "database-transaction failure" from the earlier campaign was not reproduced in TS-109 artifacts; the observed failures were build timeout/timeout-related coding failures. C66 is strengthened by surviving real long provider timeouts without reproducing the old transaction failure, but "did not reproduce" does not equal "fixed" — containment is the key observation. |
+| C67 (deterministic verification gating) | TS-101,103,104,105,107,108 passed deterministic verification before APPROVED/review acceptance path; TS-102 failed BUILD_FAILED on attempts 2–3 (verification failed), TS-106 failed TEST_FAILED on attempts 2–3, TS-109 attempt 1 failed BUILD_FAILED at verification stage. TS-110: deterministic verification PASSED in attempt 1 (fix-loop shows verification.passed=true) while reviewer returned CHANGES_REQUESTED — these are distinct layers (verification vs review). | DIRECTLY REVALIDATED | Verification gates execution of downstream review/integration paths; failures at verification prevent acceptance. Separation of verification vs review is evident in TS-110 (PASS + CHANGES_REQUESTED are not contradictory). |
+| C68 (scope containment / edit policy) | Scope guard appears in TS-102/TS-106 verification artifacts (SCOPE step with ALLOW counts). Build/test failures for TS-102/TS-106 occurred after/during verification paths without producing integrated candidates; no evidence of scope-guard bypass. TS-109/110 also contained. | DIRECTLY REVALIDATED | Containment holds: failed attempts did not move `agent/integration` (remained 960bd11) and failed tasks left no candidate integrated. |
+| C69 (reviewer role / blocking issues) | TS-110 shows review_cycles=2, both cycles CHANGES_REQUESTED with blocking issues (testing: oldest-after-trim test expectation dispute). Issues marked resolved/unresolved across cycles (attempt 1 blocking issue id b3b3ca1f resolved true in attempt 2 resolved list context? attempt 2 review shows blocking issue remained unresolved; fix-loop marks resolved_issues for attempt 2 as ["b3b3ca1f-6f60-41e5-80fc-64792a04795b"] but second review still lists blocking issue unresolved — evidence shows reviewer repeatedly objected). TS-101,103,104,105,107,108 approved with no blocking issues. | DIRECTLY REVALIDATED | Reviewer evaluates semantics/requirements distinct from deterministic verification (C67). Blocking issues and review budget exhaustion demonstrated by TS-110. |
+| C70 (coder failure taxonomy) | BUILD_FAILED: TS-102 (attempts 2–3), TS-109 (attempt 1). TEST_FAILED: TS-106 (attempts 2–3). MODEL_TIMEOUT: TS-109 (attempts 2–3, coding phase). RETRY_EXHAUSTED as terminal supervisor outcome after underlying attempt failures. No evidence in TS-102/106/109 artifacts of "edit-protocol rejection" as the cause; failures classified as build/test/timeout/model failures. | DIRECTLY REVALIDATED | Categories remain distinct (BUILD_FAILED != TEST_FAILED != MODEL_TIMEOUT != edit-protocol). A BUILD_FAILED attempt is not classified as edit-protocol failure absent explicit artifact proof. |
+| C71 (cancellation semantics) | Cooperative cancellation not intentionally exercised by TraceStack3 campaign tasks (per run outcomes/fix-loop). Failures observed were non-cooperative/operational (build/test/timeout) leading to RETRY_EXHAUSTED/escalation. | NOT EXERCISED | No artifact proves intentional cooperative cancellation occurred. Hard crash semantics remain outside exercised scope for TraceStack3. |
+| C72 (repair/retry discipline) | TS-107 succeeded on attempt 2 after first attempt did not produce accepted candidate (attempts=2, candidate from attempt 2). TS-110 attempted repair across cycle 1→2 but review remained CHANGES_REQUESTED with blocking issue unresolved; review budget exhausted → RETRY_EXHAUSTED (no integration). Failed tasks (102,106,109) retried up to 3 attempts then escalated with no candidate integrated. | DIRECTLY REVALIDATED | Retry/self-correction demonstrated (TS-107). Repair/re-review occurred (TS-110) without bypassing gates. Failed attempts contained. |
+| C73 (human completion/integration) | No artifact shows COMPLETED_BY_HAND or human integration performed during TraceStack3 campaign. Integration occurred only via accepted candidates (commits fb146a1,1422e24,9762f5a,e0e9b1f,df8eb95,960bd11) merged into agent/integration by the campaign process as recorded; human completion/integration was not intentionally exercised. | NOT EXERCISED | TraceStack3 did not use COMPLETED_BY_HAND unless artifacts prove otherwise — no such proof found. Human-in-the-loop completion path not exercised. |
+| C74 (agent/integration as authoritative baseline) | `agent/integration` = 960bd11 (terminal). Comparison against TraceStack2: TraceStack2 agent/integration stops at TS-107 (77e2496). TraceStack3 agent/integration stops at TS-108 (960bd11). Git chains confirm accepted commits only. Missing TS-102,106,109,110 from integration is evidence of failure containment. | DIRECTLY REVALIDATED | `agent/integration` is the authoritative accepted-code baseline for comparison; failed-task code did not leak. Distinction between campaigns preserved. |
+| C75 (isolation / contamination) | Accepted chain: 40c83d4 → fb146a1 (TS-101) → 1422e24 (TS-103) → 9762f5a (TS-104) → e0e9b1f (TS-105) → df8eb95 (TS-107) → 960bd11 (TS-108). Failed TS-102 started at fb146a1 but produced no candidate integrated (next accepted started at fb146a1 for TS-103) — no contamination. Failed TS-106 started at e0e9b1f, next accepted TS-107 started at e0e9b1f. Failed TS-109/110 started at 960bd11, agent/integration remained at 960bd11. `master` = 40c83d4 (campaign baseline) and never moved. | DIRECTLY REVALIDATED | Failure isolation holds across all failed tasks. Gaps are intentional containment artifacts. |
+| C76 (recovery paths / refused conditions) | TraceStack3 TS-110 did not reach APPROVED/delivery; it reached RETRY_EXHAUSTED with review budget exhausted after CHANGES_REQUESTED cycles (no candidate integrated). The earlier campaign remains the direct C76 evidence. TS-109/110 left integration at TS-108. No evidence of delivery-only recovery or cooperative cancellation being exercised to "fix" a refused condition. | ADDITIONAL SUPPORT (boundary case) | TS-110 is a boundary case (deterministic verification passed, reviewer repeatedly objected to test expectation semantics) that escalated without integration — consistent with containment; does not revalidate delivery-only recovery. Earlier campaign remains direct evidence for C76. | 
+
+**Special notes:**
+- C66: "Did not reproduce old database-transaction failure" is documented from durable terminal states; this strengthens evidence but is not proof of fix. 
+- C70/C72: Edit-protocol failures not inferred from BUILD_FAILED/TEST_FAILED absent artifact proof. 
+- C73: No COMPLETED_BY_HAND usage evident in TraceStack3 artifacts.
+- TS-110 semantic question (PART 14.10) is separate from classification above.
+
+
+## PART 12 — Integration and failure-isolation evidence
+
+**Accepted Git chain (TraceStack3):**
+```
+40c83d4 Add TraceStack 3 campaign manifest (baseline)
+  └─ fb146a1 TS-101: Report how many entries the stack holds (accepted, attempt 1)
+      └─ 1422e24 TS-103: Find one entry by its id (accepted, attempt 1)
+          └─ 9762f5a TS-104: Report whether an id is present (accepted, attempt 1)
+              └─ e0e9b1f TS-105: Return the most recent entries, newest first (accepted, attempt 1)
+                  └─ df8eb95 TS-107: Expose the configured maximum size (accepted, attempt 2)
+                      └─ 960bd11 TS-108: Push several entries in one call (accepted, attempt 1)
+```
+
+**Integration points verified:**
+- `agent/integration` = `960bd11bd0619c31b5b9703da38c51d28b8aea52`
+- `master` = `40c83d40f32d9e247b14c56c6376dc5946d59b1e` (intentionally remained at campaign baseline)
+
+**Gaps (by design, evidence of containment):**
+- **TS-102:** BUILD_FAILED (attempts 2–3), RETRY_EXHAUSTED, no candidate integrated. Started at fb146a1; next accepted (TS-103) started at fb146a1 — no contamination. Integration did not advance through a failed candidate.
+- **TS-106:** TEST_FAILED (attempts 2–3), RETRY_EXHAUSTED, no candidate integrated. Started at e0e9b1f; next accepted (TS-107, attempt 2 path) started at e0e9b1f — no contamination. Integration preserved baseline state for that step.
+- **TS-109:** attempt 1 BUILD_FAILED, attempts 2–3 MODEL_TIMEOUT, RETRY_EXHAUSTED, no candidate integrated. Started at 960bd11; `agent/integration` remained at 960bd11.
+- **TS-110:** deterministic verification PASSED (attempt 1) but reviewer CHANGES_REQUESTED twice; review budget exhausted, RETRY_EXHAUSTED, no candidate integrated. Started at 960bd11; `agent/integration` remained at 960bd11.
+
+**Failure isolation conclusion:** Missing commits for TS-102, TS-106, TS-109, and TS-110 in the `agent/integration` history are evidence of **failure containment** (gates preventing integration of non-accepted candidates), not missing historical record. All accepted work is present only where gates passed.
+
+
+## PART 13 — TraceStack2 vs TraceStack3 current integration comparison
+
+**Comparison basis:** Actual archived/current integration contents (refs), not checked-out working trees. `agent/integration` refs compared directly.
+
+| Aspect | TraceStack2 | TraceStack3 | Evidence source |
+|---|---|---|---|
+| agent/integration commit | 77e24962cf316af3200b1574f7529f31a730b982 | 960bd11bd0619c31b5b9703da38c51d28b8aea52 | `git rev-parse agent/integration` in each repo |
+| Integration terminal | stops at TS-107 | stops at TS-108 | Git logs of agent/integration |
+| TS-101 size() | present (accepted in chain) | present (accepted in chain) | campaign chains |
+| TS-102 isEmpty() | present (cc40bf7 in chain) | absent from integration (not accepted) | TraceStack2 includes TS-102; TraceStack3 integration does not contain TS-102 commit |
+| TS-103 find() | present | present | both |
+| TS-104 contains() | present | present | both |
+| TS-105 getMostRecent() | present | present | both |
+| TS-106 removeAllForUri() | absent from integration | absent from integration | neither current integration contains removeAllForUri() |
+| TS-107 getMaxSize() | present (terminal) | present | TraceStack2 terminal is TS-107; TraceStack3 includes TS-107 then continues |
+| TS-108 pushAll() | absent from current integration | present (terminal) | TraceStack3 terminal includes TS-108; TraceStack2 current integration does not |
+| TS-109 filterBySource() | absent from integration | absent from integration (not integrated; failed) | neither current integration contains filterBySource() |
+| TS-110 oldest() | absent from integration | absent from integration (not integrated; failed) | neither current integration contains oldest() |
+
+**Key distinctions:**
+- TraceStack2 contains `isEmpty()` (TS-102 accepted in that campaign) while TraceStack3 integration does **not** contain `isEmpty()` (TS-102 failed/contained).
+- TraceStack3 contains `pushAll()` (TS-108 accepted) while TraceStack2 current integration does **not** contain `pushAll()`.
+- Neither current integration contains `removeAllForUri()`, `filterBySource()`, or `oldest()` — these correspond to tasks that were not accepted/integrated in the respective campaigns (TS-106/109/110 outcomes).
+- Accepted-code state corresponds directly to campaign outcomes; failed-task code did not leak between campaigns. Repositories are **not** identical — differences reflect containment and distinct campaign results.
+
+
+## PART 14 — New evidence and remaining gaps
+
+**New evidence from TraceStack3:**
+1. **C66 substantially stronger live evidence (timeouts).** TS-109 experienced attempt 1 BUILD_FAILED followed by two MODEL_TIMEOUTs in coding phase (attempts 2–3) leading to RETRY_EXHAUSTED; durable terminal states show timeouts without reproducing the old database-transaction failure from the earlier campaign. This strengthens C66 with concrete timeout artifacts, but does not prove the underlying issue is "fixed".
+2. **Retry/self-correction demonstrated.** TS-107 succeeded on attempt 2 (accepted candidate df8eb95) after first attempt did not produce an accepted result — direct evidence of repair/retry discipline working as intended.
+3. **BUILD_FAILED containment demonstrated.** TS-102 failed with BUILD_FAILED on attempts 2–3, escalated to RETRY_EXHAUSTED with no candidate integrated; integration remained at fb146a1 baseline for the next step.
+4. **TEST_FAILED containment demonstrated.** TS-106 failed with TEST_FAILED on attempts 2–3, escalated to RETRY_EXHAUSTED with no candidate integrated; integration remained at e0e9b1f baseline for the next step.
+5. **MODEL_TIMEOUT containment demonstrated.** TS-109 failed with MODEL_TIMEOUT (attempts 2–3, coding phase) after initial BUILD_FAILED; escalated to RETRY_EXHAUSTED with no candidate integrated; `agent/integration` remained at 960bd11.
+6. **Reviewer-budget escalation demonstrated.** TS-110 underwent 2 review cycles, both CHANGES_REQUESTED (blocking issues), review budget exhausted → escalated to RETRY_EXHAUSTED with no candidate integrated. Deterministic verification passed in attempt 1 (separate layer from review).
+7. **C76 not re-exercised by TraceStack3.** TS-110 did not reach APPROVED/delivery; containment prevailed. Earlier campaign remains the direct evidence for C76 delivery-only recovery semantics.
+8. **Cooperative cancellation still not intentionally exercised.** No artifact in TraceStack3 proves intentional cooperative cancellation occurred; observed terminations are build/test/timeout → RETRY_EXHAUSTED/escalation.
+9. **Human completion/integration (C73) not intentionally exercised.** No COMPLETED_BY_HAND artifacts found; all accepted integrations correspond to accepted candidates produced by the campaign process.
+
+**New question exposed:**
+10. **TS-110 raises a reviewer-quality/semantic question (testing semantics).** Deterministic verification passed, but the reviewer repeatedly objected to the "oldest after trim" test expectation (issue persisted across cycles). Artifacts show the reviewer considered the test expectation incorrect relative to stack semantics ("oldest entry after trimming is the first entry in the window"), while the coder attempted repairs. The durable review artifacts (review.json, review-response.txt, issues) record the dispute but do not, on their own, definitively prove which interpretation matches the actual test setup and stack semantics as specified by TS-110 requirements. **Classification:** NEW QUESTION — requires inspecting the actual test content/setup (candidate patches and test files from RUN-20261002-000021) to determine correct semantics; we must not conclude the reviewer was wrong without that evidence.
+
+
+## PART 15 — TraceStack3 closing classification
+
+### A. Facts established by TraceStack3
+- Independent campaign with distinct run identities and artifacts; no cross-contamination with TraceStack2.
+- Final accepted integration: `agent/integration = 960bd11` (TS-108). Integration chain includes TS-101,103,104,105,107,108 only.
+- Failed tasks (TS-102 BUILD_FAILED x3→RETRY_EXHAUSTED; TS-106 TEST_FAILED x3→RETRY_EXHAUSTED; TS-109 BUILD_FAILED then MODEL_TIMEOUT x2→RETRY_EXHAUSTED; TS-110 verification PASSED but CHANGES_REQUESTED x2→RETRY_EXHAUSTED) produced no candidate integrated.
+- `master` remained at campaign baseline (`40c83d4`) throughout.
+- TS-107 demonstrates retry/self-correction (accepted on attempt 2).
+- Verification and review are distinct layers (TS-110: PASS + CHANGES_REQUESTED).
+- Failure categories are distinct (BUILD_FAILED, TEST_FAILED, MODEL_TIMEOUT, RETRY_EXHAUSTED).
+
+### B. Earlier conclusions strengthened by TraceStack3
+- Containment gates prevented integration of failed candidates across all failure modes exercised (build/test/timeout/review-budget).
+- `agent/integration` remains the authoritative accepted-code baseline.
+- Failure isolation holds (failed tasks did not contaminate subsequent accepted integrations).
+- C66 strengthened by concrete long-timeout artifacts without reproducing the old transaction failure.
+- C67–C70, C72, C74–C75 are directly revalidated by durable evidence.
+
+### C. Earlier safeguards not exercised by TraceStack3
+- Cooperative cancellation (C71) was not intentionally exercised.
+- Human completion/integration (C73, COMPLETED_BY_HAND) was not intentionally exercised.
+- C76 delivery-only recovery not re-exercised (TS-110 escalated without reaching delivery).
+
+### D. New questions exposed by TraceStack3
+- TS-110 semantic dispute over "oldest after trim" test expectation: verification passed but reviewer objected across cycles; insufficient evidence in summary artifacts alone to determine which interpretation is correct relative to actual test setup and stack semantics (PART 14.10).
+
+### E. Things TraceStack3 does NOT prove
+- That any previously observed database-transaction failure is "fixed" (only that it did not reproduce under exercised conditions in this campaign).
+- Semantic correctness of all accepted implementations beyond what passed verification and reviewer approval for those specific tasks.
+- The correct resolution of the TS-110 test-expectation dispute without examining the actual test content and patches from RUN-20261002-000021.
+- Cooperative cancellation behavior under hard process crashes.
+- Completeness of historical per-event DB state (original-history fidelity) — outside scope of this campaign.
