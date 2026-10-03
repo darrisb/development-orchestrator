@@ -14,11 +14,12 @@ from ..schemas.projects import (
     ProjectCreateRequest,
     ProjectResponse,
 )
-from ..schemas.runs import ProjectRunResponse, RunUsageResponse
+from ..schemas.runs import CampaignAdvanceResponse, ProjectRunResponse, RunUsageResponse
 from ..schemas.tasks import NextTaskResponse, TaskResponse
 from ..services import model_usage as usage_service
 from ..services import projects as project_service
 from ..services import tasks as task_service
+from ..services.campaign import CampaignRunner
 from ..services.manifest_loader import load_manifest, manifest_path_for
 from ..services.scheduler import select_next_task
 from ..services.task_importer import import_manifest
@@ -138,6 +139,33 @@ async def run_project(project_id: UUID) -> ProjectRunResponse:
         outcome=state.get("outcome"),
         state=dict(state),
     )
+
+
+@router.post("/{project_id}/campaign/advance", response_model=CampaignAdvanceResponse)
+async def advance_campaign(
+    project_id: UUID,
+    transition_limit: int = Query(default=10, ge=1, le=100),
+) -> CampaignAdvanceResponse:
+    """Advance a project campaign through bounded existing task workflows."""
+    session_factory = get_session_factory()
+    with session_factory.begin() as session:
+        project_service.get_project(session, project_id)
+
+    workflow = WorkflowRunner.configured(session_factory)
+
+    async def execute_existing_task_workflow(run_id: UUID) -> dict[str, object]:
+        return dict(await workflow.run(run_id))
+
+    campaign = CampaignRunner(
+        session_factory,
+        task_executor=execute_existing_task_workflow,
+        transition_limit=transition_limit,
+    )
+    try:
+        report = await campaign.advance(project_id)
+    finally:
+        await workflow.aclose()
+    return CampaignAdvanceResponse.from_report(report)
 
 
 @router.post("/{project_id}/pause", response_model=ProjectResponse)

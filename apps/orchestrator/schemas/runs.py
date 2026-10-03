@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from ..domain.enums import ModelPurpose, RunStatus
 from ..domain.models import TaskRun
+from ..services.campaign import CampaignReport, CampaignStatus
 from ..services.model_usage import ModelCallUsage, UsageSummary
 from ..services.run_recovery import (
     RecoverabilityReport,
@@ -177,6 +178,79 @@ class ProjectRunResponse(BaseModel):
     outcome: str | None = None
     state: dict[str, object] | None = None
     no_task_reason: str | None = None
+
+
+class CampaignTaskSummaryResponse(BaseModel):
+    external_task_id: str
+    task_id: UUID
+    status: str
+    integrated: bool
+    run_ids: list[UUID]
+    latest_run_status: str | None
+    latest_run_failure_reason: str | None
+    latest_candidate_commit: str | None
+    unintegrated_commit: str | None
+
+
+class CampaignAdvanceResponse(BaseModel):
+    project_id: UUID
+    status: CampaignStatus
+    tasks_considered: list[str]
+    tasks_completed_this_invocation: list[str]
+    tasks_already_completed: list[str]
+    tasks_escalated: list[str]
+    tasks_blocked: list[str]
+    current_task: str | None
+    current_run_id: UUID | None
+    last_task: str | None
+    last_run_id: UUID | None
+    run_ids: list[UUID]
+    resumed_run_ids: list[UUID]
+    integrated_commits: list[str]
+    stop_reason: str
+    autonomous_advance_possible: bool
+    transition_limit: int
+    transitions_used: int
+    tasks: list[CampaignTaskSummaryResponse]
+
+    @classmethod
+    def from_report(cls, report: CampaignReport) -> CampaignAdvanceResponse:
+        return cls(
+            project_id=report.project_id,
+            status=report.status,
+            tasks_considered=list(report.tasks_considered),
+            tasks_completed_this_invocation=list(report.tasks_completed_this_invocation),
+            tasks_already_completed=list(report.tasks_already_completed),
+            tasks_escalated=list(report.tasks_escalated),
+            tasks_blocked=list(report.tasks_blocked),
+            current_task=report.current_task,
+            current_run_id=report.current_run_id,
+            last_task=report.last_task,
+            last_run_id=report.last_run_id,
+            run_ids=list(report.run_ids),
+            resumed_run_ids=list(report.resumed_run_ids),
+            integrated_commits=list(report.integrated_commits),
+            stop_reason=report.stop_reason,
+            autonomous_advance_possible=report.autonomous_advance_possible,
+            transition_limit=report.transition_limit,
+            transitions_used=report.transitions_used,
+            tasks=[
+                CampaignTaskSummaryResponse(
+                    external_task_id=task.external_task_id,
+                    task_id=task.task_id,
+                    status=task.status.value,
+                    integrated=task.integrated,
+                    run_ids=list(task.run_ids),
+                    latest_run_status=task.latest_run_status.value
+                    if task.latest_run_status is not None
+                    else None,
+                    latest_run_failure_reason=task.latest_run_failure_reason,
+                    latest_candidate_commit=task.latest_candidate_commit,
+                    unintegrated_commit=task.unintegrated_commit,
+                )
+                for task in report.tasks
+            ],
+        )
 
 
 def _money(value: Decimal | None) -> str | None:

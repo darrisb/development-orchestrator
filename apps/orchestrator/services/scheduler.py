@@ -19,7 +19,7 @@ from ..domain.dependencies import ReadinessReport, evaluate_readiness
 from ..domain.enums import ProjectStatus, TaskStatus
 from ..domain.models import Task
 from ..domain.state_machine import is_active
-from ..repositories import ProjectRepository, TaskRepository
+from ..repositories import ProjectRepository, TaskRepository, TaskRunRepository
 
 logger = get_logger(__name__)
 
@@ -141,10 +141,11 @@ def refresh_readiness(session: Session, project_id: UUID) -> ReadinessReport:
 
 def active_tasks(session: Session, project_id: UUID) -> list[Task]:
     """Tasks with a run in flight. V1 expects at most one (section 26)."""
+    runs = TaskRunRepository(session)
     return [
         task
         for task in TaskRepository(session).list_for_project(project_id)
-        if is_active(task.status)
+        if is_active(task.status) or runs.in_flight_for_task(task.id) is not None
     ]
 
 
@@ -197,7 +198,8 @@ def select_next_task(session: Session, project_id: UUID) -> Selection:
     tasks = TaskRepository(session).list_for_project(project_id)
     if not tasks:
         return Selection(reason=NoTaskReason.NO_TASKS)
-    if any(is_active(task.status) for task in tasks):
+    runs = TaskRunRepository(session)
+    if any(is_active(task.status) or runs.in_flight_for_task(task.id) for task in tasks):
         return Selection(reason=NoTaskReason.TASK_IN_FLIGHT)
 
     report = refresh_readiness(session, project_id)
