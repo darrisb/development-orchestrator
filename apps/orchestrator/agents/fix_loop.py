@@ -64,6 +64,7 @@ from ..domain.enums import (
     EscalationStatus,
     FailureAction,
     FailureReason,
+    ReviewDecision,
     RunEventType,
     RunStatus,
     TaskStatus,
@@ -74,12 +75,20 @@ from ..domain.limits import can_retry_coding
 from ..domain.models import (
     HumanEscalation,
     Project,
+    Review,
     ReviewIssue,
     RunEvent,
     Task,
     TaskRun,
 )
-from ..domain.review import HumanApprovalPolicy, issue_fingerprint, unreraised_issues
+from ..domain.review import (
+    HumanApprovalPolicy,
+    ReviewRouting,
+    issue_fingerprint,
+    reraised_unresolved_blocking_issues,
+    render_review_feedback,
+    unreraised_issues,
+)
 from ..domain.state_machine import can_transition
 from ..domain.verification import VerificationReport
 from ..domain.workflow import deadline_exceeded, run_deadline
@@ -101,6 +110,7 @@ from .loop_recovery import (
     Fingerprint,
     RecoveredLoopState,
     recover_loop_state,
+    review_result_for,
 )
 from .review_agent import ESCALATION_ARTIFACT, ReviewOutcome, run_review
 
@@ -450,6 +460,39 @@ async def run_fix_loop(
             runtime_budget=runtime_budget,
         )
 
+    recovered_dispute = _recovered_repeated_blocking_dispute(session, run, task)
+    if recovered_dispute is not None:
+        logger.warning(
+            "fix_loop_recovered_repeated_blocking_dispute",
+            run_id=str(run.id),
+            task=task.external_task_id,
+            cycle=recovered_dispute.review.cycle,
+            repeated=len(recovered_dispute.repeated),
+        )
+        iterations.append(
+            FixIteration(
+                number=0,
+                attempt=run.attempt_number,
+                cycle=recovered_dispute.review.cycle,
+                coding=CodingAttempt(
+                    task_run_id=run.id,
+                    external_task_id=task.external_task_id,
+                    attempt=run.attempt_number,
+                    context_hash=run.context_hash or "",
+                    provider_id="recovered",
+                    model_name="recovered",
+                ),
+                review=recovered_dispute.outcome,
+                resolved_issues=recovered_dispute.resolved,
+                failure_reason=FailureReason.HUMAN_DECISION_REQUIRED,
+                action=FailureAction.ESCALATE,
+            )
+        )
+        return settle(
+            outcome=LoopOutcome.ESCALATED,
+            reason=FailureReason.HUMAN_DECISION_REQUIRED,
+        )
+
     if first > ceiling:
         # A resumed run whose attempts are already spent must not re-make the
         # turn it was interrupted in: the interruption is not a free retry. The
@@ -559,7 +602,7 @@ async def run_fix_loop(
         if checkpoint_turn is not None:
             checkpoint_turn()
 
-        if _reviews_are_stagnant(
+        if iteration.action is not FailureAction.ESCALATE and _reviews_are_stagnant(
             [*fingerprints],
             limit=config.fix_loop_stagnant_review_limit,
         ):
@@ -715,7 +758,15 @@ async def _turn(
         policy=policy,
         checkpoint_call=checkpoint_call,
     )
-    resolved = _close_unreraised_issues(session, run, task, project, review)
+    earlier_issues = _open_earlier_review_issues(session, run, review.cycle)
+    resolved = _close_unreraised_issues(
+        session, run, task, project, review, earlier=earlier_issues
+    )
+    repeated = reraised_unresolved_blocking_issues(
+        earlier_issues, review.result.issues
+    )
+    if review.routing.needs_fix and repeated:
+        review = _escalate_repeated_blocking_dispute(review, repeated)
     iteration = FixIteration(
         number=number, attempt=run.attempt_number, cycle=review.cycle,
         coding=attempt, verification=report, review=review, resolved_issues=resolved,
@@ -865,31 +916,116 @@ def _correction_feedback(
 # ------------------------------------------------------------ issue bookkeeping
 
 
-def _close_unreraised_issues(
+def _open_earlier_review_issues(
+    session: Session, run: TaskRun, cycle: int
+) -> tuple[ReviewIssue, ...]:
+    if cycle <= 1:
+        return ()
+    return tuple(
+        issue
+        for stored in ReviewRepository(session).list_for_run(run.id)
+        if stored.cycle < cycle
+        for issue in stored.issues
+        if not issue.resolved
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveredDispute:
+    review: Review
+    outcome: ReviewOutcome
+    repeated: tuple[ReviewIssue, ...]
+    resolved: tuple[UUID, ...]
+
+
+def _recovered_repeated_blocking_dispute(
+    session: Session, run: TaskRun, task: Task
+) -> _RecoveredDispute | None:
+    reviews = ReviewRepository(session).list_for_run(run.id)
+    if len(reviews) < 2:
+        return None
+    latest = reviews[-1]
+    if (
+        latest.decision is not ReviewDecision.CHANGES_REQUESTED
+        or latest.cycle >= task.limits.max_review_cycles
+    ):
+        return None
+
+    earlier = tuple(
+        issue
+        for stored in reviews[:-1]
+        for issue in stored.issues
+        if not issue.resolved
+    )
+    if not earlier:
+        return None
+
+    resolved = _close_unreraised_review_issues(
+        session, run, task, latest, earlier=earlier
+    )
+    resolved_ids = set(resolved)
+    still_open = tuple(
+        issue for issue in earlier if issue.id is None or issue.id not in resolved_ids
+    )
+    repeated = reraised_unresolved_blocking_issues(still_open, latest.issues)
+    if not repeated:
+        return None
+
+    result = review_result_for(latest)
+    base = ReviewOutcome(
+        task_run_id=run.id,
+        external_task_id=task.external_task_id,
+        cycle=latest.cycle,
+        package=None,  # type: ignore[arg-type]
+        result=result,
+        review=latest,
+        routing=ReviewRouting(
+            decision=ReviewDecision.CHANGES_REQUESTED,
+            reviewer_decision=result.decision,
+            task_status=TaskStatus.CHANGES_REQUESTED,
+            failure_reason=FailureReason.REVIEW_CHANGES_REQUESTED,
+            blocking_issues=result.blocking_issues,
+            feedback=render_review_feedback(result),
+        ),
+    )
+    return _RecoveredDispute(
+        review=latest,
+        outcome=_escalate_repeated_blocking_dispute(base, repeated),
+        repeated=tuple(repeated),
+        resolved=resolved,
+    )
+
+
+def _escalate_repeated_blocking_dispute(
+    review: ReviewOutcome, repeated: Sequence[ReviewIssue]
+) -> ReviewOutcome:
+    reason = (
+        "a blocking review issue persisted across a coder repair cycle and "
+        "successful deterministic verification; human review is required to "
+        "resolve the repeated coder/reviewer disagreement"
+    )
+    routing = ReviewRouting(
+        decision=ReviewDecision.HUMAN_REVIEW_REQUIRED,
+        reviewer_decision=review.result.decision,
+        task_status=TaskStatus.HUMAN_REVIEW,
+        failure_reason=FailureReason.HUMAN_DECISION_REQUIRED,
+        blocking_issues=tuple(repeated),
+        human_review_reasons=(reason,),
+        feedback=review.routing.feedback,
+    )
+    return replace(review, routing=routing)
+
+
+def _close_unreraised_review_issues(
     session: Session,
     run: TaskRun,
     task: Task,
-    project: Project,
-    review: ReviewOutcome,
+    review: Review,
+    *,
+    earlier: Sequence[ReviewIssue],
 ) -> tuple[UUID, ...]:
-    """Mark earlier findings this review did not raise again (concern 27).
-
-    Every open finding from an earlier cycle was in this review's package, so a
-    reviewer that read the new diff and did not repeat one is the only witness
-    this system has that it was addressed. Nothing is closed on the first
-    cycle: there is nothing earlier to close.
-    """
-    if review.cycle <= 1:
-        return ()
+    closed = unreraised_issues(earlier, review.issues)
     reviews = ReviewRepository(session)
-    earlier: list[ReviewIssue] = [
-        issue
-        for stored in reviews.list_for_run(run.id)
-        if stored.cycle < review.cycle
-        for issue in stored.issues
-        if not issue.resolved
-    ]
-    closed = unreraised_issues(earlier, review.result.issues)
     for issue in closed:
         if issue.id is not None:
             reviews.mark_issue_resolved(issue.id)
@@ -901,6 +1037,46 @@ def _close_unreraised_issues(
             cycle=review.cycle,
             resolved=len(closed),
             still_open=len(earlier) - len(closed),
+        )
+    return tuple(issue.id for issue in closed if issue.id is not None)
+
+
+def _close_unreraised_issues(
+    session: Session,
+    run: TaskRun,
+    task: Task,
+    project: Project,
+    review: ReviewOutcome,
+    *,
+    earlier: Sequence[ReviewIssue] | None = None,
+) -> tuple[UUID, ...]:
+    """Mark earlier findings this review did not raise again (concern 27).
+
+    Every open finding from an earlier cycle was in this review's package, so a
+    reviewer that read the new diff and did not repeat one is the only witness
+    this system has that it was addressed. Nothing is closed on the first
+    cycle: there is nothing earlier to close.
+    """
+    earlier_issues = (
+        tuple(earlier)
+        if earlier is not None
+        else _open_earlier_review_issues(session, run, review.cycle)
+    )
+    if not earlier_issues:
+        return ()
+    reviews = ReviewRepository(session)
+    closed = unreraised_issues(earlier_issues, review.result.issues)
+    for issue in closed:
+        if issue.id is not None:
+            reviews.mark_issue_resolved(issue.id)
+    if closed:
+        logger.info(
+            "review_issues_resolved",
+            run_id=str(run.id),
+            task=task.external_task_id,
+            cycle=review.cycle,
+            resolved=len(closed),
+            still_open=len(earlier_issues) - len(closed),
         )
     return tuple(issue.id for issue in closed if issue.id is not None)
 
@@ -1173,6 +1349,13 @@ def _escalate(
             f"It stopped because runtime, not retries, was exhausted; "
             f"{attempts} coding attempt(s) started and {cycles_used} review cycle(s) completed."
         )
+    elif (
+        reason is FailureReason.HUMAN_DECISION_REQUIRED
+        and last is not None
+        and last.review is not None
+        and last.review.routing.human_review_reasons
+    ):
+        reason_text = " ".join(last.review.routing.human_review_reasons)
     else:
         reason_text = "The run reached a decision the orchestrator may not take."
     summary = render_run_escalation(
@@ -1250,6 +1433,8 @@ def _blocker(iteration: FixIteration | None) -> str:
                 f"(exit {step.exit_code if step.exit_code is not None else 'n/a'})"
             )
     if iteration.review is not None:
+        if iteration.review.routing.needs_human and iteration.review.routing.human_review_reasons:
+            return _one_line("; ".join(iteration.review.routing.human_review_reasons))
         blocking = iteration.review.result.blocking_issues
         if blocking:
             return _one_line(blocking[0].problem)

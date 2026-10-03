@@ -634,6 +634,27 @@ def unreraised_issues(
         and (issue.requirement_id or "").strip().casefold() not in requirements
     )
 
+
+def reraised_unresolved_blocking_issues(
+    earlier: Sequence[ReviewIssue], current: Sequence[ReviewIssue]
+) -> tuple[ReviewIssue, ...]:
+    """Still-open blocking findings this review raised again.
+
+    This is the sibling of ``unreraised_issues`` for the dispute safeguard:
+    after a coder has had a repair cycle and deterministic verification has
+    passed, the same still-open blocking finding appearing again is evidence
+    of a repeated unresolved disagreement, not a signal to keep bouncing the
+    same issue through the coder. Identity is exactly ``issue_fingerprint``;
+    no prose matching or semantic comparison is introduced here.
+    """
+    current_blocking = {issue_fingerprint(issue) for issue in current if issue.is_blocking}
+    return tuple(
+        issue
+        for issue in earlier
+        if issue.is_blocking and issue_fingerprint(issue) in current_blocking
+    )
+
+
 def render_escalation(
     *,
     external_task_id: str,
@@ -933,6 +954,7 @@ __all__ = [
     "render_escalation",
     "render_review_feedback",
     "render_unresolved_issues",
+    "reraised_unresolved_blocking_issues",
     "route_review",
     "unreraised_issues",
 ]

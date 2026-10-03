@@ -11,7 +11,11 @@ from __future__ import annotations
 
 from apps.orchestrator.domain.enums import IssueCategory, IssueSeverity
 from apps.orchestrator.domain.models import ReviewIssue
-from apps.orchestrator.domain.review import issue_fingerprint, unreraised_issues
+from apps.orchestrator.domain.review import (
+    issue_fingerprint,
+    reraised_unresolved_blocking_issues,
+    unreraised_issues,
+)
 
 
 def issue(**overrides) -> ReviewIssue:
@@ -108,3 +112,44 @@ def test_the_fingerprint_is_case_insensitive_about_paths_and_requirements():
     assert issue_fingerprint(issue(requirement_id=" ts-004-r7 ")) == issue_fingerprint(
         issue(requirement_id="TS-004-R7")
     )
+
+
+def test_a_reraised_unresolved_blocking_finding_is_identified():
+    earlier = [issue()]
+    again = [issue(problem="The selection is still dropped on open.", line=9)]
+
+    assert reraised_unresolved_blocking_issues(earlier, again) == tuple(earlier)
+
+
+def test_a_genuinely_different_blocking_finding_is_not_a_reraised_dispute():
+    earlier = [issue()]
+    different = [
+        issue(
+            requirement_id="TS-004-R8",
+            file="src/tree.ts",
+            problem="The tree is not refreshed.",
+        )
+    ]
+
+    assert reraised_unresolved_blocking_issues(earlier, different) == ()
+
+
+def test_a_shared_requirement_with_a_different_fingerprint_is_not_a_dispute():
+    earlier = [issue(requirement_id="TS-004-R7", file="src/navigation.ts")]
+    moved = [issue(requirement_id="TS-004-R7", file="src/provider.ts")]
+
+    assert reraised_unresolved_blocking_issues(earlier, moved) == ()
+
+
+def test_a_disappeared_finding_is_not_a_reraised_dispute():
+    earlier = [issue()]
+
+    assert reraised_unresolved_blocking_issues(earlier, []) == ()
+
+
+def test_reraised_low_or_info_findings_do_not_trigger_blocking_dispute():
+    low = issue(severity=IssueSeverity.LOW)
+    info = issue(severity=IssueSeverity.INFO, requirement_id="TS-004-R8")
+
+    assert reraised_unresolved_blocking_issues([low], [low]) == ()
+    assert reraised_unresolved_blocking_issues([info], [info]) == ()

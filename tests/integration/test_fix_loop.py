@@ -43,14 +43,24 @@ from apps.orchestrator.domain.enums import (
     Complexity,
     EscalationStatus,
     FailureReason,
+    IssueCategory,
+    IssueSeverity,
     ModelPurpose,
     ModelRole,
+    ReviewDecision,
     RunEventType,
     RunStatus,
     TaskStatus,
     WorkerProfile,
 )
-from apps.orchestrator.domain.models import Project, Task, TaskLimits, TaskRun
+from apps.orchestrator.domain.models import (
+    Project,
+    Review,
+    ReviewIssue,
+    Task,
+    TaskLimits,
+    TaskRun,
+)
 from apps.orchestrator.domain.verification import VerificationProfile
 from apps.orchestrator.providers import (
     ConnectionReport,
@@ -796,15 +806,203 @@ async def test_repeated_identical_findings_escalate_before_spending_the_full_bud
     )
 
     assert result.outcome is LoopOutcome.ESCALATED
-    assert result.failure_reason is FailureReason.RETRY_EXHAUSTED
+    assert result.failure_reason is FailureReason.HUMAN_DECISION_REQUIRED
     assert result.cycles_used == 2 < task.limits.max_review_cycles
     assert _status(session, task) is TaskStatus.HUMAN_REVIEW
     assert len(coder.answers) == 1
+    assert result.iterations[1].review.routing.needs_human
+    assert result.iterations[1].review.routing.failure_reason is (
+        FailureReason.HUMAN_DECISION_REQUIRED
+    )
+    assert "blocking review issue persisted" in (
+        result.iterations[1].review.routing.human_review_reasons[0]
+    )
 
     (escalation,) = EscalationRepository(session).list_open(task_id=task.id)
-    assert "2 of the task's 3 permitted attempts" in escalation.summary
-    assert "A null target is returned instead of being rejected." in escalation.summary
+    assert "blocking review issue persisted" in escalation.summary
     assert result.escalation.id == escalation.id
+
+
+@pytest.mark.asyncio
+async def test_recovered_repeated_review_dispute_takes_the_same_route(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    run: TaskRun,
+    loop_settings: Settings,
+):
+    issue = ReviewIssue(
+        severity=IssueSeverity.HIGH,
+        category=IssueCategory.REQUIREMENT,
+        file="src/nav.py",
+        line=2,
+        requirement_id="TS-004-R2",
+        problem="A null target is returned instead of being rejected.",
+        required_fix="Raise when target is None.",
+    )
+    reviews = ReviewRepository(session)
+    reviews.add(
+        Review(
+            task_run_id=run.id,
+            reviewer_provider="scripted-reviewer",
+            reviewer_model="reviewer-test",
+            decision=ReviewDecision.CHANGES_REQUESTED,
+            summary="A null target is still accepted.",
+            confidence=0.9,
+            cycle=1,
+            issues=[issue],
+        )
+    )
+    reviews.add(
+        Review(
+            task_run_id=run.id,
+            reviewer_provider="scripted-reviewer",
+            reviewer_model="reviewer-test",
+            decision=ReviewDecision.CHANGES_REQUESTED,
+            summary="A null target is still accepted.",
+            confidence=0.9,
+            cycle=2,
+            issues=[
+                ReviewIssue(
+                    severity=IssueSeverity.HIGH,
+                    category=IssueCategory.REQUIREMENT,
+                    file="src/nav.py",
+                    line=4,
+                    requirement_id="TS-004-R2",
+                    problem="The guard is still missing.",
+                    required_fix="Raise when target is None.",
+                )
+            ],
+        )
+    )
+    TaskRunRepository(session).update_fields(run.id, attempt_number=3, review_cycle=2)
+
+    coder = ScriptedModel(_code(REVIEWED))
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=coder,
+        reviewer=reviewer(_review(summary="Should not be called.")),
+        settings=loop_settings,
+    )
+
+    assert result.outcome is LoopOutcome.ESCALATED
+    assert result.failure_reason is FailureReason.HUMAN_DECISION_REQUIRED
+    assert result.cycles_used == 2
+    assert len(coder.answers) == 1
+    assert _status(session, task) is TaskStatus.HUMAN_REVIEW
+    assert result.iterations[0].review.routing.needs_human
+    assert "blocking review issue persisted" in (
+        result.iterations[0].review.routing.human_review_reasons[0]
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_different_second_review_issue_uses_normal_review_behavior(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    run: TaskRun,
+    loop_settings: Settings,
+):
+    coder = ScriptedModel(_code(WORKING), _code(REVIEWED), _code(REVIEWED))
+
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=coder,
+        reviewer=reviewer(
+            _review(
+                decision="CHANGES_REQUESTED",
+                summary="A null target is still accepted.",
+                issues=[_MISSING_GUARD],
+            ),
+            _review(
+                decision="CHANGES_REQUESTED",
+                summary="The guard is untested.",
+                issues=[_UNTESTED],
+            ),
+            _review(summary="Guarded and tested."),
+        ),
+        settings=loop_settings,
+    )
+
+    assert result.outcome is LoopOutcome.APPROVED
+    assert result.iterations[1].failure_reason is FailureReason.REVIEW_CHANGES_REQUESTED
+    assert result.iterations[1].review.routing.needs_fix
+    assert len(coder.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_issue_is_resolved_without_dispute_escalation(
+    session: Session,
+    workspace: TaskWorkspace,
+    run: TaskRun,
+    loop_settings: Settings,
+):
+    coder = ScriptedModel(_code(WORKING), _code(REVIEWED))
+
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=coder,
+        reviewer=reviewer(
+            _review(
+                decision="CHANGES_REQUESTED",
+                summary="A null target is still accepted.",
+                issues=[_MISSING_GUARD],
+            ),
+            _review(summary="The guard rejects a null target."),
+        ),
+        settings=loop_settings,
+    )
+
+    assert result.outcome is LoopOutcome.APPROVED
+    assert result.iterations[1].resolved_issues
+    assert not result.iterations[1].review.routing.needs_human
+    (stored_review,) = ReviewRepository(session).list_for_run(run.id)[:1]
+    assert stored_review.issues[0].resolved
+
+
+@pytest.mark.asyncio
+async def test_a_reraised_low_or_info_issue_does_not_trigger_dispute_escalation(
+    session: Session,
+    workspace: TaskWorkspace,
+    loop_settings: Settings,
+):
+    low_issue = {**_MISSING_GUARD, "severity": "LOW"}
+    info_issue = {**_MISSING_GUARD, "severity": "INFO"}
+    coder = ScriptedModel(_code(WORKING), _code(REVIEWED), _code(REVIEWED))
+
+    result = await run_fix_loop(
+        session,
+        workspace,
+        coder=coder,
+        reviewer=reviewer(
+            _review(
+                decision="CHANGES_REQUESTED",
+                summary="A low-severity issue remains.",
+                issues=[low_issue],
+            ),
+            _review(
+                decision="CHANGES_REQUESTED",
+                summary="An informational issue remains.",
+                issues=[info_issue],
+            ),
+            _review(summary="No remaining observations."),
+        ),
+        settings=loop_settings,
+    )
+
+    assert result.outcome is LoopOutcome.APPROVED
+    assert result.iterations[0].review.routing.needs_fix
+    assert result.iterations[1].review.routing.needs_fix
+    assert all(
+        "blocking review issue persisted" not in reason
+        for iteration in result.iterations
+        if iteration.review is not None
+        for reason in iteration.review.routing.human_review_reasons
+    )
 
 
 @pytest.mark.asyncio
@@ -1007,9 +1205,12 @@ async def test_a_finding_the_next_review_dropped_is_marked_resolved(
     run: TaskRun,
     loop_settings: Settings,
 ):
-    """Concern 27. The first review raises two findings, the second re-raises
-    one: the one it let go is closed, so the third cycle's reviewer is not shown
-    a finding it can see was fixed."""
+    """Concern 27 plus the repeated-dispute safeguard.
+
+    The first review raises two findings. The second drops one, so that issue
+    is still closed by reconciliation; it re-raises the other, so the task now
+    escalates instead of spending a third coder cycle on the same dispute.
+    """
     coder = ScriptedModel(_code(WORKING), _code(REVIEWED), _code(REVIEWED))
 
     result = await run_fix_loop(
@@ -1032,9 +1233,11 @@ async def test_a_finding_the_next_review_dropped_is_marked_resolved(
         settings=loop_settings,
     )
 
-    assert result.outcome is LoopOutcome.APPROVED
+    assert result.outcome is LoopOutcome.ESCALATED
+    assert result.failure_reason is FailureReason.HUMAN_DECISION_REQUIRED
+    assert len(coder.answers) == 1
     reviews = ReviewRepository(session).list_for_run(run.id)
-    assert [review.cycle for review in reviews] == [1, 2, 3]
+    assert [review.cycle for review in reviews] == [1, 2]
 
     first_cycle = {issue.requirement_id: issue for issue in reviews[0].issues}
     second_cycle = {issue.requirement_id: issue for issue in reviews[1].issues}
@@ -1046,16 +1249,12 @@ async def test_a_finding_the_next_review_dropped_is_marked_resolved(
     assert guard.resolved
     assert result.iterations[1].resolved_issues == (guard.id,)
 
-    # The approval that followed closed what was still open: the test finding as
-    # the first cycle raised it, and again as the second re-raised it. Nothing
-    # was closed because an attempt was made; each was closed by a reviewer that
-    # had it in front of it and did not raise it.
-    assert first_cycle["TS-004-R9"].resolved
-    assert second_cycle["TS-004-R9"].resolved
-    assert set(result.iterations[2].resolved_issues) == {
-        first_cycle["TS-004-R9"].id,
-        second_cycle["TS-004-R9"].id,
-    }
+    assert not first_cycle["TS-004-R9"].resolved
+    assert not second_cycle["TS-004-R9"].resolved
+    assert result.iterations[1].review.routing.needs_human
+    assert "blocking review issue persisted" in (
+        result.iterations[1].review.routing.human_review_reasons[0]
+    )
 
 
 @pytest.mark.asyncio
