@@ -294,7 +294,13 @@ async def run_coding_attempt(
     request = ModelRequest(
         system_instructions=CODER_SYSTEM_PROMPT,
         task_instructions=render_coding_instructions(
-            task, plan, path_output_limits=path_output_limits
+            task,
+            plan,
+            path_output_limits=path_output_limits,
+            # A correction attempt is served the repair paragraph of the
+            # bounded-verification contract: the findings it was handed are
+            # the subject, and certifying the project is still not its job.
+            is_fix_attempt=review_feedback is not None,
         ),
         context=built.text,
         review_feedback=review_feedback,

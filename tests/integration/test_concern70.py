@@ -989,8 +989,18 @@ def test_the_schema_advertises_the_targeted_operation():
 
 
 def test_the_edit_schema_version_records_the_contract_change():
+    """The schema version is concern 70's; the prompt version is not.
+
+    The edit schema has not changed since concern 70 introduced ``replace``,
+    so ``code-edits/3`` is still the contract this concern added. The coder
+    prompt has moved on twice since: ``coder-prompt/4`` preferred whole-file
+    updates for complete writable files, and ``coder-prompt/5`` bounded the
+    coder's own verification. Both are real contract changes, so what this
+    test pins is that the two versions move independently -- the schema stays
+    where concern 70 left it while the prompt is free to advance.
+    """
     assert EDIT_SCHEMA_VERSION == "code-edits/3"
-    assert CODER_PROMPT_VERSION == "coder-prompt/3"
+    assert CODER_PROMPT_VERSION == "coder-prompt/5"
 
 
 # ===========================================================================

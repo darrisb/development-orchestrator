@@ -524,7 +524,10 @@ async def test_the_coder_is_sent_the_task_the_context_and_the_approved_plan(
     assert "Task: TS-004" in prompt  # the task specification, from the context
     assert "src/widgets/tree.ts" in prompt  # the declared file it may read
     assert "Approved plan" in prompt
-    assert "never run commands" in prompt  # the system rules
+    # The system rules. Concern 78 stage 1 replaced the flat "never run
+    # commands" with the bounded-verification contract, so what is asserted
+    # here is that the shared rules reached the coder at all.
+    assert "never install packages, manage dependencies, or touch Git" in prompt
     assert "API_TOKEN" not in prompt  # .env is not context
 
 
