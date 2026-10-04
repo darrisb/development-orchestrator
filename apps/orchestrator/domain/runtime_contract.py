@@ -61,6 +61,7 @@ MAX_EVIDENCE_CHARS = 2_000
 
 _RUNTIME_KEYS: frozenset[str] = frozenset(
     {
+        "dependencies",
         "start",
         "readiness_url",
         "readiness_timeout_seconds",
@@ -71,7 +72,11 @@ _RUNTIME_KEYS: frozenset[str] = frozenset(
         "env",
     }
 )
+_DEPENDENCY_KEYS: frozenset[str] = frozenset(
+    {"name", "start", "readiness_url", "readiness_timeout_seconds", "env"}
+)
 _EXPECT_REQUEST_KEYS: frozenset[str] = frozenset({"url_pattern", "status", "content_type"})
+_DEPENDENCY_NAME = re.compile(r"\A[a-zA-Z][a-zA-Z0-9_.-]{0,63}\Z")
 
 #: Environment names a contract may set. Deliberately conservative: the
 #: contract is project-controlled, but it must not be a way to rewrite the
@@ -111,6 +116,26 @@ class ExpectedRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeDependency:
+    """One supporting process the runtime contract needs before the app starts."""
+
+    name: str
+    start: str
+    readiness_url: str
+    readiness_timeout_seconds: int = DEFAULT_READINESS_TIMEOUT_SECONDS
+    env: Mapping[str, str] = field(default_factory=dict)
+
+    def describe(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "start": self.start,
+            "readiness_url": self.readiness_url,
+            "readiness_timeout_seconds": self.readiness_timeout_seconds,
+            "env": dict(self.env),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeContract:
     """What a project declares about its running self (V1).
 
@@ -126,6 +151,7 @@ class RuntimeContract:
     expect_text: str | None = None
     forbid_console_errors: bool = False
     env: Mapping[str, str] = field(default_factory=dict)
+    dependencies: tuple[RuntimeDependency, ...] = ()
 
     @property
     def opens_a_browser(self) -> bool:
@@ -146,6 +172,7 @@ class RuntimeContract:
 
     def describe(self) -> dict[str, object]:
         return {
+            "dependencies": [entry.describe() for entry in self.dependencies],
             "start": self.start,
             "readiness_url": self.readiness_url,
             "readiness_timeout_seconds": self.readiness_timeout_seconds,
@@ -210,6 +237,7 @@ def parse_runtime_contract(
         )
 
     return RuntimeContract(
+        dependencies=_parse_dependencies(payload.get("dependencies"), where),
         start=_required_text(payload.get("start"), f"{where}.start"),
         readiness_url=_required_url(payload.get("readiness_url"), f"{where}.readiness_url"),
         readiness_timeout_seconds=(
@@ -222,6 +250,48 @@ def parse_runtime_contract(
         expect_text=expect_text,
         forbid_console_errors=forbid,
         env=_parse_env(payload.get("env"), f"{where}.env"),
+    )
+
+
+def _parse_dependencies(value: object, where: str) -> tuple[RuntimeDependency, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        raise RuntimeContractError(f"{where}.dependencies must be a list")
+    dependencies: list[RuntimeDependency] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(value):
+        dependency = _parse_dependency(entry, f"{where}.dependencies[{index}]")
+        if dependency.name in seen:
+            raise RuntimeContractError(
+                f"{where}.dependencies[{index}].name duplicates {dependency.name!r}"
+            )
+        seen.add(dependency.name)
+        dependencies.append(dependency)
+    return tuple(dependencies)
+
+
+def _parse_dependency(value: object, where: str) -> RuntimeDependency:
+    if not isinstance(value, Mapping):
+        raise RuntimeContractError(f"{where} must be a mapping")
+    _reject_unknown(value, _DEPENDENCY_KEYS, where)
+    timeout = value.get("readiness_timeout_seconds")
+    name = _required_text(value.get("name"), f"{where}.name")
+    if not _DEPENDENCY_NAME.match(name):
+        raise RuntimeContractError(
+            f"{where}.name must start with a letter and contain only letters, "
+            "digits, dots, underscores or dashes"
+        )
+    return RuntimeDependency(
+        name=name,
+        start=_required_text(value.get("start"), f"{where}.start"),
+        readiness_url=_required_url(value.get("readiness_url"), f"{where}.readiness_url"),
+        readiness_timeout_seconds=(
+            DEFAULT_READINESS_TIMEOUT_SECONDS
+            if timeout is None
+            else _parse_timeout(timeout, f"{where}.readiness_timeout_seconds")
+        ),
+        env=_parse_env(value.get("env"), f"{where}.env"),
     )
 
 
@@ -661,6 +731,7 @@ __all__ = [
     "AssertionFailure",
     "ExpectedRequest",
     "ObservedResponse",
+    "RuntimeDependency",
     "RuntimeContract",
     "RuntimeContractError",
     "RuntimeObservation",

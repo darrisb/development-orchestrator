@@ -415,6 +415,46 @@ def test_a_runtime_contract_alone_is_enough_to_start_and_check_the_application(
     assert not _survivor(pid_file)
 
 
+def test_runtime_dependencies_start_before_the_application_and_are_cleaned_up(
+    session: Session, runtime_case, tmp_path: Path, verification_settings: Settings
+):
+    dependency_pid = tmp_path / "dependency.pid"
+    application_pid = tmp_path / "application.pid"
+    workspace, _, _ = runtime_case(
+        parse_runtime_contract(
+            {
+                "dependencies": [
+                    {
+                        "name": "fixture-api",
+                        "start": f"{PYTHON} tools/server.py {dependency_pid}",
+                        "readiness_url": "http://127.0.0.1:8000/health",
+                        "readiness_timeout_seconds": 5,
+                        "env": {"PORT": "8000"},
+                    }
+                ],
+                "start": f"{PYTHON} tools/server.py {application_pid}",
+                "readiness_url": "http://127.0.0.1:7391/",
+                "readiness_timeout_seconds": 5,
+            }
+        )
+    )
+    probe = FakeProbe()
+
+    report = verify_candidate(
+        session, workspace, settings=verification_settings, runtime_probe=probe
+    )
+
+    step = report.step_for(VerificationType.RUNTIME)
+    assert step.passed
+    assert step.evidence["dependencies"][0]["name"] == "fixture-api"
+    assert step.evidence["dependencies"][0]["readiness"]["ready"] is True
+    assert step.evidence["application_state"] == "running"
+    assert dependency_pid.exists()
+    assert application_pid.exists()
+    assert not _survivor(dependency_pid)
+    assert not _survivor(application_pid)
+
+
 # --- candidate failures ------------------------------------------------------
 
 
@@ -492,6 +532,44 @@ def test_a_readiness_timeout_is_a_bounded_failure_with_the_last_error(
     assert "ECONNREFUSED" in step.evidence["readiness"]["last_error"]
     assert probe.polls >= 1
     assert not _survivor(pid_file)
+
+
+def test_a_dependency_readiness_failure_is_a_candidate_runtime_failure(
+    session: Session, runtime_case, tmp_path: Path, verification_settings: Settings
+):
+    dependency_pid = tmp_path / "dependency.pid"
+    application_pid = tmp_path / "application.pid"
+    workspace, _, _ = runtime_case(
+        parse_runtime_contract(
+            {
+                "dependencies": [
+                    {
+                        "name": "fixture-api",
+                        "start": f"{PYTHON} tools/server.py {dependency_pid}",
+                        "readiness_url": "http://127.0.0.1:8000/health",
+                        "readiness_timeout_seconds": 1,
+                    }
+                ],
+                "start": f"{PYTHON} tools/server.py {application_pid}",
+                "readiness_url": "http://127.0.0.1:7391/",
+                "readiness_timeout_seconds": 5,
+            }
+        )
+    )
+    probe = FakeProbe(never_ready=True)
+
+    report = verify_candidate(
+        session, workspace, settings=verification_settings, runtime_probe=probe
+    )
+
+    step = report.step_for(VerificationType.RUNTIME)
+    assert step.status is VerificationStatus.FAILED
+    assert report.failure_reason is FailureReason.TEST_FAILED
+    assert "dependency 'fixture-api' did not answer" in step.detail
+    assert step.evidence["dependencies"][0]["readiness"]["ready"] is False
+    assert dependency_pid.exists()
+    assert not application_pid.exists()
+    assert not _survivor(dependency_pid)
 
 
 # --- infrastructure failures -------------------------------------------------

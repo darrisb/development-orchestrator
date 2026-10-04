@@ -231,6 +231,37 @@ def test_a_second_background_process_is_refused_while_one_is_alive(
         assert worker.background is first
 
 
+def test_named_background_processes_can_coexist(worktree: Path, settings: Settings):
+    with worker_session(
+        worktree, profile=WorkerProfile.PYTHON, settings=settings
+    ) as worker:
+        first = worker.start_background(f"{PYTHON} server.py", name="dependency-fixture")
+        second = worker.start_background(f"{PYTHON} server.py")
+
+        assert first.is_running()
+        assert second.is_running()
+        assert worker.background is second
+        assert worker.run(f"{PYTHON} verify.py").succeeded
+
+        worker.terminate_background(name="dependency-fixture")
+
+        assert not _alive(first._process.pid)
+        assert second.is_running()
+
+
+def test_worker_close_kills_every_named_background_process(
+    worktree: Path, settings: Settings
+):
+    worker = start_worker(worktree, profile=WorkerProfile.PYTHON, settings=settings)
+    first = worker.start_background(f"{PYTHON} server.py", name="dependency-fixture")
+    second = worker.start_background(f"{PYTHON} server.py")
+    pids = [first._process.pid, second._process.pid]
+
+    worker.close()
+
+    assert all(not _alive(pid) for pid in pids)
+
+
 def test_a_finished_process_does_not_block_the_next_one(worktree: Path, settings: Settings):
     with worker_session(
         worktree, profile=WorkerProfile.PYTHON, settings=settings

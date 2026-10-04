@@ -23,6 +23,7 @@ from apps.orchestrator.domain.runtime_contract import (
     ObservedResponse,
     RuntimeContract,
     RuntimeContractError,
+    RuntimeDependency,
     RuntimeObservation,
     content_type_matches,
     evaluate,
@@ -118,6 +119,34 @@ def test_the_minimum_contract_is_a_command_and_a_readiness_url():
     assert not contract.opens_a_browser
 
 
+def test_a_runtime_contract_may_declare_dependencies():
+    contract = parse_runtime_contract(
+        {
+            "dependencies": [
+                {
+                    "name": "fixture-api",
+                    "start": "python3 tools/api.py",
+                    "readiness_url": "http://127.0.0.1:8000/health",
+                    "readiness_timeout_seconds": 30,
+                    "env": {"PORT": "8000"},
+                }
+            ],
+            "start": "npm start",
+            "readiness_url": "http://127.0.0.1:4200/",
+        }
+    )
+
+    assert contract.dependencies == (
+        RuntimeDependency(
+            name="fixture-api",
+            start="python3 tools/api.py",
+            readiness_url="http://127.0.0.1:8000/health",
+            readiness_timeout_seconds=30,
+            env={"PORT": "8000"},
+        ),
+    )
+
+
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
@@ -143,6 +172,88 @@ def test_the_minimum_contract_is_a_command_and_a_readiness_url():
 def test_an_unusable_contract_is_refused_with_the_key_that_is_wrong(payload, expected):
     with pytest.raises(RuntimeContractError, match=expected):
         parse_runtime_contract(payload)
+
+
+@pytest.mark.parametrize(
+    ("dependency", "expected"),
+    [
+        ({"start": "python3 tools/api.py", "readiness_url": "http://x/"}, "name"),
+        ({"name": "fixture-api", "readiness_url": "http://x/"}, "start"),
+        ({"name": "fixture-api", "start": "python3 tools/api.py"}, "readiness_url"),
+        (
+            {
+                "name": "fixture-api",
+                "start": "python3 tools/api.py",
+                "readiness_url": "http://x/",
+                "oops": 1,
+            },
+            "oops",
+        ),
+        (
+            {"name": "bad name", "start": "python3 tools/api.py", "readiness_url": "http://x/"},
+            "name",
+        ),
+        (
+            {"name": "fixture-api", "start": " ", "readiness_url": "http://x/"},
+            "start",
+        ),
+        (
+            {"name": "fixture-api", "start": "python3 tools/api.py", "readiness_url": "ftp://x/"},
+            "absolute URL",
+        ),
+        (
+            {
+                "name": "fixture-api",
+                "start": "python3 tools/api.py",
+                "readiness_url": "http://x/",
+                "readiness_timeout_seconds": 0,
+            },
+            "readiness_timeout_seconds",
+        ),
+        (
+            {
+                "name": "fixture-api",
+                "start": "python3 tools/api.py",
+                "readiness_url": "http://x/",
+                "env": {"API_TOKEN": "secret"},
+            },
+            "API_TOKEN",
+        ),
+    ],
+)
+def test_an_unusable_dependency_is_refused_with_the_key_that_is_wrong(
+    dependency, expected
+):
+    with pytest.raises(RuntimeContractError, match=expected):
+        parse_runtime_contract(
+            {
+                "dependencies": [dependency],
+                "start": "npm start",
+                "readiness_url": "http://x/",
+            }
+        )
+
+
+def test_duplicate_dependency_names_are_refused():
+    with pytest.raises(RuntimeContractError, match="duplicates"):
+        parse_runtime_contract(
+            {
+                "dependencies": [
+                    {
+                        "name": "fixture-api",
+                        "start": "python3 tools/api.py",
+                        "readiness_url": "http://x/",
+                    },
+                    {
+                        "name": "fixture-api",
+                        "start": "python3 tools/other.py",
+                        "readiness_url": "http://x/other",
+                    },
+                ],
+                "start": "npm start",
+                "readiness_url": "http://x/app",
+            }
+        )
 
 
 @pytest.mark.parametrize("timeout", [0, -1, MAX_READINESS_TIMEOUT_SECONDS + 1, "90", 1.5, True])

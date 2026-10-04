@@ -59,6 +59,7 @@ from ..domain.runtime_contract import (
     MAX_EVIDENCE_REQUESTS,
     AssertionFailure,
     RuntimeContract,
+    RuntimeDependency,
     RuntimeObservation,
     evaluate,
 )
@@ -230,20 +231,46 @@ def verify_runtime(
         # a project putting a value somewhere it should not be, and the
         # orchestrator's own report is not the place that choice gets copied
         # to. Names are what diagnose a misconfiguration anyway.
-        "contract": {**contract.describe(), "env": sorted(contract.env)},
+        "contract": _contract_evidence(contract),
         "application_command": contract.start,
         "readiness_url": contract.readiness_url,
     }
     probe_dir = worktree / PROBE_DIRECTORY
     application: BackgroundProcess | None = None
+    dependencies: list[BackgroundProcess] = []
     transcript: list[str] = []
 
     try:
         runner = probe or _install_probe(worker, worktree, contract)
+        dependency_evidence: list[dict[str, object]] = []
+        evidence["dependencies"] = dependency_evidence
+        for dependency in contract.dependencies:
+            process = _start_dependency(worker, dependency)
+            dependencies.append(process)
+            entry: dict[str, object] = {
+                "name": dependency.name,
+                "command": dependency.start,
+                "readiness_url": dependency.readiness_url,
+                "state": process.state.value,
+            }
+            dependency_evidence.append(entry)
+            readiness = _await_dependency_readiness(
+                runner,
+                process,
+                dependency,
+                started=started,
+                deadline_monotonic=deadline_monotonic,
+                evidence=evidence,
+                dependency_evidence=entry,
+                transcript=transcript,
+            )
+            if readiness is not None:
+                return readiness
+
         application = _start_application(worker, contract)
         evidence["application_state"] = application.state.value
 
-        readiness = _await_readiness(
+        readiness = _await_application_readiness(
             runner,
             application,
             contract,
@@ -287,6 +314,8 @@ def verify_runtime(
         evidence["infrastructure_error"] = str(error)
         if application is not None:
             transcript.append(_application_evidence(application))
+        for dependency, process in zip(contract.dependencies, dependencies, strict=False):
+            transcript.append(_dependency_evidence(dependency.name, process))
         return _error(str(error), started, evidence, transcript)
     except (
         CommandRejected,
@@ -318,7 +347,16 @@ def _start_application(worker: Worker, contract: RuntimeContract) -> BackgroundP
     return worker.start_background(contract.start, environment=dict(contract.env))
 
 
-def _await_readiness(
+def _start_dependency(worker: Worker, dependency: RuntimeDependency) -> BackgroundProcess:
+    """Start one declared supporting process in the worker's network namespace."""
+    return worker.start_background(
+        dependency.start,
+        environment=dict(dependency.env),
+        name=f"dependency-{dependency.name}",
+    )
+
+
+def _await_application_readiness(
     runner: RuntimeProbe,
     application: BackgroundProcess,
     contract: RuntimeContract,
@@ -392,6 +430,74 @@ def _await_readiness(
     )
 
 
+def _await_dependency_readiness(
+    runner: RuntimeProbe,
+    dependency: BackgroundProcess,
+    contract: RuntimeDependency,
+    *,
+    started: float,
+    deadline_monotonic: float | None,
+    evidence: dict[str, object],
+    dependency_evidence: dict[str, object],
+    transcript: list[str],
+) -> RuntimeOutcome | None:
+    budget = float(contract.readiness_timeout_seconds)
+    if deadline_monotonic is not None:
+        budget = min(budget, max(0.0, deadline_monotonic - monotonic()))
+    deadline = monotonic() + budget
+    attempts = 0
+    last = ReadinessPoll(ready=False, error="no readiness attempt was made")
+
+    while True:
+        if not dependency.is_running():
+            dependency_evidence["state"] = dependency.state.value
+            dependency_evidence["exit_code"] = dependency.exit_code
+            dependency_evidence["readiness"] = {"ready": False, "polls": attempts}
+            transcript.append(_dependency_evidence(contract.name, dependency))
+            return _failed(
+                f"dependency {contract.name!r} exited before it became ready "
+                f"(exit code {dependency.exit_code}); it was started with "
+                f"{contract.start!r}",
+                started,
+                evidence,
+                transcript=transcript,
+            )
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        attempts += 1
+        last = runner.poll_readiness(
+            contract.readiness_url,
+            budget_seconds=min(float(READINESS_CHUNK_SECONDS), remaining),
+        )
+        if last.ready:
+            dependency_evidence["readiness"] = {
+                "ready": True,
+                "status": last.status,
+                "polls": attempts,
+                "seconds": round(budget - max(0.0, deadline - monotonic()), 1),
+            }
+            dependency_evidence["state"] = dependency.state.value
+            return None
+
+    dependency_evidence["readiness"] = {
+        "ready": False,
+        "polls": attempts,
+        "timeout_seconds": contract.readiness_timeout_seconds,
+        "last_error": _clip(last.error),
+    }
+    dependency_evidence["state"] = dependency.state.value
+    transcript.append(_dependency_evidence(contract.name, dependency))
+    return _failed(
+        f"dependency {contract.name!r} did not answer {contract.readiness_url} within "
+        f"{contract.readiness_timeout_seconds}s"
+        + (f" (last attempt: {last.error})" if last.error else ""),
+        started,
+        evidence,
+        transcript=transcript,
+    )
+
+
 def _cleanup(worker: Worker, probe_dir: Path, evidence: dict[str, object]) -> None:
     """Stop the application and remove the probe. Runs however we got here.
 
@@ -403,7 +509,7 @@ def _cleanup(worker: Worker, probe_dir: Path, evidence: dict[str, object]) -> No
     silent pass.
     """
     try:
-        worker.terminate_background()
+        worker.terminate_backgrounds()
     except BackgroundProcessCleanupFailed as error:
         evidence["cleanup_error"] = str(error)
         logger.warning(
@@ -609,6 +715,24 @@ def _application_evidence(application: BackgroundProcess) -> str:
         f"state: {application.state.value}, exit code: {application.exit_code}\n"
         f"{application.output_tail(APPLICATION_OUTPUT_LINES)}"
     )
+
+
+def _dependency_evidence(name: str, dependency: BackgroundProcess) -> str:
+    return (
+        f"--- dependency {name} ({dependency.command.display}) ---\n"
+        f"state: {dependency.state.value}, exit code: {dependency.exit_code}\n"
+        f"{dependency.output_tail(APPLICATION_OUTPUT_LINES)}"
+    )
+
+
+def _contract_evidence(contract: RuntimeContract) -> dict[str, object]:
+    described = contract.describe()
+    described["env"] = sorted(contract.env)
+    described["dependencies"] = [
+        {**dependency.describe(), "env": sorted(dependency.env)}
+        for dependency in contract.dependencies
+    ]
+    return described
 
 
 def _passed(started: float, evidence: dict[str, object], transcript: list[str]) -> RuntimeOutcome:

@@ -490,6 +490,12 @@ class WorkerSpec:
         """The sibling container's name. Derived, so it is findable by hand."""
         return f"{self.worker_id}-bg"
 
+    def background_container_name_for(self, slot: str) -> str:
+        """The sibling container name for one managed background slot."""
+        if slot == "default":
+            return self.background_container_name
+        return f"{self.worker_id}-bg-{slot}"
+
     @property
     def runtime_description(self) -> str:
         """What actually ran the commands, for ``task_runs.worker_image``.
@@ -552,13 +558,13 @@ class Worker:
         self.docker_binary = docker_binary
         self.container_id: str | None = None
         self._closed = False
-        #: The one orchestrator-managed background process, if any (V1: at
-        #: most one per worker). Kept after it exits so its diagnostics stay
-        #: readable and so its remains are cleaned up on close.
-        self._background: BackgroundProcess | None = None
+        #: Orchestrator-managed background processes, keyed by caller-owned
+        #: slot. The legacy singular API uses the ``default`` slot.
+        self._backgrounds: dict[str, BackgroundProcess] = {}
         #: Whether this worker has ever had one. Only then is there a sibling
         #: container to sweep up on close.
         self._background_started = False
+        self._background_container_names: set[str] = set()
         #: Set when a command had to be killed. The process inside a container
         #: may survive a killed ``docker exec``, so a timed-out worker is
         #: destroyed rather than reused -- see ``run``.
@@ -592,11 +598,10 @@ class Worker:
         # this one would not take it with it. The handle's own cleanup has
         # already run; this is the backstop for the case where it could not.
         if self._background_started:
-            with contextlib.suppress(Exception):
-                self._docker_capture(
-                    "rm", "--force", "--volumes", self.spec.background_container_name,
-                    timeout=60,
-                )
+            names = self._background_container_names or {self.spec.background_container_name}
+            for name in names:
+                with contextlib.suppress(Exception):
+                    self._docker_capture("rm", "--force", "--volumes", name, timeout=60)
         if retain and not self._tainted:
             logger.warning(
                 "worker_retained", worker_id=self.spec.worker_id, container=self.container_id
@@ -731,13 +736,14 @@ class Worker:
     @property
     def background(self) -> BackgroundProcess | None:
         """The managed background process, running or finished, if any."""
-        return self._background
+        return self._backgrounds.get("default")
 
     def start_background(
         self,
         command: str | ApprovedCommand,
         *,
         environment: Mapping[str, str] | None = None,
+        name: str = "default",
     ) -> BackgroundProcess:
         """Start the worker's one managed long-running process.
 
@@ -788,16 +794,24 @@ class Worker:
         approved = (
             command if isinstance(command, ApprovedCommand) else self.policy.approve(command)
         )
-        if self._background is not None:
-            if self._background.is_running():
+        if not name or any(character.isspace() for character in name):
+            raise ValueError("background process name must be a non-empty token")
+        existing = self._backgrounds.get(name)
+        if existing is not None:
+            if existing.is_running():
+                limit = (
+                    "; a worker manages at most one background process in the default slot"
+                    if name == "default"
+                    else ""
+                )
                 raise BackgroundProcessAlreadyRunning(
                     f"Worker {self.spec.worker_id} already manages "
-                    f"{self._background.command.display!r}; a worker manages at most one "
-                    f"background process"
+                    f"{existing.command.display!r} as background process {name!r}"
+                    f"{limit}"
                 )
             # A finished one still holds resources (a stopped container, drain
             # threads). Clear them before taking on another.
-            self.terminate_background()
+            self.terminate_background(name=name)
 
         common = {
             "command": approved,
@@ -808,7 +822,7 @@ class Worker:
         }
         if self.spec.backend is WorkerBackend.DOCKER:
             process: BackgroundProcess = self._start_background_container(
-                approved, common, extra
+                approved, common, extra, name=name
             )
         elif self.spec.backend is WorkerBackend.SUBPROCESS:
             process = self._start_background_host(approved, common, extra)
@@ -817,7 +831,7 @@ class Worker:
                 f"the {self.spec.backend} backend does not support a managed background "
                 f"process; no process was started"
             )
-        self._background = process
+        self._backgrounds[name] = process
         self._background_started = True
         logger.info(
             "background_process_started",
@@ -827,7 +841,9 @@ class Worker:
         )
         return process
 
-    def terminate_background(self, *, grace_seconds: float | None = None) -> None:
+    def terminate_background(
+        self, *, grace_seconds: float | None = None, name: str = "default"
+    ) -> None:
         """Stop the managed background process, if there is one.
 
         Idempotent. Leaves the worker usable: nothing about the worker's own
@@ -837,7 +853,7 @@ class Worker:
             BackgroundProcessCleanupFailed: cleanup could not be proven. The
                 worker is tainted, so its container will be destroyed.
         """
-        process = self._background
+        process = self._backgrounds.get(name)
         if process is None:
             return
         try:
@@ -848,12 +864,24 @@ class Worker:
             self._tainted = True
             raise
         finally:
-            self._background = None
+            self._backgrounds.pop(name, None)
+
+    def terminate_backgrounds(self, *, grace_seconds: float | None = None) -> None:
+        """Stop every managed background process, newest first."""
+        first_error: BackgroundProcessCleanupFailed | None = None
+        for name in reversed(tuple(self._backgrounds)):
+            try:
+                self.terminate_background(grace_seconds=grace_seconds, name=name)
+            except BackgroundProcessCleanupFailed as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
     def _cleanup_background(self) -> None:
         """Terminate the background process on a path that must not raise."""
         try:
-            self.terminate_background()
+            self.terminate_backgrounds()
         except Exception as error:  # noqa: BLE001 - close() must not mask a failure
             logger.warning(
                 "background_process_cleanup_failed",
@@ -892,10 +920,12 @@ class Worker:
         approved: ApprovedCommand,
         common: dict[str, object],
         extra_environment: Mapping[str, str] | None = None,
+        *,
+        name: str = "default",
     ) -> BackgroundProcess:
         if self.container_id is None:
             raise WorkerNotRunning(f"Worker {self.spec.worker_id} has no container")
-        name = self.spec.background_container_name
+        container_name = self.spec.background_container_name_for(name)
         # Removed explicitly rather than with `--rm`, because the exit code and
         # the log of a process that died on its own are the evidence for why.
         argv: list[str] = [
@@ -903,7 +933,7 @@ class Worker:
             "--detach",
             "--init",
             "--name",
-            name,
+            container_name,
             "--workdir",
             CONTAINER_WORKDIR,
             "--volume",
@@ -940,11 +970,12 @@ class Worker:
         except WorkerStartFailed as error:
             # Leave nothing half-created behind a failed start.
             with contextlib.suppress(Exception):
-                self._docker_capture("rm", "--force", "--volumes", name, timeout=60)
+                self._docker_capture("rm", "--force", "--volumes", container_name, timeout=60)
             raise BackgroundProcessStartFailed(
                 f"{approved.display!r} could not be started: {error}"
             ) from error
-        container = output.strip().splitlines()[-1] if output.strip() else name
+        container = output.strip().splitlines()[-1] if output.strip() else container_name
+        self._background_container_names.add(container_name)
         return _ContainerBackgroundProcess(
             container=container, capture=self._docker_capture, **common
         )  # type: ignore[arg-type]
