@@ -259,7 +259,39 @@ def run_escalation_options(reason: FailureReason) -> tuple[EscalationOption, ...
                 "Abandon the task; nothing of it has been committed.",
             ),
         )
-    if reason in {FailureReason.SCOPE_VIOLATION, FailureReason.SECURITY_FAILED}:
+    if reason is FailureReason.SECURITY_FAILED:
+        # Split from ``SCOPE_VIOLATION`` because the two decisions are not the
+        # same one. A scope violation is answered by changing what the task is
+        # allowed to touch; a security finding is answered by judging the
+        # finding -- it was real, or it was the scanner being wrong about
+        # legitimate code. Offering "widen the task's declared allowance" for a
+        # failed credential scan asked the operator the wrong question.
+        #
+        # Both options that retry carry ``RETRY_TASK``: the intents are
+        # unchanged, only the sentences differ. Accepting the candidate is
+        # still not on the table -- it has been rolled back, and a change that
+        # failed the security gate is not one a person should be invited to
+        # wave through from an escalation.
+        return (
+            EscalationOption(
+                "A",
+                EscalationIntent.RETRY_TASK,
+                "The finding was legitimate or expected, or the scanner or task "
+                "has since been corrected; run the task again.",
+            ),
+            EscalationOption(
+                "B",
+                EscalationIntent.RETRY_TASK,
+                "Adjust the task or the project's security configuration so the "
+                "work no longer trips the scan, and run it again.",
+            ),
+            EscalationOption(
+                "C",
+                EscalationIntent.ABANDON_TASK,
+                "Abandon the task; the candidate has been rolled back.",
+            ),
+        )
+    if reason is FailureReason.SCOPE_VIOLATION:
         return (
             EscalationOption(
                 "A",

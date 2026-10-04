@@ -55,6 +55,7 @@ from apps.orchestrator.domain.enums import (
     TaskStatus,
     WorkerProfile,
 )
+from apps.orchestrator.domain.escalation import EscalationIntent
 from apps.orchestrator.domain.models import (
     Project,
     Review,
@@ -1177,7 +1178,15 @@ async def test_a_candidate_that_breaks_its_scope_is_rolled_back_not_reviewed(
     loop_settings: Settings,
 ):
     """``ROLLBACK`` ends the run. Section 25: reset the disposable worktree,
-    mark the run failed, and do not hand an unsafe candidate to a reviewer."""
+    mark the run failed, and do not hand an unsafe candidate to a reviewer.
+
+    Concern 81 changed one thing about this, and only one: the task now rests
+    in ``HUMAN_REVIEW`` with an escalation rather than in ``FAILED`` with
+    nothing to answer. Everything the rollback guaranteed it still guarantees
+    -- the candidate is gone, the run is ``FAILED``, no reviewer saw it -- and
+    the run's own outcome is still ``FAILED`` so the graph still releases the
+    worktree. What changed is that somebody is now asked.
+    """
     coder = ScriptedModel(_code(WORKING, path=".env", summary="Added configuration."))
 
     result = await run_fix_loop(
@@ -1187,9 +1196,12 @@ async def test_a_candidate_that_breaks_its_scope_is_rolled_back_not_reviewed(
     assert result.outcome is LoopOutcome.FAILED
     assert result.failure_reason is FailureReason.SCOPE_VIOLATION
     assert result.rolled_back
-    assert result.escalation is None
     assert result.cycles_used == 0
-    assert _status(session, task) is TaskStatus.FAILED
+    assert result.attempts_used == 1
+    # Concern 81: the operator decision the rollback used to leave unrecorded.
+    assert result.escalation is not None
+    assert result.escalation.reason == FailureReason.SCOPE_VIOLATION.value
+    assert _status(session, task) is TaskStatus.HUMAN_REVIEW
     assert TaskRunRepository(session).get(run.id).status is RunStatus.FAILED
     # The worktree is back at the run's starting commit, and the protected file
     # the coder aimed at was never written.
@@ -1733,3 +1745,245 @@ async def test_a_repeated_blocking_dispute_still_escalates_and_earns_nothing(
     assert final.correction_source is CorrectionSource.REVIEW
     assert final.verification is not None and final.verification.no_new_regressions
     assert not final.repair_granted
+
+
+# --- concern 81: a rolled-back terminal failure still owes a decision --------
+#
+# UI-002 run 67b3f116. A 13-file candidate built green, tested green, and was
+# refused by the security scan -- correctly as far as the loop knew, though the
+# finding was later shown to be a scanner false positive. The run ended:
+#
+#   fix_loop_finished  outcome=FAILED  failure_reason=SECURITY_FAILED
+#                      escalation_id=null  rolled_back=true
+#   task status        FAILED
+#   GET /escalations   empty
+#
+# Every part of that is the fail-closed design working, except the last line.
+# The decision path already existed -- ``run_escalation_options`` has had a
+# branch for SECURITY_FAILED and SCOPE_VIOLATION all along, offering RETRY_TASK
+# and ABANDON_TASK and deliberately not ACCEPT_CANDIDATE -- and nothing called
+# it, because ``_settle`` only wrote an escalation for ``LoopOutcome.ESCALATED``.
+#
+# These tests pin both halves: the rollback is untouched, and the task is now
+# answerable.
+
+#: A candidate that builds and tests clean and still carries a credential, so
+#: the run is stopped by the security gate rather than by a command. Synthetic.
+_SMUGGLED_SECRET = (
+    'TOKEN = "ghp_ZZfakefakefakefakefakefake123456"\n'
+    "def navigate(target):\n"
+    "    return target\n"
+)
+
+
+async def _security_failed_run(session, workspace, loop_settings):
+    return await run_fix_loop(
+        session,
+        workspace,
+        coder=ScriptedModel(_code(_SMUGGLED_SECRET)),
+        reviewer=reviewer(),
+        settings=loop_settings,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_security_failure_is_rolled_back_and_escalated(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    run: TaskRun,
+    loop_settings: Settings,
+):
+    """Concern 81, the reported case end to end."""
+    result = await _security_failed_run(session, workspace, loop_settings)
+
+    # --- unchanged: the candidate was refused and discarded ----------------
+    assert result.outcome is LoopOutcome.FAILED
+    assert result.failure_reason is FailureReason.SECURITY_FAILED
+    assert result.rolled_back
+    assert result.attempts_used == 1
+    assert result.cycles_used == 0, "no reviewer saw an unsafe candidate"
+    assert TaskRunRepository(session).get(run.id).status is RunStatus.FAILED
+    assert (
+        TaskRunRepository(session).get(run.id).failure_reason
+        == FailureReason.SECURITY_FAILED.value
+    )
+    # The smuggled credential is not in the worktree any more.
+    assert (workspace.path / "src" / "nav.py").read_text() == STUB
+    assert "ghp_ZZfake" not in (workspace.path / "src" / "nav.py").read_text()
+
+    # --- new: the task is answerable ---------------------------------------
+    assert _status(session, task) is TaskStatus.HUMAN_REVIEW
+    assert result.escalation is not None
+    (open_escalation,) = EscalationRepository(session).list_open(task_id=task.id)
+    assert open_escalation.id == result.escalation.id
+    assert open_escalation.status is EscalationStatus.OPEN
+    assert open_escalation.reason == FailureReason.SECURITY_FAILED.value, (
+        "the escalation must keep the reason the run actually stopped for"
+    )
+
+    intents = {option.intent for option in open_escalation.options}
+    assert EscalationIntent.RETRY_TASK in intents
+    assert EscalationIntent.ABANDON_TASK in intents
+    assert EscalationIntent.ACCEPT_CANDIDATE not in intents, (
+        "a candidate refused by the security gate is not waveable through"
+    )
+    # The operator is told what happened and that nothing is on disk.
+    assert "rolled back" in open_escalation.summary
+    assert "no longer on disk" in open_escalation.summary
+    # And never the credential itself.
+    assert "ghp_ZZfake" not in open_escalation.summary
+
+
+@pytest.mark.asyncio
+async def test_the_security_escalation_asks_about_the_finding_not_the_allowance(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    loop_settings: Settings,
+):
+    """The wording is security's own, and the intents are the shared ones.
+
+    Before this, SECURITY_FAILED borrowed SCOPE_VIOLATION's options and asked
+    an operator to "widen the task's declared allowance" about a failed
+    credential scan -- the wrong question for the right decision.
+    """
+    result = await _security_failed_run(session, workspace, loop_settings)
+
+    options = " ".join(result.escalation.options).casefold()
+    assert "scanner or task has since been corrected" in options
+    assert "declared allowance" not in options
+    assert "accept the candidate" not in options
+    assert [option[:2] for option in result.escalation.options] == ["A.", "B.", "C."]
+
+
+@pytest.mark.asyncio
+async def test_retry_task_on_a_rolled_back_escalation_returns_the_task_to_ready(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    loop_settings: Settings,
+):
+    """The established resolution path, not a second retry mechanism.
+
+    ``apply_escalation_answer`` with ``RETRY_TASK`` is the same call an
+    exhausted run's escalation is answered with, and its ``ResolutionEffect``
+    is what moves the task. Nothing here touches the database directly and
+    nothing calls ``retry_failed_task``, which remains for the ``FAILED``
+    tasks that legitimately carry no escalation.
+    """
+    from apps.orchestrator.workflow.resolution import apply_escalation_answer
+
+    result = await _security_failed_run(session, workspace, loop_settings)
+    escalation_id = result.escalation.id
+    assert _status(session, task) is TaskStatus.HUMAN_REVIEW
+
+    apply_escalation_answer(
+        session,
+        escalation_id,
+        resolution="The finding was a scanner false positive; it has been fixed.",
+        intent=EscalationIntent.RETRY_TASK,
+        settings=loop_settings,
+    )
+
+    assert _status(session, task) is TaskStatus.READY
+    resolved = EscalationRepository(session).get(escalation_id)
+    assert resolved.status is EscalationStatus.RESOLVED
+    assert resolved.resolution_intent is EscalationIntent.RETRY_TASK
+    # The failed run keeps its own history: nothing is retroactively excused.
+    assert EscalationRepository(session).list_open(task_id=task.id) == []
+
+
+@pytest.mark.asyncio
+async def test_abandoning_a_rolled_back_escalation_leaves_the_task_failed(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    loop_settings: Settings,
+):
+    """The other offered intent still works, and is still terminal."""
+    from apps.orchestrator.workflow.resolution import apply_escalation_answer
+
+    result = await _security_failed_run(session, workspace, loop_settings)
+
+    apply_escalation_answer(
+        session,
+        result.escalation.id,
+        resolution="The finding was real; the task is not worth repeating.",
+        intent=EscalationIntent.ABANDON_TASK,
+        settings=loop_settings,
+    )
+
+    assert _status(session, task) is TaskStatus.FAILED
+    assert EscalationRepository(session).list_open(task_id=task.id) == []
+
+
+@pytest.mark.asyncio
+async def test_retry_exhaustion_still_preserves_its_candidate(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    loop_settings: Settings,
+):
+    """Concern 81 must not blur the two kinds of escalation.
+
+    An exhausted run escalates *with* its candidate on disk, because a person
+    is being asked to look at it. A rolled-back run escalates *without* one.
+    Both reach HUMAN_REVIEW; only one keeps the work.
+    """
+    coder = ScriptedModel(_code(BROKEN), _code(BROKEN), _code(BROKEN))
+
+    result = await run_fix_loop(
+        session, workspace, coder=coder, reviewer=reviewer(), settings=loop_settings
+    )
+
+    assert result.outcome is LoopOutcome.ESCALATED
+    assert result.failure_reason is FailureReason.RETRY_EXHAUSTED
+    assert not result.rolled_back, "an exhausted run's candidate is preserved"
+    assert (workspace.path / "src" / "nav.py").read_text() == BROKEN
+    assert _status(session, task) is TaskStatus.HUMAN_REVIEW
+    assert result.escalation is not None
+    assert result.escalation.reason == FailureReason.RETRY_EXHAUSTED.value
+    # Its own wording, unchanged by this concern.
+    assert "permitted" in result.escalation.summary
+
+
+@pytest.mark.asyncio
+async def test_a_rolled_back_escalation_is_discoverable_and_has_one_retry_path(
+    session: Session,
+    workspace: TaskWorkspace,
+    task: Task,
+    loop_settings: Settings,
+):
+    """What the operator and the campaign actually see.
+
+    Two assertions in one test because they are two halves of the same
+    guarantee. The escalation must show up where an operator looks for work --
+    ``list_open_escalations`` is what ``GET /escalations`` serves -- and there
+    must be exactly *one* way to retry it. ``retry_failed_task`` requires
+    ``FAILED``, so a task resting in ``HUMAN_REVIEW`` is refused by it and can
+    only move through escalation resolution. That is the single established
+    path, and the direct API stays available for the ``FAILED`` tasks that
+    legitimately carry no escalation (an abandoned run, concern 65).
+    """
+    from apps.orchestrator.services import retry as retry_service
+    from apps.orchestrator.services.errors import EntityConflict
+    from apps.orchestrator.services.reviews import list_open_escalations
+
+    result = await _security_failed_run(session, workspace, loop_settings)
+
+    # Discoverable through the operator's own queue, unfiltered.
+    queued = list_open_escalations(session)
+    assert result.escalation.id in {item.id for item in queued}
+
+    # The campaign stops for this task: HUMAN_REVIEW is already one of the
+    # statuses it treats as needing a person.
+    assert _status(session, task) is TaskStatus.HUMAN_REVIEW
+    assert TaskStatus.HUMAN_REVIEW not in retry_service.RETRYABLE_TASK_STATES
+    assert TaskStatus.FAILED in retry_service.RETRYABLE_TASK_STATES
+
+    # So the direct retry API refuses it rather than offering a second route.
+    with pytest.raises(EntityConflict):
+        retry_service.retry_failed_task(
+            session, task.id, reason="operator judged the finding a false positive"
+        )

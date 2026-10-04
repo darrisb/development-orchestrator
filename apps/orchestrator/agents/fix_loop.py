@@ -1303,6 +1303,59 @@ def _close_unreraised_issues(
 # ------------------------------------------------------------------- settling
 
 
+def _awaits_operator_decision(
+    outcome: LoopOutcome, *, rollback: bool, reason: FailureReason | None
+) -> bool:
+    """Whether a terminal, rolled-back run still owes a person a decision.
+
+    Concern 81. A ``ROLLBACK`` run used to end as ``FAILED`` with no
+    escalation, which read as "nobody is needed here". That is true of the
+    *candidate* -- it is gone, and no automatic retry may resurrect it -- and
+    false of the *task*, which cannot move again without somebody deciding
+    whether the finding was real. UI-002 came to rest in ``FAILED`` with an
+    empty escalation queue, so a campaign stopped and the operator had nothing
+    to answer.
+
+    The decision path for exactly this case already existed and was already
+    tested: ``run_escalation_options`` has a branch for ``SECURITY_FAILED``
+    and ``SCOPE_VIOLATION`` offering ``RETRY_TASK`` and ``ABANDON_TASK``, and
+    ``render_run_escalation`` has the wording for a candidate that is no longer
+    on disk. Nothing here is new behaviour; this is the wire that was missing
+    between the branch that produces the failure and the branch that writes
+    the decision.
+
+    **Why the predicate is three conjuncts rather than "not approved and has a
+    reason".** The broad form would also catch ``LoopOutcome.FAILED`` arrived
+    at by any future route, and it would make the escalation a consequence of
+    *having a reason* rather than of the policy for that reason. These three
+    are checkable against the policy table:
+
+    * ``LoopOutcome.FAILED`` -- the only outcome the loop settles without
+      already escalating, and the only one the graph routes to ``release``.
+      ``ESCALATED`` keeps its existing path untouched.
+    * ``rollback`` -- the candidate really was discarded, so the options that
+      offer to accept it are correctly absent.
+    * ``action_for(reason) is FailureAction.ROLLBACK`` -- read from
+      ``FAILURE_POLICY`` rather than from a second list here, so the two cannot
+      drift. Exactly three reasons map to ``ROLLBACK``: ``SECURITY_FAILED``,
+      ``SCOPE_VIOLATION`` and ``GIT_CONFLICT``, and no other failure class can
+      satisfy this however it reaches the loop. ``RETRY_EXHAUSTED``,
+      ``RUNTIME_EXHAUSTED`` and ``HUMAN_DECISION_REQUIRED`` map to
+      ``ESCALATE`` and already escalate with their candidate preserved; the
+      ``SEND_TO_CODER`` and ``RETRY`` classes never settle a run at all.
+    """
+    if outcome is not LoopOutcome.FAILED or not rollback or reason is None:
+        return False
+    try:
+        return action_for(reason) is FailureAction.ROLLBACK
+    except KeyError:
+        # ``action_for`` raises for an unclassified reason on purpose, and a
+        # settling path must not be the place that discovers it. An
+        # unclassified failure is not granted an escalation it was never
+        # designed one for.
+        return False
+
+
 def _settle(
     session: Session,
     workspace: TaskWorkspace,
@@ -1343,6 +1396,13 @@ def _settle(
         rollback_workspace(workspace)
         workspace_reset = True
 
+    # Computed from ``workspace_reset`` rather than from ``rollback``: the
+    # question is whether the candidate is actually gone, not whether a reset
+    # was requested.
+    awaiting_operator = _awaits_operator_decision(
+        outcome, rollback=workspace_reset, reason=reason
+    )
+
     if outcome is LoopOutcome.APPROVED:
         # The run is not finished: the candidate still has to be committed, and
         # that is the workflow's step (phase K). Leaving it RUNNING is what says
@@ -1350,9 +1410,18 @@ def _settle(
         # like delivered work.
         status = TaskStatus.APPROVED
     else:
+        # Concern 81. A rolled-back terminal failure rests in ``HUMAN_REVIEW``
+        # alongside the escalation written for it below, because that is the
+        # state the escalation-resolution path acts on: ``RETRY_TASK``'s
+        # ``ResolutionEffect`` moves the task to ``READY`` and reopens it,
+        # which is the established retry and not a second one.
+        #
+        # The *run* is still finished ``FAILED`` with its original reason, on
+        # the same line as before: what the candidate did is unchanged, and
+        # only who is expected to act on it is.
         status = (
             TaskStatus.HUMAN_REVIEW
-            if outcome is LoopOutcome.ESCALATED
+            if outcome is LoopOutcome.ESCALATED or awaiting_operator
             else TaskStatus.FAILED
         )
         TaskRunRepository(session).finish(
@@ -1379,11 +1448,15 @@ def _settle(
     else:
         consumed_ms = max(0, run.active_runtime_ms)
         remaining_ms = max(0, configured_ms - consumed_ms)
-    if outcome is LoopOutcome.ESCALATED and escalation is None:
+    if (outcome is LoopOutcome.ESCALATED or awaiting_operator) and escalation is None:
         escalation = _escalate(
             session, run, task, project, iterations,
+            # The original reason, not ``HUMAN_DECISION_REQUIRED``: an
+            # escalation that renamed the failure would lose why the run
+            # stopped, and ``run_escalation_options`` dispatches on it.
             reason=reason or FailureReason.HUMAN_DECISION_REQUIRED,
             rolled_back=workspace_reset,
+            awaiting_operator=awaiting_operator,
             config=config,
             attempts_used=attempts,
             recovered=recovered,
@@ -1428,7 +1501,11 @@ def _settle(
         # or the process then failed, the durable history would say an approved
         # run was rejected. The provisional "in_progress" from the last turn
         # boundary stands until delivery replaces it with "accepted".
-        _record_outcome(session, run, task, outcome, config=config)
+        _record_outcome(
+            session, run, task, outcome,
+            config=config,
+            awaiting_operator=awaiting_operator,
+        )
     logger.info(
         "fix_loop_finished",
         run_id=str(run.id),
@@ -1451,6 +1528,7 @@ def _record_outcome(
     outcome: LoopOutcome,
     *,
     config: Settings,
+    awaiting_operator: bool = False,
 ) -> None:
     """Write ``outcome.json`` for a run that did not get delivered (phase L).
 
@@ -1490,7 +1568,11 @@ def _record_outcome(
         record_outcome(
             session,
             run.id,
-            outcome="escalated" if outcome is LoopOutcome.ESCALATED else "rejected",
+            outcome=(
+                "escalated"
+                if outcome is LoopOutcome.ESCALATED or awaiting_operator
+                else "rejected"
+            ),
             settings=config,
         )
     except Exception as error:  # noqa: BLE001 - bookkeeping must not fail the loop
@@ -1536,6 +1618,7 @@ def _escalate(
     reason: FailureReason,
     rolled_back: bool,
     config: Settings,
+    awaiting_operator: bool = False,
     attempts_used: int | None = None,
     recovered: RecoveredLoopState | None = None,
     cycles_used: int = 0,
@@ -1603,6 +1686,17 @@ def _escalate(
         and last.review.routing.human_review_reasons
     ):
         reason_text = " ".join(last.review.routing.human_review_reasons)
+    elif awaiting_operator:
+        # Concern 81. The sentence a person reads first has to say both halves
+        # of this state: the gate refused the candidate and the candidate is
+        # gone, so there is nothing to accept and nothing was integrated, and
+        # what is left is a judgement about the finding itself.
+        reason_text = (
+            f"The candidate was refused by the {reason.value} gate and has been "
+            "rolled back, so nothing was accepted and nothing was integrated. "
+            "The orchestrator does not retry this on its own: whether the "
+            "finding was real is a decision for a person."
+        )
     else:
         reason_text = "The run reached a decision the orchestrator may not take."
     summary = render_run_escalation(
