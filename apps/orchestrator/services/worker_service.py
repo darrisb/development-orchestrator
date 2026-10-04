@@ -22,6 +22,13 @@ Two backends:
   -- a permitted command can still read the developer's home directory -- and
   exists so the loop can be developed on a machine without Docker.
 
+Beside the foreground runner there is one narrow extra capability: a single
+orchestrator-managed *background* process per worker (``start_background``).
+It exists so a later concern can start a long-running program, do other work
+while it runs, and stop it again. It owns the process lifecycle only -- start,
+liveness, exit state, bounded output, termination. Readiness (is the thing it
+started actually serving?) belongs to whatever asks for it, not here.
+
 Deliberately free of the database: like ``GitService``, this service does the
 work and something else records it (``services.command_logs``).
 """
@@ -36,9 +43,10 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 
 from ..config.logging import get_logger
@@ -47,6 +55,9 @@ from ..domain.commands import ApprovedCommand, CommandPolicy
 from ..domain.enums import WorkerProfile
 from ..domain.redaction import Redactor, is_secret_name
 from .worker_errors import (
+    BackgroundProcessAlreadyRunning,
+    BackgroundProcessCleanupFailed,
+    BackgroundProcessStartFailed,
     WorkerBackendUnavailable,
     WorkerNotRunning,
     WorkerStartFailed,
@@ -71,6 +82,17 @@ _TMPFS_MOUNTS: tuple[tuple[str, str], ...] = (
     ("/tmp", "rw,exec,nosuid,size=512m"),
     ("/home/worker", "rw,nosuid,size=64m"),
 )
+
+#: The last lines of a background process' container log that are fetched for
+#: diagnostics. A ceiling in lines as well as bytes: ``docker logs`` without
+#: one would stream a whole dev server's history through a pipe to be thrown
+#: away.
+BACKGROUND_LOG_LINES = 2_000
+
+#: Docker's own log-file ceiling for a managed background process. The handle
+#: keeps bounded output in memory; this keeps the daemon from accumulating an
+#: unbounded file on the host behind it.
+BACKGROUND_LOG_OPTIONS: tuple[str, ...] = ("max-size=4m", "max-file=1")
 
 #: Environment every worker gets. No host values: a worker is given what it
 #: needs, never what this process happens to hold (section 11).
@@ -159,6 +181,286 @@ class CommandResult:
         }
 
 
+class BackgroundState(StrEnum):
+    """What the orchestrator knows about its managed background process.
+
+    ``RUNNING`` is answered by asking the process itself, never by observing
+    that the worker is alive: a container that is up says nothing about
+    whether the program inside it is still there.
+    """
+
+    RUNNING = "running"
+    #: Exited on its own, for whatever reason. ``exit_code`` says which.
+    EXITED = "exited"
+    #: Stopped by the orchestrator (``terminate``, worker close, taint path).
+    TERMINATED = "terminated"
+
+
+class BackgroundProcess:
+    """A handle on the one background process a worker manages.
+
+    The worker owns the process; this object is how a caller sees and ends it.
+    Use it as a context manager to tie the process to a narrower scope than
+    the worker's own -- but the worker will clean it up regardless, and so
+    will the container's destruction behind that.
+
+    It answers process questions only: running, exited, exit code, recent
+    output. Whether the program has finished starting up, is listening, or
+    answers a request is the caller's business, not this handle's.
+    """
+
+    def __init__(
+        self,
+        *,
+        command: ApprovedCommand,
+        worker_id: str,
+        max_output_bytes: int,
+        stop_grace_seconds: float,
+        redactor: Redactor,
+    ) -> None:
+        self.command = command
+        self.worker_id = worker_id
+        self.max_output_bytes = max_output_bytes
+        self.stop_grace_seconds = stop_grace_seconds
+        self._redactor = redactor
+        self._state = BackgroundState.RUNNING
+        self._exit_code: int | None = None
+        self._cleaned = False
+
+    # --------------------------------------------------------------- state
+
+    @property
+    def state(self) -> BackgroundState:
+        """The state as of the last observation. ``is_running`` refreshes it."""
+        self._refresh()
+        return self._state
+
+    @property
+    def exit_code(self) -> int | None:
+        """The exit code, or ``None`` while running or when it is unknowable."""
+        self._refresh()
+        return self._exit_code
+
+    def is_running(self) -> bool:
+        self._refresh()
+        return self._state is BackgroundState.RUNNING
+
+    @property
+    def terminated(self) -> bool:
+        """True when the orchestrator stopped it, rather than it exiting."""
+        return self._state is BackgroundState.TERMINATED
+
+    # ----------------------------------------------------------- diagnostics
+
+    @property
+    def stdout(self) -> str:
+        """Bounded, redacted stdout. Still available after the process ends."""
+        return self._redactor.redact(self._read_stream(error=False))
+
+    @property
+    def stderr(self) -> str:
+        return self._redactor.redact(self._read_stream(error=True))
+
+    @property
+    def combined_output(self) -> str:
+        sections = []
+        if self.stdout.strip():
+            sections.append(f"--- stdout ---\n{self.stdout}")
+        if self.stderr.strip():
+            sections.append(f"--- stderr ---\n{self.stderr}")
+        return "\n".join(sections) if sections else "(no output)"
+
+    def output_tail(self, lines: int = 40) -> str:
+        """The last ``lines`` of output -- where a server says why it died."""
+        text = self.combined_output.rstrip("\n")
+        split = text.splitlines()
+        if len(split) <= lines:
+            return text
+        return "\n".join(["[... earlier output omitted ...]", *split[-lines:]])
+
+    def describe(self) -> dict[str, object]:
+        """Metadata only; the output is fetched explicitly."""
+        return {
+            **self.command.describe(),
+            "worker_id": self.worker_id,
+            "state": self.state.value,
+            "exit_code": self._exit_code,
+        }
+
+    # ----------------------------------------------------------- termination
+
+    def terminate(self, *, grace_seconds: float | None = None) -> None:
+        """Stop the process: graceful signal, bounded wait, then force.
+
+        Idempotent -- it is called on every cleanup path, including ones that
+        are already unwinding another failure.
+
+        Raises:
+            BackgroundProcessCleanupFailed: the process could not be proven
+                dead. The caller must treat the worker as compromised.
+        """
+        if self._cleaned:
+            return
+        grace = self.stop_grace_seconds if grace_seconds is None else grace_seconds
+        was_running = self.is_running()
+        try:
+            self._stop(grace)
+        finally:
+            self._cleaned = True
+        if was_running:
+            self._state = BackgroundState.TERMINATED
+        logger.info(
+            "background_process_terminated",
+            worker_id=self.worker_id,
+            command=self.command.display,
+            was_running=was_running,
+            exit_code=self._exit_code,
+        )
+
+    def __enter__(self) -> BackgroundProcess:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.terminate()
+
+    # ------------------------------------------------------------ subclasses
+
+    def _refresh(self) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def _read_stream(self, *, error: bool) -> str:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def _stop(self, grace_seconds: float) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+
+class _HostBackgroundProcess(BackgroundProcess):
+    """A background process on the host (``WorkerBackend.SUBPROCESS``).
+
+    A real process in its own session, with its output drained into bounded
+    buffers, terminated by signalling the whole process group -- the same
+    mechanism the foreground runner uses on a timeout. Isolation is the
+    backend's usual weak isolation; the lifecycle is genuine.
+    """
+
+    def __init__(self, *, process: subprocess.Popen, drains: tuple[_Drain, _Drain], **kwargs
+                 ) -> None:
+        super().__init__(**kwargs)
+        self._process = process
+        self._out, self._err = drains
+
+    def _refresh(self) -> None:
+        if self._state is not BackgroundState.RUNNING:
+            return
+        code = self._process.poll()
+        if code is not None:
+            self._exit_code = code
+            self._state = BackgroundState.EXITED
+            # Let the drains finish so output is complete for whoever reads it
+            # after the exit; they are daemon threads on a closed pipe.
+            self._out.join(timeout=5)
+            self._err.join(timeout=5)
+
+    def _read_stream(self, *, error: bool) -> str:
+        return (self._err if error else self._out).text()
+
+    def _stop(self, grace_seconds: float) -> None:
+        if self._process.poll() is None:
+            _kill_group(self._process, grace_seconds=grace_seconds)
+        self._out.join(timeout=5)
+        self._err.join(timeout=5)
+        code = self._process.poll()
+        if code is None:
+            raise BackgroundProcessCleanupFailed(
+                f"background process {self.command.display!r} survived SIGKILL"
+            )
+        self._exit_code = code
+
+
+class _ContainerBackgroundProcess(BackgroundProcess):
+    """A background process in its own container, beside the worker's.
+
+    A sibling container rather than a ``docker exec``, for one reason:
+    ``docker exec`` does not forward signals, so killing the client leaves the
+    program running inside the container -- exactly the orphan this primitive
+    exists to prevent. A container can be asked whether it is running, asked
+    for its exit code, stopped gracefully then forcibly (``docker stop``), and
+    removed with certainty (``docker rm --force``).
+
+    It shares the worker's network namespace, so a program it starts is
+    reachable from a command the worker runs. The worker's container remains
+    free to run foreground commands the whole time.
+    """
+
+    def __init__(
+        self,
+        *,
+        container: str,
+        capture: Callable[..., _Capture],
+        **kwargs: object,
+    ) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self._container = container
+        self._capture = capture
+        self._removed = False
+        self._frozen_output: dict[bool, str] = {}
+
+    def _refresh(self) -> None:
+        if self._state is not BackgroundState.RUNNING:
+            return
+        result = self._capture("inspect", "--format", "{{.State.Running}} {{.State.ExitCode}}",
+                               self._container, timeout=30)
+        fields = result.stdout.split()
+        if result.exit_code != 0 or len(fields) != 2:
+            # The container is gone (or unreadable): it is certainly not
+            # running, and its exit code is no longer knowable.
+            self._state = BackgroundState.EXITED
+            return
+        running, code = fields
+        if running == "true":
+            return
+        self._state = BackgroundState.EXITED
+        with contextlib.suppress(ValueError):
+            self._exit_code = int(code)
+
+    def _read_stream(self, *, error: bool) -> str:
+        if self._removed:
+            return self._frozen_output.get(error, "")
+        result = self._capture(
+            "logs", "--tail", str(BACKGROUND_LOG_LINES), self._container,
+            timeout=60, max_output_bytes=self.max_output_bytes,
+        )
+        text = result.stderr if error else result.stdout
+        return text
+
+    def _stop(self, grace_seconds: float) -> None:
+        # Read the log out before the container is removed: after that there is
+        # nothing left to ask, and the output is the diagnosis.
+        for error in (False, True):
+            with contextlib.suppress(Exception):
+                self._frozen_output[error] = self._read_stream(error=error)
+        self._refresh()
+        # `docker stop` is the graceful-then-forced sequence: SIGTERM, wait
+        # --time, SIGKILL. A failure here is not fatal; `rm --force` is.
+        stop = self._capture("stop", "--time", str(int(max(0, grace_seconds))),
+                             self._container, timeout=int(grace_seconds) + 30)
+        if stop.exit_code != 0:
+            logger.warning(
+                "background_process_stop_failed",
+                worker_id=self.worker_id,
+                container=self._container,
+                error=stop.stderr.strip()[-300:],
+            )
+        removal = self._capture("rm", "--force", "--volumes", self._container, timeout=60)
+        self._removed = True
+        if removal.exit_code != 0 and "no such container" not in removal.stderr.lower():
+            raise BackgroundProcessCleanupFailed(
+                f"the container for {self.command.display!r} could not be removed: "
+                f"{removal.stderr.strip()[-300:]}"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerSpec:
     """How one worker is created. Every field is a policy from section 11."""
@@ -176,8 +478,17 @@ class WorkerSpec:
     pids_limit: int = 512
     command_timeout_seconds: int = 900
     max_output_bytes: int = 1_000_000
+    #: Per-stream ceiling for the managed background process' diagnostics.
+    background_max_output_bytes: int = 256_000
+    #: Grace given to the managed background process before it is killed.
+    background_stop_grace_seconds: int = 10
     environment: Mapping[str, str] = field(default_factory=dict)
     user: str | None = None
+
+    @property
+    def background_container_name(self) -> str:
+        """The sibling container's name. Derived, so it is findable by hand."""
+        return f"{self.worker_id}-bg"
 
     @property
     def runtime_description(self) -> str:
@@ -241,6 +552,13 @@ class Worker:
         self.docker_binary = docker_binary
         self.container_id: str | None = None
         self._closed = False
+        #: The one orchestrator-managed background process, if any (V1: at
+        #: most one per worker). Kept after it exits so its diagnostics stay
+        #: readable and so its remains are cleaned up on close.
+        self._background: BackgroundProcess | None = None
+        #: Whether this worker has ever had one. Only then is there a sibling
+        #: container to sweep up on close.
+        self._background_started = False
         #: Set when a command had to be killed. The process inside a container
         #: may survive a killed ``docker exec``, so a timed-out worker is
         #: destroyed rather than reused -- see ``run``.
@@ -263,8 +581,22 @@ class Worker:
         if self._closed:
             return
         self._closed = True
+        # The managed background process goes first: the container's removal
+        # would take it with it, but the subprocess backend has no container
+        # behind it, and an explicit kill is what makes the guarantee the same
+        # on both backends.
+        self._cleanup_background()
         if self.container_id is None:
             return
+        # The background process runs in a *sibling* container, so destroying
+        # this one would not take it with it. The handle's own cleanup has
+        # already run; this is the backstop for the case where it could not.
+        if self._background_started:
+            with contextlib.suppress(Exception):
+                self._docker_capture(
+                    "rm", "--force", "--volumes", self.spec.background_container_name,
+                    timeout=60,
+                )
         if retain and not self._tainted:
             logger.warning(
                 "worker_retained", worker_id=self.spec.worker_id, container=self.container_id
@@ -394,6 +726,198 @@ class Worker:
                 break
         return tuple(results)
 
+    # ------------------------------------------------- background lifecycle
+
+    @property
+    def background(self) -> BackgroundProcess | None:
+        """The managed background process, running or finished, if any."""
+        return self._background
+
+    def start_background(self, command: str | ApprovedCommand) -> BackgroundProcess:
+        """Start the worker's one managed long-running process.
+
+        The command goes through the *same* ``CommandPolicy`` as ``run``:
+        there is no shell here either, nothing is backgrounded with ``&``, and
+        an executable this profile does not allow is refused exactly as it
+        would be in the foreground. What makes the command a background one is
+        that the orchestrator keeps the process instead of waiting for it.
+
+        Ownership stays with the worker. The process is stopped by
+        ``terminate``, by ``close``, by ``worker_session`` leaving its block
+        however it leaves it, and ultimately by the container's destruction.
+
+        This starts a process; it does not wait for the program to become
+        useful. Readiness -- a port open, an HTTP answer, a page rendered --
+        belongs to the caller that knows what it asked to be started.
+
+        Raises:
+            CommandRejected: the command is not permitted by this policy.
+            WorkerNotRunning: the worker is closed or tainted.
+            BackgroundProcessAlreadyRunning: one is already alive (V1 limit).
+            BackgroundProcessStartFailed: the process could not be started.
+            WorkerBackendUnavailable: this backend has no background support.
+        """
+        if self._closed or self._tainted:
+            raise WorkerNotRunning(
+                f"Worker {self.spec.worker_id} is no longer running"
+                + (" (a previous command timed out)" if self._tainted else "")
+            )
+        approved = (
+            command if isinstance(command, ApprovedCommand) else self.policy.approve(command)
+        )
+        if self._background is not None:
+            if self._background.is_running():
+                raise BackgroundProcessAlreadyRunning(
+                    f"Worker {self.spec.worker_id} already manages "
+                    f"{self._background.command.display!r}; a worker manages at most one "
+                    f"background process"
+                )
+            # A finished one still holds resources (a stopped container, drain
+            # threads). Clear them before taking on another.
+            self.terminate_background()
+
+        common = {
+            "command": approved,
+            "worker_id": self.spec.worker_id,
+            "max_output_bytes": self.spec.background_max_output_bytes,
+            "stop_grace_seconds": float(self.spec.background_stop_grace_seconds),
+            "redactor": self.redactor,
+        }
+        if self.spec.backend is WorkerBackend.DOCKER:
+            process: BackgroundProcess = self._start_background_container(approved, common)
+        elif self.spec.backend is WorkerBackend.SUBPROCESS:
+            process = self._start_background_host(approved, common)
+        else:  # pragma: no cover - a backend added without deciding this
+            raise WorkerBackendUnavailable(
+                f"the {self.spec.backend} backend does not support a managed background "
+                f"process; no process was started"
+            )
+        self._background = process
+        self._background_started = True
+        logger.info(
+            "background_process_started",
+            worker_id=self.spec.worker_id,
+            command=approved.display,
+            backend=self.spec.backend.value,
+        )
+        return process
+
+    def terminate_background(self, *, grace_seconds: float | None = None) -> None:
+        """Stop the managed background process, if there is one.
+
+        Idempotent. Leaves the worker usable: nothing about the worker's own
+        container is touched.
+
+        Raises:
+            BackgroundProcessCleanupFailed: cleanup could not be proven. The
+                worker is tainted, so its container will be destroyed.
+        """
+        process = self._background
+        if process is None:
+            return
+        try:
+            process.terminate(grace_seconds=grace_seconds)
+        except BackgroundProcessCleanupFailed:
+            # Fail closed: a process that may still be alive means this
+            # worker's integrity is unknown, which is what taint means.
+            self._tainted = True
+            raise
+        finally:
+            self._background = None
+
+    def _cleanup_background(self) -> None:
+        """Terminate the background process on a path that must not raise."""
+        try:
+            self.terminate_background()
+        except Exception as error:  # noqa: BLE001 - close() must not mask a failure
+            logger.warning(
+                "background_process_cleanup_failed",
+                worker_id=self.spec.worker_id,
+                error=str(error),
+            )
+
+    def _start_background_host(
+        self, approved: ApprovedCommand, common: dict[str, object]
+    ) -> BackgroundProcess:
+        try:
+            process = subprocess.Popen(  # noqa: S603 - approved argv, never a shell
+                list(approved.argv),
+                cwd=str(self.spec.mount_source),
+                env=self._process_environment(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except (FileNotFoundError, PermissionError, OSError) as error:
+            raise BackgroundProcessStartFailed(
+                f"{approved.display!r} could not be started: {error}"
+            ) from error
+        limit = self.spec.background_max_output_bytes
+        drains = (_Drain(process.stdout, limit), _Drain(process.stderr, limit))
+        for drain in drains:
+            drain.start()
+        return _HostBackgroundProcess(process=process, drains=drains, **common)  # type: ignore[arg-type]
+
+    def _start_background_container(
+        self, approved: ApprovedCommand, common: dict[str, object]
+    ) -> BackgroundProcess:
+        if self.container_id is None:
+            raise WorkerNotRunning(f"Worker {self.spec.worker_id} has no container")
+        name = self.spec.background_container_name
+        # Removed explicitly rather than with `--rm`, because the exit code and
+        # the log of a process that died on its own are the evidence for why.
+        argv: list[str] = [
+            "run",
+            "--detach",
+            "--init",
+            "--name",
+            name,
+            "--workdir",
+            CONTAINER_WORKDIR,
+            "--volume",
+            f"{self.spec.mount_source}:{CONTAINER_WORKDIR}:rw",
+            # The worker's own network namespace: whatever this starts is
+            # reachable from a command the worker runs, and it inherits the
+            # worker's network restriction rather than widening it.
+            "--network",
+            f"container:{self.container_id}",
+            "--cpus",
+            str(self.spec.cpus),
+            "--memory",
+            self.spec.memory,
+            "--pids-limit",
+            str(self.spec.pids_limit),
+            "--read-only",
+            "--security-opt",
+            "no-new-privileges",
+            "--cap-drop",
+            "ALL",
+        ]
+        for option in BACKGROUND_LOG_OPTIONS:
+            argv += ["--log-opt", option]
+        for target, options in _TMPFS_MOUNTS:
+            argv += ["--tmpfs", f"{target}:{options}"]
+        if self.spec.user:
+            argv += ["--user", self.spec.user]
+        for key, value in self.spec.environment.items():
+            argv += ["--env", f"{key}={value}"]
+        argv += [self.spec.image or "", *approved.argv]
+
+        try:
+            output = self._docker(*argv, timeout=120)
+        except WorkerStartFailed as error:
+            # Leave nothing half-created behind a failed start.
+            with contextlib.suppress(Exception):
+                self._docker_capture("rm", "--force", "--volumes", name, timeout=60)
+            raise BackgroundProcessStartFailed(
+                f"{approved.display!r} could not be started: {error}"
+            ) from error
+        container = output.strip().splitlines()[-1] if output.strip() else name
+        return _ContainerBackgroundProcess(
+            container=container, capture=self._docker_capture, **common
+        )  # type: ignore[arg-type]
+
     # --------------------------------------------------------------- backends
 
     def _argv_for(
@@ -478,6 +1002,24 @@ class Worker:
             raise WorkerStartFailed(f"Docker did not return a container id for {image}")
         return container
 
+    def _docker_capture(
+        self, *args: str, timeout: int, max_output_bytes: int = 64_000
+    ) -> _Capture:
+        """Run a ``docker`` subcommand and return what it did, without judging.
+
+        ``_docker`` raises on failure, which is right when a worker cannot be
+        created. Inspecting and stopping a background process needs the
+        opposite: a failure there is information (the container is gone), not
+        an exception.
+        """
+        return _execute(
+            (self.docker_binary, *args),
+            cwd=None,
+            env=None,
+            timeout_seconds=timeout,
+            max_output_bytes=max_output_bytes,
+        )
+
     def _docker(self, *args: str, timeout: int) -> str:
         capture = _execute(
             (self.docker_binary, *args),
@@ -551,6 +1093,8 @@ def build_spec(
         pids_limit=config.worker_pids_limit,
         command_timeout_seconds=config.worker_command_timeout_seconds,
         max_output_bytes=config.worker_max_output_bytes,
+        background_max_output_bytes=config.worker_background_max_output_bytes,
+        background_stop_grace_seconds=config.worker_background_stop_grace_seconds,
         environment=environment,
         user=_container_user(config),
     )
@@ -753,9 +1297,14 @@ class _Drain(threading.Thread):
         self.total = 0
 
     def run(self) -> None:
+        # ``read1`` rather than ``read``: a buffered ``read(n)`` blocks until it
+        # has n bytes or the pipe closes, so a managed background process'
+        # output would be invisible until it died. ``read1`` returns what has
+        # arrived, which is what makes a live server's log readable.
+        read = getattr(self.stream, "read1", None) or self.stream.read
         try:
             while True:
-                chunk = self.stream.read(65_536)
+                chunk = read(65_536)
                 if not chunk:
                     break
                 self.total += len(chunk)
@@ -774,7 +1323,9 @@ class _Drain(threading.Thread):
         return self.total > self.kept
 
     def text(self) -> str:
-        decoded = b"".join(self.chunks).decode("utf-8", errors="replace")
+        # Snapshot the list: a background process' output is read while the
+        # drain thread is still appending to it.
+        decoded = b"".join(list(self.chunks)).decode("utf-8", errors="replace")
         return decoded + OUTPUT_TRUNCATION_MARKER if self.truncated else decoded
 
 
@@ -837,14 +1388,19 @@ def _execute(
     )
 
 
-def _kill_group(process: subprocess.Popen) -> None:
-    """Terminate, then kill, the process group started by ``_execute``."""
+def _kill_group(process: subprocess.Popen, *, grace_seconds: float = 5.0) -> None:
+    """Terminate, then kill, the process group started by ``_execute``.
+
+    ``grace_seconds`` is how long the group is given to exit after SIGTERM; a
+    background process gets the operator-configured grace, a timed-out
+    foreground command the default.
+    """
     try:
         group = os.getpgid(process.pid)
     except (ProcessLookupError, AttributeError):  # pragma: no cover - already gone
         process.kill()
         return
-    for sig, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
+    for sig, grace in ((signal.SIGTERM, max(0.1, grace_seconds)), (signal.SIGKILL, 5.0)):
         try:
             os.killpg(group, sig)
         except ProcessLookupError:
@@ -857,9 +1413,13 @@ def _kill_group(process: subprocess.Popen) -> None:
 
 
 __all__ = [
+    "BACKGROUND_LOG_LINES",
+    "BACKGROUND_LOG_OPTIONS",
     "BASE_ENVIRONMENT",
     "CONTAINER_WORKDIR",
     "OUTPUT_TRUNCATION_MARKER",
+    "BackgroundProcess",
+    "BackgroundState",
     "CommandResult",
     "Worker",
     "WorkerSpec",

@@ -185,6 +185,13 @@ class Settings(BaseSettings):
     #: Keep a failed worker's container for inspection. Leaks containers by
     #: design; never leave it on.
     worker_retain_on_failure: bool = Field(default=False)
+    #: Per-stream capture ceiling for a managed background process. Much
+    #: smaller than a command's: a long-running server's value is its recent
+    #: output, and that output is held for as long as the handle lives.
+    worker_background_max_output_bytes: int = Field(default=256_000, ge=1024)
+    #: How long a managed background process is given to exit after a graceful
+    #: signal before it is killed. Bounded so cleanup cannot hang a run.
+    worker_background_stop_grace_seconds: int = Field(default=10, ge=1)
     docker_binary: str = Field(default="docker")
 
     log_level: str = Field(default="INFO")

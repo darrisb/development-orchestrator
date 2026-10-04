@@ -54,6 +54,30 @@ class WorkspaceMountRejected(WorkerError):
     """
 
 
+class BackgroundProcessAlreadyRunning(WorkerError):
+    """A second managed background process was requested.
+
+    A worker owns at most one (``worker_service``, V1). Overlapping servers
+    would need supervision this layer deliberately does not have, so the
+    second request is refused rather than quietly replacing the first.
+    """
+
+
+class BackgroundProcessStartFailed(WorkerStartFailed):
+    """A managed background process could not be started at all."""
+
+
+class BackgroundProcessCleanupFailed(WorkerError):
+    """A managed background process could not be proven dead.
+
+    Raised rather than swallowed: the invariant is that nothing orchestrator-
+    managed survives a worker lifecycle boundary, and reporting success while
+    a process may still hold the worktree would make that invariant a guess.
+    The worker is tainted so its container is destroyed, which is the
+    backstop.
+    """
+
+
 class CommandTimedOut(WorkerError):
     """A command exceeded its timeout and was killed.
 
@@ -69,6 +93,9 @@ class CommandTimedOut(WorkerError):
 
 
 __all__ = [
+    "BackgroundProcessAlreadyRunning",
+    "BackgroundProcessCleanupFailed",
+    "BackgroundProcessStartFailed",
     "CommandTimedOut",
     "WorkerBackendUnavailable",
     "WorkerError",
