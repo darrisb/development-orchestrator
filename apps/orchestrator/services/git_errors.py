@@ -8,6 +8,8 @@ distinct types so the caller can react without parsing messages.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .errors import ServiceError
 
 
@@ -105,6 +107,21 @@ class WorktreeMissing(GitError):
     reports that a run cannot be resumed or delivered from where it worked.
     Recoverable by policy, not by retrying -- see ``services.recovery``.
     """
+
+
+class CandidateNotRestorable(GitError):
+    """A captured patch could not rebuild the candidate it describes.
+
+    Concern 80. Raised *before* anything is discarded, so the candidate is
+    still on disk when a caller sees it: the alternative is a worktree that
+    has been reset and cannot be put back, which is how a multi-attempt run
+    silently continued from only its latest attempt's edits.
+    """
+
+    def __init__(self, path: Path | str, detail: str) -> None:
+        super().__init__(f"Refusing to restore the candidate in {path}: {detail}")
+        self.path = str(path)
+        self.detail = detail
 
 
 class WorktreeUnusable(GitError):

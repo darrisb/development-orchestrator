@@ -12,6 +12,7 @@ escape hatch, no shell, and no way to pass an arbitrary subcommand.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ from ..domain.git import (
 from .git_errors import (
     BranchAlreadyExists,
     BranchMissing,
+    CandidateNotRestorable,
     DirtyWorktree,
     GitCommandFailed,
     GitCommandTimeout,
@@ -48,6 +50,13 @@ logger = get_logger(__name__)
 #: Marker appended when diff text is truncated, so a reader (human or
 #: reviewer model) can never mistake a clipped diff for a complete one.
 DIFF_TRUNCATION_MARKER = "\n[diff truncated by orchestrator]\n"
+
+#: How Git summarises a binary change when it was not asked for the content:
+#: ``Binary files a/logo.png and b/logo.png differ``. A patch carrying this
+#: line describes a change it cannot reapply, and ``git apply`` rejects such a
+#: patch in full -- see ``restore_patch`` (concern 80). A ``--binary`` capture
+#: emits ``GIT binary patch`` and a base85 blob instead, and never this.
+_BINARY_WITHOUT_CONTENT = re.compile(r"^Binary files .* differ$", re.MULTILINE)
 
 @dataclass(frozen=True, slots=True)
 class CommitSummary:
@@ -540,16 +549,29 @@ class GitService:
         *,
         include_untracked: bool = True,
         max_bytes: int | None = None,
+        binary: bool = False,
     ) -> str:
         """Unified diff of the working tree against ``base``.
 
         Truncation is explicit: when ``max_bytes`` is given and exceeded, the
         text ends with ``DIFF_TRUNCATION_MARKER`` rather than being silently
         cut, because a reviewer must know it did not see everything.
+
+        ``binary`` makes the diff *restorable* rather than merely readable
+        (concern 80). Without it Git summarises a binary change as the single
+        line ``Binary files a/x and b/x differ``, which carries no content and
+        which ``git apply`` refuses -- and refuses *atomically*, taking every
+        text file in the same patch down with it. Off by default because every
+        other caller renders the diff for a person or a scanner, and a
+        base85 blob helps neither; ``restore_patch``'s producer is the one
+        caller that has to be able to reconstruct the tree from it.
         """
         if include_untracked:
             self.stage_all(intent_to_add=True)
-        diff = self._run("diff", "--no-color", base).stdout
+        args = ["diff", "--no-color"]
+        if binary:
+            args.append("--binary")
+        diff = self._run(*args, base).stdout
         if max_bytes is not None and len(diff.encode()) > max_bytes:
             return diff.encode()[:max_bytes].decode(errors="ignore") + DIFF_TRUNCATION_MARKER
         return diff
@@ -802,7 +824,29 @@ class GitService:
         return resolved
 
     def restore_patch(self, base: str, patch: str) -> None:
-        """Discard command side effects, then restore the measured candidate."""
+        """Discard command side effects, then restore the measured candidate.
+
+        Concern 80. This is the one place in the system that destroys a
+        candidate and then rebuilds it from a patch, so the patch has to be
+        able to rebuild it. The check below runs *before* the reset for that
+        reason: a patch that cannot restore what it describes must stop this
+        method while the candidate is still on disk, rather than after.
+
+        The failure it guards against was not hypothetical. A diff captured
+        without ``--binary`` renders a binary file as ``Binary files a/x and
+        b/x differ``; ``git apply`` rejects that patch whole, so the reset had
+        already removed every *text* file in the candidate too. A multi-attempt
+        run then continued from a worktree holding only its latest attempt's
+        edits, and the reviewer was shown a candidate with the implementation
+        missing.
+        """
+        if _BINARY_WITHOUT_CONTENT.search(patch):
+            raise CandidateNotRestorable(
+                self.path,
+                "the captured patch describes a binary change without its "
+                "content, so restoring it would discard the candidate without "
+                "being able to rebuild it; capture with binary=True",
+            )
         self.reset_hard_to_sha(base)
         if patch.strip():
             self._run("apply", "--whitespace=nowarn", "-", input_text=patch)

@@ -574,3 +574,134 @@ def test_a_command_that_never_finishes_fails_its_category_without_an_exit_code(
     assert step.status is VerificationStatus.TIMEOUT
     assert step.exit_code is None
     assert "timed out" in report.feedback
+
+
+# --- concern 80: verification is observational on the candidate --------------
+#
+# The invariant: after ``verify_candidate`` returns, the worktree represents
+# the same complete cumulative candidate relative to the run's starting commit
+# that entered it. Review, commit and the final guards all recapture from that
+# commit, so a candidate damaged here is damaged for all of them.
+#
+# Found by a multi-attempt Angular task. The preservation capture summarised a
+# binary asset as "Binary files ... differ" instead of carrying its content,
+# ``git apply`` rejected the patch *in full*, and the reset that preceded it
+# had already removed every text file in the candidate too. The next attempt
+# changed one file, verification passed, and the reviewer was shown a one-file
+# candidate and reported the implementation missing.
+
+
+@pytest.fixture
+def c80_workspace(
+    session: Session, project: Project, verification_settings: Settings
+) -> TaskWorkspace:
+    """A run whose task declares every path the two attempts touch.
+
+    The stock ``task`` fixture declares only ``src/nav.py``, so a multi-file
+    candidate is blocked by the scope guard *before* any command runs -- which
+    would make these tests pass without ever reaching the preservation
+    boundary they exist to exercise. (That the guard sees all four paths is
+    itself evidence it reads the cumulative candidate, not the latest attempt.)
+    """
+    tasks = TaskRepository(session)
+    task = tasks.add(
+        Task(
+            project_id=project.id,
+            external_task_id="TS-080",
+            title="A candidate built over two attempts",
+            files_to_modify=[
+                "src/nav.py",
+                "src/feature.py",
+                "src/model.py",
+                "src/logo.png",
+            ],
+        )
+    )
+    tasks.transition(task.id, TaskStatus.READY)
+    created = create_run(session, task.id)
+    tasks.transition(task.id, TaskStatus.CODING)
+    return prepare_workspace(session, created.id, settings=verification_settings)
+
+
+def _cumulative(space: TaskWorkspace) -> dict[str, str]:
+    """The candidate relative to the run's starting commit: path -> kind."""
+    return {
+        change.path: change.change_type.value
+        for change in space.git.get_changed_files(space.starting_commit)
+    }
+
+
+def test_verification_preserves_a_multi_attempt_cumulative_candidate(
+    session: Session, c80_workspace: TaskWorkspace, verification_settings: Settings
+):
+    """Concern 80, through the real pipeline.
+
+    Two attempts' work in one worktree, including a binary asset and files the
+    *earlier* attempt created, then a verification run whose commands write
+    into the tree. What comes out must be what went in.
+    """
+    # Attempt 1: new files, a binary asset, and a working implementation.
+    (c80_workspace.path / "src" / "feature.py").write_text(
+        "def feature():\n    return 1\n", encoding="utf-8"
+    )
+    (c80_workspace.path / "src" / "model.py").write_text(
+        "MODEL = {'id': 'x'}\n", encoding="utf-8"
+    )
+    (c80_workspace.path / "src" / "logo.png").write_bytes(bytes([0, 1, 2, 255, 10, 13, 7]))
+    # Attempt 2, the repair: one tracked file, nothing else.
+    candidate(c80_workspace, "def navigate(target):\n    return target.strip()\n")
+
+    before = _cumulative(c80_workspace)
+    before_diff = c80_workspace.git.get_diff(c80_workspace.starting_commit, binary=True)
+    logo = (c80_workspace.path / "src" / "logo.png").read_bytes()
+    assert set(before) == {
+        "src/feature.py",
+        "src/model.py",
+        "src/logo.png",
+        "src/nav.py",
+    }
+
+    report = verify(session, c80_workspace, verification_settings)
+
+    # The run itself is beside the point; the worktree afterwards is not.
+    assert report is not None
+    after = _cumulative(c80_workspace)
+    assert after == before, "verification changed the cumulative candidate"
+    # The earlier attempt's files are still here, with their contents.
+    assert (c80_workspace.path / "src" / "feature.py").read_text(encoding="utf-8") == (
+        "def feature():\n    return 1\n"
+    )
+    assert (c80_workspace.path / "src" / "model.py").exists()
+    assert (c80_workspace.path / "src" / "logo.png").read_bytes() == logo
+    # The later attempt's edit survived, rather than the base version.
+    assert (c80_workspace.path / "src" / "nav.py").read_text(encoding="utf-8") == (
+        "def navigate(target):\n    return target.strip()\n"
+    )
+    # And the cumulative diff a reviewer would now capture is equivalent.
+    assert c80_workspace.git.get_diff(c80_workspace.starting_commit, binary=True) == before_diff
+
+
+def test_the_review_diff_after_verification_shows_every_attempts_work(
+    session: Session, c80_workspace: TaskWorkspace, verification_settings: Settings
+):
+    """The reviewer-facing consequence, asserted where the reviewer reads it.
+
+    ``capture_diff`` is what builds the review package, and it recaptures from
+    the starting commit. The bug was never in the reviewer or in the package:
+    it was that the worktree no longer held the candidate by the time either
+    of them looked.
+    """
+    (c80_workspace.path / "src" / "feature.py").write_text(
+        "def feature():\n    return 1\n", encoding="utf-8"
+    )
+    (c80_workspace.path / "src" / "logo.png").write_bytes(bytes([0, 1, 2, 255]))
+    candidate(c80_workspace, "def navigate(target):\n    return target.strip()\n")
+
+    verify(session, c80_workspace, verification_settings)
+    review_diff = capture_diff(c80_workspace)
+
+    paths = {change.path for change in review_diff.summary.files}
+    assert "src/feature.py" in paths, "the earlier attempt's work reached the reviewer"
+    assert "src/nav.py" in paths
+    assert len(paths) >= 3, f"a one-file review package is the C80 symptom: {paths}"
+    assert "def feature():" in review_diff.text

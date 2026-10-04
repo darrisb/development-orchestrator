@@ -318,7 +318,13 @@ def _run_command_categories(
     if not to_run:
         return steps
 
-    candidate_patch = workspace.git.get_diff(workspace.starting_commit)
+    # Concern 80. ``binary=True`` is what makes this patch able to *rebuild*
+    # the candidate rather than merely describe it. The restore below resets
+    # and cleans the worktree first, and ``git apply`` rejects a patch whole,
+    # so a single binary file captured without its content would discard every
+    # text file in the candidate as well -- which is how a later attempt came
+    # to be reviewed as if the earlier attempts had never run.
+    candidate_patch = workspace.git.get_diff(workspace.starting_commit, binary=True)
     try:
         with worker_session(
             workspace.path,

@@ -18,6 +18,7 @@ from apps.orchestrator.domain.git import ChangeType
 from apps.orchestrator.services.git_errors import (
     BranchAlreadyExists,
     BranchMissing,
+    CandidateNotRestorable,
     DirtyWorktree,
     GitCommandFailed,
     MergeConflict,
@@ -448,3 +449,165 @@ def test_repository_hooks_do_not_run_during_a_commit(worktree: GitService, fixtu
     worktree.commit("TS-001: the answer")
 
     assert not marker.exists()
+
+
+# --- concern 80: verification is observational on the candidate --------------
+#
+# The invariant: after the verification preservation boundary, the worktree
+# represents the same complete cumulative candidate relative to the run's
+# starting commit that entered it. Review, commit and the final guards all
+# read the worktree from that commit, so anything lost here is lost to all of
+# them.
+#
+# The defect was found by a multi-attempt Angular task. One binary file in the
+# candidate made the captured patch unappliable, and ``git apply`` rejects a
+# patch *in full*, so the reset had already taken every text file with it. The
+# next attempt changed one file, verification passed, and the reviewer was
+# shown a one-file candidate and concluded the implementation was missing.
+
+
+def _candidate(worktree: GitService, base: str) -> tuple[dict[str, ChangeType], str]:
+    """The cumulative candidate relative to ``base``: paths, kinds and diff."""
+    paths = {
+        change.path: change.change_type
+        for change in worktree.get_changed_files(base)
+    }
+    return paths, worktree.get_diff(base, binary=True)
+
+
+def _multi_attempt_candidate(worktree: GitService) -> None:
+    """Two coding attempts' worth of work, accumulated in one worktree.
+
+    The shape that mattered: the files the reviewer did not see were created
+    by the *earlier* attempt, and the later attempt touched one tracked file.
+    """
+    # Attempt 1: new files (untracked), a tracked modification, a deletion,
+    # and a binary asset -- the ingredient that made the patch unappliable.
+    (worktree.path / "src" / "feature.ts").write_text(
+        "export class Feature {}\n", encoding="utf-8"
+    )
+    (worktree.path / "src" / "model.ts").write_text(
+        "export interface Model { id: string }\n", encoding="utf-8"
+    )
+    (worktree.path / "src" / "logo.png").write_bytes(bytes([0, 1, 2, 255, 10, 13, 7]))
+    (worktree.path / "README.md").unlink()
+    (worktree.path / "src" / "app.js").write_text(
+        "export const answer = 42;\n", encoding="utf-8"
+    )
+    # Attempt 2, the repair: one tracked file, nothing else.
+    (worktree.path / "src" / "app.js").write_text(
+        "export const answer = 43;\n", encoding="utf-8"
+    )
+
+
+def test_the_cumulative_candidate_survives_the_verification_boundary(
+    worktree: GitService,
+):
+    """Concern 80, the invariant itself.
+
+    Capture, let commands write into the tree, restore -- and the candidate
+    relative to the starting commit must be the one that went in, not the
+    latest attempt's slice of it.
+    """
+    base = worktree.get_head_sha()
+    _multi_attempt_candidate(worktree)
+    before_paths, before_diff = _candidate(worktree, base)
+    logo = (worktree.path / "src" / "logo.png").read_bytes()
+
+    # What verification does: capture, run commands, restore.
+    patch = worktree.get_diff(base, binary=True)
+    (worktree.path / "src" / "app.js").write_text("MANGLED BY A BUILD\n", encoding="utf-8")
+    (worktree.path / "src" / "bundle.js").write_text("build output\n", encoding="utf-8")
+    (worktree.path / "src" / "feature.ts").unlink()
+    worktree.restore_patch(base, patch)
+
+    after_paths, after_diff = _candidate(worktree, base)
+
+    # Structural: the same paths, with the same change kinds.
+    assert after_paths == before_paths
+    assert after_paths["src/feature.ts"] is ChangeType.ADDED
+    assert after_paths["src/model.ts"] is ChangeType.ADDED
+    assert after_paths["src/app.js"] is ChangeType.MODIFIED
+    assert after_paths["README.md"] is ChangeType.DELETED
+    # The earlier attempt's files are back, with their contents.
+    assert (worktree.path / "src" / "feature.ts").read_text(encoding="utf-8") == (
+        "export class Feature {}\n"
+    )
+    assert (worktree.path / "src" / "model.ts").exists()
+    # The later attempt's edit is the one that survived, not the base version.
+    assert (worktree.path / "src" / "app.js").read_text(encoding="utf-8") == (
+        "export const answer = 43;\n"
+    )
+    # The deletion is still a deletion.
+    assert not (worktree.path / "README.md").exists()
+    # Binary content is restored byte for byte, not approximately.
+    assert (worktree.path / "src" / "logo.png").read_bytes() == logo
+    # And the cumulative diff is equivalent.
+    assert after_diff == before_diff
+    # Verification is still not allowed to leave its side effects behind.
+    assert not (worktree.path / "src" / "bundle.js").exists()
+
+
+def test_a_binary_candidate_captured_without_its_content_is_unrestorable(
+    worktree: GitService,
+):
+    """The exact mechanism, pinned so it cannot come back.
+
+    A diff captured without ``binary=True`` summarises the asset as a line of
+    prose. ``git apply`` rejects such a patch whole -- so this is not "the
+    binary file is lost", it is "the whole candidate is lost".
+    """
+    base = worktree.get_head_sha()
+    _multi_attempt_candidate(worktree)
+
+    readable = worktree.get_diff(base)
+    restorable = worktree.get_diff(base, binary=True)
+
+    assert "Binary files" in readable, "the readable capture summarises the asset"
+    assert "Binary files" not in restorable
+    assert "GIT binary patch" in restorable, "the restorable capture carries content"
+    # Both describe the same set of paths; only one can rebuild them.
+    assert "src/feature.ts" in readable and "src/feature.ts" in restorable
+
+
+def test_an_unrestorable_patch_is_refused_before_the_candidate_is_discarded(
+    worktree: GitService,
+):
+    """Concern 80's safety property, which is about ordering.
+
+    The reset cannot be undone, so the refusal has to come first. A caller
+    that hands over a patch which cannot rebuild the candidate gets an error
+    and a worktree that still holds the candidate -- the previous behaviour
+    was an error and an empty worktree.
+    """
+    base = worktree.get_head_sha()
+    _multi_attempt_candidate(worktree)
+    before_paths, _ = _candidate(worktree, base)
+
+    with pytest.raises(CandidateNotRestorable):
+        worktree.restore_patch(base, worktree.get_diff(base))
+
+    after_paths, _ = _candidate(worktree, base)
+    assert after_paths == before_paths, "the candidate must still be on disk"
+    assert (worktree.path / "src" / "feature.ts").exists()
+    assert (worktree.path / "src" / "logo.png").exists()
+
+
+def test_a_text_only_candidate_still_restores_without_binary_capture(
+    worktree: GitService,
+):
+    """The guard is about binary content, not about tightening the contract.
+
+    A candidate with no binary files produces a patch with no such line, and
+    the existing text-only restore path is unchanged.
+    """
+    base = worktree.get_head_sha()
+    (worktree.path / "src" / "feature.ts").write_text("export class F {}\n", encoding="utf-8")
+    (worktree.path / "src" / "app.js").write_text("export const answer = 42;\n", encoding="utf-8")
+    before_paths, before_diff = _candidate(worktree, base)
+
+    worktree.restore_patch(base, worktree.get_diff(base))
+
+    after_paths, after_diff = _candidate(worktree, base)
+    assert after_paths == before_paths
+    assert after_diff == before_diff
