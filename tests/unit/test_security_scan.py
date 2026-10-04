@@ -396,3 +396,128 @@ def test_the_name_itself_is_never_what_excuses_a_line():
     evidence of a value beside it."""
     assert ts_declaration("  totalTokens: number;").decision is ScopePolicyDecision.ALLOW
     assert ts_declaration("totalTokens=Zx91fakefakenotrealvalue").blocked
+
+
+# ------------------- a member expression is code, not credential material
+#
+# UI-002 run #4. A 13-file, 351-line candidate built and tested green and then
+# failed the security scan alone, on diff line 96:
+#
+#     totalTokens = usage.totalTokens;
+#
+# Usage-accounting code. ``TOKEN`` is a secret-name hint and must stay one, and
+# the previous correction deliberately treated ``=`` as strong evidence of an
+# assignment -- which it is. What it is not is evidence of a *literal*: what
+# follows the ``=`` here is a property read, so the value is somewhere else
+# entirely. That is the same thing ``_REFERENCE_MARKERS`` already says about
+# ``config.``, ``settings.`` and ``process.env``, which are member expressions
+# spelled out one prefix at a time.
+
+
+def ts_usage(*lines: str):
+    """Scan added lines as a TypeScript usage-accounting module."""
+    return scan_candidate(diff_adding(*lines), summary(changed("src/usage.ts")))
+
+
+def test_the_reported_token_usage_assignment_does_not_block():
+    """UI-002 run #4, diff line 96, exactly as it appeared."""
+    assessment = ts_usage("        totalTokens = usage.totalTokens;")
+
+    assert assessment.decision is ScopePolicyDecision.ALLOW
+    assert assessment.findings == ()
+
+
+def test_the_surrounding_token_accounting_code_does_not_block():
+    """The whole neighbourhood from the production diff, scanned together."""
+    assessment = ts_usage(
+        "  let totalTokens = 0;",
+        "        totalTokens = usage.totalTokens;",
+        "        this.totalTokens = usage.totalTokens;",
+        "      prompt_tokens: 120,",
+        "      completion_tokens: 80,",
+        "      total_tokens: 200,",
+        "    expect(totalTokens).toBe(200);",
+    )
+
+    assert assessment.decision is ScopePolicyDecision.ALLOW, assessment.summary()
+    assert assessment.findings == ()
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # The observed shape and its near neighbours: a credential-shaped name
+        # assigned the result of reading a property off something else.
+        "        totalTokens = usage.totalTokens;",
+        "        this.totalTokens = usage.totalTokens;",
+        "  authToken = response.data.token;",
+        "  apiKey = this.config.apiKey;",
+        "  sessionId = req.session.id;",
+        "  state.totalTokens = result.usage.totalTokens;",
+        # A deep but still realistic property chain, near the length bound.
+        "  state.totalTokens = this.state.response.usage.totalTokens;",
+    ],
+)
+def test_a_member_expression_assignment_does_not_block(line: str):
+    assessment = ts_usage(line)
+
+    assert assessment.decision is ScopePolicyDecision.ALLOW, line
+    assert assessment.findings == (), line
+
+
+def test_the_earlier_type_declaration_correction_still_holds():
+    """The previous fix is not regressed by this one."""
+    assessment = ts_usage("  readonly totalTokens: number;")
+
+    assert assessment.decision is ScopePolicyDecision.ALLOW
+    assert assessment.findings == ()
+
+
+@pytest.mark.parametrize(
+    ("line", "why"),
+    [
+        # A bare value after ``=`` is still a literal, dot or no dot. This is
+        # the clause that keeps the rule from becoming "ignore assignments".
+        ("TOKEN=Zx91fakefakenotrealvalue", "bare literal after ="),
+        ("API_TOKEN=Zx91fakefakenotrealvalue", "bare literal after ="),
+        ("  totalTokens = Zx91fakefakenotrealvalue;", "same name, real literal"),
+        # A quoted value is data wherever it appears.
+        ('  apiToken = "Zx91fakefakenotrealvalue";', "quoted literal"),
+        ('  "api_token": "Zx91fakefakenotrealvalue",', "quoted JSON value"),
+        # Punctuation cannot be spelled as a member expression.
+        ("  secret_key = Zx91-fakefake/notreal+value;", "punctuated literal"),
+        # A call is not a property read, and is deliberately left blocking.
+        ("  apiToken = getToken();", "function call"),
+        ("  apiToken = auth.getToken();", "method call"),
+        # The content-identifying shapes remain the backstop.
+        ('const key = "sk-ZZfakefakefakefakefake1234";', "provider prefix"),
+        ("  aws_access_key = AKIAZZ91FAKEFAKEFAKE;", "AWS prefix"),
+        (
+            "  authToken = eyJhbGciOiJIUzI1NiJ9.ZZfakebodyZZfake.ZZfakesigZZfake;",
+            "JWT backstop on a dotted value",
+        ),
+        # Dotted credentials that no content shape recognises, and which
+        # blocked on the ``=`` separator before this narrowing. They are the
+        # reason the member-expression rule is bounded by length: a property
+        # chain is short, random key material is not. Synthetic, but shaped
+        # like SendGrid and Airtable keys.
+        (
+            "  api_key = SG.aBcD1234567890abcdef.XyZ9876543210fedcbaABCDEFGHijklmnop;",
+            "dotted provider key, too long to be a property chain",
+        ),
+        (
+            "  api_token = pat9aBcDeFgHiJkL.7f3c9a1b2d4e6f8a0c2e4g6h8j0k2m4n6p8r0t2v4x6z;",
+            "dotted provider key, too long to be a property chain",
+        ),
+        (
+            "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.ZZfakebodyZZfake.ZZfakesigZZfake",
+            "auth header",
+        ),
+    ],
+)
+def test_real_credential_assignments_still_block(line: str, why: str):
+    assessment = ts_usage(line)
+
+    assert assessment.blocked, f"{why}: {line}"
+    assert assessment.findings[0].kind is SecurityFindingKind.SECRET_MATERIAL
+    assert "Zx91fakefake" not in assessment.summary(), line

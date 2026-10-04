@@ -145,6 +145,36 @@ _IDENTIFIER_VALUE = re.compile(
     r"(?:\[\])*$"                        # ...or Foo[][]
 )
 
+#: What makes an identifier-shaped value a *member expression* -- ``usage.
+#: totalTokens`` rather than ``Zx91fakefakevalue``. A dot means the value being
+#: read lives on another object, so whatever the credential-shaped name is
+#: being given, it is not spelled on this line.
+#:
+#: This is the structural form of something the scanner already asserts one
+#: prefix at a time: ``_REFERENCE_MARKERS`` lists ``config.``, ``settings.``,
+#: ``secrets.``, ``process.env`` and ``os.environ``, every one of which is a
+#: member expression, allowed for exactly this reason. The list cannot
+#: enumerate every object a project reads a count off, so the shape is read
+#: instead of the prefix.
+_MEMBER_ACCESS = "."
+
+#: How long a member expression may be and still read as code.
+#:
+#: The dot alone is not quite enough, because some real credentials are dotted
+#: too -- a JWT, a SendGrid or Airtable key. The JWT is caught by
+#: ``prefixed_key`` whatever this rule says, but the others are not, and before
+#: this narrowing they blocked on the ``=`` separator alone. Letting them
+#: through would be a regression, not a refinement.
+#:
+#: What separates them is length, and not marginally: the longest property
+#: chain in the production evidence is ``result.usage.totalTokens`` at 24
+#: characters, and ``this.state.response.usage.totalTokens`` reaches 37, while
+#: dotted key material starts around 59 because its segments are random. The
+#: bound sits in that gap. A length threshold is the same kind of judgement
+#: the scanner already makes in ``MIN_REDACTABLE_LENGTH`` and in the shapes'
+#: own ``{6,}``.
+_MAX_MEMBER_EXPRESSION_LENGTH = 48
+
 #: A PEM header on its own line. See ``_secret_findings``.
 _PEM_HEADER = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 
@@ -381,20 +411,29 @@ def _insufficient_evidence(text: str, match: re.Match[str]) -> bool:
     Three structural facts, all taken from the match itself, and a genuine
     credential contradicts at least one:
 
-    1. **The separator is ``:``, not ``=``.** ``NAME=value`` is an assignment
-       wherever it is spelled that way, and nothing annotates a type with
-       ``=``. This alone keeps every ``TOKEN=...`` finding.
-    2. **The value is unquoted.** A quoted value is data. This alone keeps
-       every JSON and YAML string credential, which is where a colon and a
-       real secret legitimately meet.
-    3. **The value is spelled as a plain identifier.** Credential material is
-       not: it carries punctuation or a provider prefix, and both are what the
-       content-identifying shapes read.
+    1. **The value is unquoted.** A quoted value is data. This alone keeps
+       every JSON and YAML string credential, and every ``key = "sk-..."``.
+    2. **The value is spelled as an identifier**, optionally qualified.
+       Credential material is not: it carries punctuation or a provider
+       prefix, and both are what the content-identifying shapes read. A call
+       is not one either -- ``getToken()`` keeps its bracket, so
+       ``apiToken = getToken()`` is left to block.
+    3. **What the separator then licenses**, and this is where the two
+       readings part:
 
-    All three together leave a name, a colon and a bare word -- which is the
-    shape of ``totalTokens: number``, of ``apiKey: string`` and of every
-    project type beside them. The name is the only thing suggesting a
-    credential, and a name is not evidence of a value.
+       * After ``:`` a bare word is enough. ``totalTokens: number``,
+         ``apiKey: string`` and every project type beside them annotate what
+         the value *is*; the value itself is not on the line.
+       * After ``=`` a bare word is **not** enough, because ``TOKEN=abc123``
+         really is a literal. What is enough is a **member expression**:
+         ``totalTokens = usage.totalTokens`` reads a property off another
+         object, so again the value is not on the line -- provided it is short
+         enough to be a property chain and not a dotted key. See
+         ``_MEMBER_ACCESS`` and ``_MAX_MEMBER_EXPRESSION_LENGTH``.
+
+    In both cases what is left is a credential-shaped *name* next to something
+    that is not a credential-shaped *value*, and a name is not evidence of a
+    value.
 
     This is a decision not to *block*, not a decision that the line is safe.
     The loop continues to the content-identifying shapes, so a real key on the
@@ -403,12 +442,26 @@ def _insufficient_evidence(text: str, match: re.Match[str]) -> bool:
     """
     before = text[: match.start("secret")]
     # The shape consumes an opening quote before the value, so a quote here
-    # means the value was quoted: data, not an annotation.
+    # means the value was quoted: data, not an annotation or a property read.
     if before.endswith(('"', "'")):
         return False
-    if not before.rstrip().endswith(":"):
+    value = match.group("secret")
+    if not _IDENTIFIER_VALUE.match(value):
         return False
-    return bool(_IDENTIFIER_VALUE.match(match.group("secret")))
+    separator = before.rstrip()[-1:]
+    if separator == ":":
+        # An annotation: the name is being told what type it has.
+        return True
+    if separator == "=":
+        # An assignment, so a bare word here would be a literal and must
+        # block. Only a member expression says the value is elsewhere -- and
+        # only one short enough to be a property chain rather than a dotted
+        # key.
+        return (
+            _MEMBER_ACCESS in value
+            and len(value) <= _MAX_MEMBER_EXPRESSION_LENGTH
+        )
+    return False
 
 
 def _path_findings(
