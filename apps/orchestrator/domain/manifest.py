@@ -23,6 +23,11 @@ from .errors import ManifestError
 from .model_policy import ModelPolicy
 from .models import TaskLimits
 from .relevance import normalise_path
+from .runtime_contract import (
+    RuntimeContract,
+    RuntimeContractError,
+    parse_runtime_contract,
+)
 from .verification import VerificationProfile
 
 #: Manifest schema versions this build understands.
@@ -54,7 +59,9 @@ _TOP_LEVEL_KEYS = frozenset(
 _PROJECT_KEYS = frozenset({"id", "name", "repository", "default_branch"})
 _RUNTIME_KEYS = frozenset({"worker_profile", "max_parallel_tasks"})
 _MODEL_POLICY_KEYS = frozenset({"default_coder", "high_complexity_coder", "reviewer"})
-_VERIFICATION_KEYS = frozenset({"build", "lint", "tests", "security", "milestone_interval"})
+_VERIFICATION_KEYS = frozenset(
+    {"build", "lint", "tests", "security", "runtime", "milestone_interval"}
+)
 _TASK_KEYS = frozenset(
     {
         "id",
@@ -228,7 +235,27 @@ def _parse_verification_profile(verification: Mapping[str, Any]) -> Verification
         lint=_parse_string_list(verification.get("lint"), "verification.lint"),
         tests=_parse_string_list(verification.get("tests"), "verification.tests"),
         security=_parse_string_list(verification.get("security"), "verification.security"),
+        runtime=_parse_runtime(verification.get("runtime")),
     )
+
+
+def _parse_runtime(value: Any) -> RuntimeContract | None:
+    """The optional runtime contract (concern 81), validated strictly.
+
+    ``runtime`` is absent from almost every manifest and must stay free to be:
+    a project that declares none keeps exactly the behaviour it had. What is
+    *declared* is validated as strictly as everything else here -- an unknown
+    key inside it is a typo that would otherwise silently drop an assertion,
+    which is the failure mode this parser exists to prevent.
+
+    ``RuntimeContractError`` is re-raised as ``ManifestError`` so an author
+    sees one kind of failure for one kind of mistake, whichever part of the
+    document it is in.
+    """
+    try:
+        return parse_runtime_contract(value, where="verification.runtime")
+    except RuntimeContractError as error:
+        raise ManifestError(str(error)) from error
 
 
 def _parse_model_policy(value: Any) -> ModelPolicy:

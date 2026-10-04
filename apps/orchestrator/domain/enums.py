@@ -103,6 +103,11 @@ class VerificationType(StrEnum):
     LINT = "LINT"
     TESTS = "TESTS"
     SECURITY = "SECURITY"
+    #: The optional runtime/browser contract a project declared (concern 81).
+    #: It runs after every command category, because starting an application
+    #: that does not build proves nothing, and before the diff checks, because
+    #: a running server writes caches into the worktree.
+    RUNTIME = "RUNTIME"
     DIFF_POLICY = "DIFF_POLICY"
     #: The cumulative gate over the merged tree (concern 51). The same commands
     #: as the three above, run against a different tree, so they are recorded

@@ -640,12 +640,10 @@ def _project_row(manifest: dict[str, Any]) -> dict[str, Any]:
             if parsed.approval_gated_categories is not None
             else None
         ),
-        "verification_profile": {
-            "build": list(parsed.verification.build),
-            "lint": list(parsed.verification.lint),
-            "tests": list(parsed.verification.tests),
-            "security": list(parsed.verification.security),
-        },
+        # ``describe`` rather than a hand-written mapping: it is the stored
+        # form, so a manifest that declares a runtime contract (concern 81)
+        # keeps it through a reconstruction instead of silently losing it.
+        "verification_profile": parsed.verification.describe(),
         "milestone_interval": parsed.milestone_interval,
     }
 

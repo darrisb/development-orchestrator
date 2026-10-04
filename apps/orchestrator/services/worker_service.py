@@ -733,7 +733,12 @@ class Worker:
         """The managed background process, running or finished, if any."""
         return self._background
 
-    def start_background(self, command: str | ApprovedCommand) -> BackgroundProcess:
+    def start_background(
+        self,
+        command: str | ApprovedCommand,
+        *,
+        environment: Mapping[str, str] | None = None,
+    ) -> BackgroundProcess:
         """Start the worker's one managed long-running process.
 
         The command goes through the *same* ``CommandPolicy`` as ``run``:
@@ -750,17 +755,35 @@ class Worker:
         useful. Readiness -- a port open, an HTTP answer, a page rendered --
         belongs to the caller that knows what it asked to be started.
 
+        Args:
+            environment: extra variables for *this process only*, on top of the
+                worker's own. A long-running program often needs one (a port, a
+                mode) that the foreground commands must not see, and widening
+                the worker's environment to carry it would change the
+                environment the build and the tests ran in. Credential-shaped
+                names are refused: a secret reaches a worker by being injected
+                at its creation (section 11), not through a caller's keyword.
+
         Raises:
             CommandRejected: the command is not permitted by this policy.
             WorkerNotRunning: the worker is closed or tainted.
             BackgroundProcessAlreadyRunning: one is already alive (V1 limit).
             BackgroundProcessStartFailed: the process could not be started.
             WorkerBackendUnavailable: this backend has no background support.
+            ValueError: ``environment`` names something credential-shaped.
         """
         if self._closed or self._tainted:
             raise WorkerNotRunning(
                 f"Worker {self.spec.worker_id} is no longer running"
                 + (" (a previous command timed out)" if self._tainted else "")
+            )
+        extra = dict(environment or {})
+        refused = sorted(name for name in extra if is_secret_name(name))
+        if refused:
+            raise ValueError(
+                f"a managed background process may not be given credential-shaped "
+                f"variable(s) {', '.join(refused)}; inject secrets when the worker "
+                f"is created"
             )
         approved = (
             command if isinstance(command, ApprovedCommand) else self.policy.approve(command)
@@ -784,9 +807,11 @@ class Worker:
             "redactor": self.redactor,
         }
         if self.spec.backend is WorkerBackend.DOCKER:
-            process: BackgroundProcess = self._start_background_container(approved, common)
+            process: BackgroundProcess = self._start_background_container(
+                approved, common, extra
+            )
         elif self.spec.backend is WorkerBackend.SUBPROCESS:
-            process = self._start_background_host(approved, common)
+            process = self._start_background_host(approved, common, extra)
         else:  # pragma: no cover - a backend added without deciding this
             raise WorkerBackendUnavailable(
                 f"the {self.spec.backend} backend does not support a managed background "
@@ -837,13 +862,16 @@ class Worker:
             )
 
     def _start_background_host(
-        self, approved: ApprovedCommand, common: dict[str, object]
+        self,
+        approved: ApprovedCommand,
+        common: dict[str, object],
+        extra_environment: Mapping[str, str],
     ) -> BackgroundProcess:
         try:
             process = subprocess.Popen(  # noqa: S603 - approved argv, never a shell
                 list(approved.argv),
                 cwd=str(self.spec.mount_source),
-                env=self._process_environment(),
+                env={**(self._process_environment() or {}), **extra_environment},
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
@@ -860,7 +888,10 @@ class Worker:
         return _HostBackgroundProcess(process=process, drains=drains, **common)  # type: ignore[arg-type]
 
     def _start_background_container(
-        self, approved: ApprovedCommand, common: dict[str, object]
+        self,
+        approved: ApprovedCommand,
+        common: dict[str, object],
+        extra_environment: Mapping[str, str] | None = None,
     ) -> BackgroundProcess:
         if self.container_id is None:
             raise WorkerNotRunning(f"Worker {self.spec.worker_id} has no container")
@@ -900,7 +931,7 @@ class Worker:
             argv += ["--tmpfs", f"{target}:{options}"]
         if self.spec.user:
             argv += ["--user", self.spec.user]
-        for key, value in self.spec.environment.items():
+        for key, value in {**self.spec.environment, **(extra_environment or {})}.items():
             argv += ["--env", f"{key}={value}"]
         argv += [self.spec.image or "", *approved.argv]
 

@@ -42,6 +42,7 @@ from .enums import (
 from .failure_identity import MAX_RENDERED_IDENTITIES, FailureComparison
 from .repair_evidence import MAX_EVIDENCE_EXCERPT_LINES, RepairEvidence
 from .repair_evidence import build as build_repair_evidence
+from .runtime_contract import RuntimeContract
 
 #: The pipeline, in section 17's order. ``SCOPE`` runs before anything is
 #: executed -- a candidate that already broke its allowance should not get a
@@ -53,6 +54,7 @@ PIPELINE_ORDER: tuple[VerificationType, ...] = (
     VerificationType.LINT,
     VerificationType.TESTS,
     VerificationType.SECURITY,
+    VerificationType.RUNTIME,
     VerificationType.DIFF_POLICY,
 )
 
@@ -74,6 +76,17 @@ FAILURE_REASONS: Mapping[VerificationType, FailureReason] = {
     VerificationType.LINT: FailureReason.LINT_FAILED,
     VerificationType.TESTS: FailureReason.TEST_FAILED,
     VerificationType.SECURITY: FailureReason.SECURITY_FAILED,
+    # **Temporary, V1 (concern 81).** A runtime contract that the candidate
+    # application did not satisfy is routed through ``TEST_FAILED`` so it
+    # reaches the coder with its evidence (``SEND_TO_CODER``) rather than
+    # falling through to a generic handler. This does *not* mean a runtime
+    # failure is a test: it means V1 adds no new failure class. A future
+    # concern is expected to introduce ``RUNTIME_FAILED`` for reporting,
+    # policy and accounting clarity, at which point this entry changes and
+    # nothing else here has to. Note that this mapping applies to a *candidate*
+    # failure only: a runtime step that could not execute at all carries
+    # ``WORKER_FAILURE`` through ``VerificationStep.failure_reason_override``.
+    VerificationType.RUNTIME: FailureReason.TEST_FAILED,
     VerificationType.DIFF_POLICY: FailureReason.SCOPE_VIOLATION,
 }
 
@@ -128,10 +141,30 @@ class VerificationProfile:
     lint: tuple[str, ...] = ()
     tests: tuple[str, ...] = ()
     security: tuple[str, ...] = ()
+    #: The optional runtime contract (concern 81), or ``None``. Not a command
+    #: list: a contract declares how the application is started and what must
+    #: be observed once it is up, and the orchestrator runs exactly one of
+    #: them. Optional in the strongest sense -- a project that declares none
+    #: behaves exactly as it did before this field existed.
+    runtime: RuntimeContract | None = None
 
     @property
     def is_empty(self) -> bool:
+        """Whether this project declared no verification **commands**.
+
+        Deliberately unchanged by the runtime contract. This property's one
+        caller warns that a report will pass without having been verified, and
+        ``VerificationReport.verified`` is computed from ``COMMAND_CATEGORIES``
+        -- which ``RUNTIME`` is not a member of, because it is not a list of
+        project commands. Folding the contract in here would have the pipeline
+        stop warning about a project whose report is still, correctly,
+        ``verified=False``. ``has_runtime`` is the question about the contract.
+        """
         return not any((self.build, self.lint, self.tests, self.security))
+
+    @property
+    def has_runtime(self) -> bool:
+        return self.runtime is not None
 
     def commands_for(self, category: VerificationType) -> tuple[str, ...]:
         return {
@@ -179,20 +212,36 @@ class VerificationProfile:
         """
         if not payload:
             return cls()
+        runtime = payload.get("runtime")
         return cls(
             build=_string_tuple(payload.get("build")),
             lint=_string_tuple(payload.get("lint")),
             tests=_string_tuple(payload.get("tests")),
             security=_string_tuple(payload.get("security")),
+            runtime=(
+                RuntimeContract.from_mapping(runtime)
+                if isinstance(runtime, Mapping)
+                else None
+            ),
         )
 
-    def describe(self) -> dict[str, list[str]]:
-        return {
+    def describe(self) -> dict[str, object]:
+        """The stored form, which is also the compared form.
+
+        ``runtime`` appears **only** when a contract was declared. That is what
+        keeps a project without one byte-identical to what earlier builds
+        stored, so the importer does not see a change to write on every import
+        and a legacy row round-trips unchanged.
+        """
+        described: dict[str, object] = {
             "build": list(self.build),
             "lint": list(self.lint),
             "tests": list(self.tests),
             "security": list(self.security),
         }
+        if self.runtime is not None:
+            described["runtime"] = self.runtime.describe()
+        return described
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +269,21 @@ class VerificationStep:
     detail: str = ""
     #: The tail of what the command printed, already redacted by the worker.
     output: str = ""
+    #: A failure class for this step that differs from its category's. One
+    #: category, two kinds of failure: a runtime contract the candidate did not
+    #: satisfy is the candidate's (``TEST_FAILED`` in V1), while a runtime
+    #: verifier that could not execute at all -- no browser in the image, a
+    #: cleanup that could not be proven -- is the infrastructure's
+    #: (``WORKER_FAILURE``). Converting the second into the first would send a
+    #: coder to fix code that is not broken, so the distinction is carried on
+    #: the step rather than inferred from the category.
+    failure_reason_override: FailureReason | None = None
+    #: Structured evidence for the steps that have more to say than an exit
+    #: code: the runtime contract's observations, its failed assertions, the
+    #: expected and observed values. Empty for everything else, and omitted
+    #: from ``describe`` when empty, so the stored report of a project that
+    #: declares no contract is unchanged.
+    evidence: Mapping[str, object] = field(default_factory=dict)
 
     @property
     def passed(self) -> bool:
@@ -231,7 +295,9 @@ class VerificationStep:
 
     @property
     def failure_reason(self) -> FailureReason | None:
-        return FAILURE_REASONS[self.verification_type] if self.failed else None
+        if not self.failed:
+            return None
+        return self.failure_reason_override or FAILURE_REASONS[self.verification_type]
 
     def describe(self) -> dict[str, object]:
         return {
@@ -243,6 +309,10 @@ class VerificationStep:
             "log_artifact": self.log_artifact,
             "executed": self.executed,
             "detail": self.detail,
+            "failure_reason": (
+                reason.value if (reason := self.failure_reason) is not None else None
+            ),
+            **({"evidence": dict(self.evidence)} if self.evidence else {}),
         }
 
 

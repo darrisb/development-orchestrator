@@ -77,8 +77,21 @@ def test_the_pipeline_runs_in_section_17s_order():
         VerificationType.LINT,
         VerificationType.TESTS,
         VerificationType.SECURITY,
+        # The optional runtime contract (concern 81) sits after everything that
+        # is executed against the source and before the checks made over the
+        # diff: an application that does not build cannot be started, and a
+        # running application writes into the worktree.
+        VerificationType.RUNTIME,
         VerificationType.DIFF_POLICY,
     )
+
+
+def test_the_runtime_contract_is_not_a_command_category():
+    """``COMMAND_CATEGORIES`` is the list of *project command lists*, and it is
+    what ``verified`` and ``unverified_categories`` are computed from. A
+    contract is not a command list, and adding it here would change both of
+    those for every project that declares no contract."""
+    assert VerificationType.RUNTIME not in COMMAND_CATEGORIES
 
 
 def test_scope_and_diff_policy_are_not_commands():

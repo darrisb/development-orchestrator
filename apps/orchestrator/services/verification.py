@@ -3,7 +3,9 @@
 Section 17's order, executed:
 
 ```text
-scope validation -> build -> lint -> targeted tests -> security -> diff policy
+scope -> dependency bootstrap -> build -> lint -> targeted tests ->
+security (project command) -> runtime contract -> security (diff scan) ->
+diff policy
 ```
 
 and then, only if all of it passed, the candidate is worth a reviewer's time.
@@ -92,6 +94,12 @@ from .dependency_bootstrap import (
     NETWORKLESS_VERIFICATION_NETWORK,
     bootstrap_dependencies,
 )
+from .runtime_verification import (
+    RuntimeOutcome,
+    RuntimeProbe,
+    store_runtime_log,
+    verify_runtime,
+)
 from .verification_baseline import classify as classify_against_baseline
 from .worker_service import worker_session
 from .workspace import DiffCapture, TaskWorkspace, capture_diff, load_run_context
@@ -153,6 +161,7 @@ def verify_candidate(
     *,
     settings: Settings | None = None,
     secrets: Mapping[str, str] | None = None,
+    runtime_probe: RuntimeProbe | None = None,
 ) -> VerificationReport:
     """Run the whole pipeline against the candidate in ``workspace``.
 
@@ -160,6 +169,10 @@ def verify_candidate(
         workspace: the run's worktree, holding the coder's uncommitted work.
         secrets: values the commands need, injected into the worker
             individually and redacted out of every log (section 36).
+        runtime_probe: the mechanism that observes the running application, for
+            the optional runtime contract (concern 81). ``None`` -- always,
+            outside a test -- means Chromium in the worker, driven by the
+            orchestrator's own probe.
 
     Raises:
         EntityNotFound: the run, its task or its project is missing.
@@ -233,6 +246,7 @@ def verify_candidate(
         _run_command_categories(
             session, run, task, project, workspace, profile, recorder,
             prefix=prefix, settings=config, secrets=secrets, executed=executed,
+            runtime_probe=runtime_probe,
         )
     )
 
@@ -294,13 +308,27 @@ def _run_command_categories(
     settings: Settings,
     secrets: Mapping[str, str] | None,
     executed: list[tuple[VerificationType, CommandExecution]],
+    runtime_probe: RuntimeProbe | None = None,
 ) -> list[VerificationStep]:
-    """Build, lint, tests and security, in order, in one worker.
+    """Build, lint, tests, security and the runtime contract, in one worker.
 
-    One worker for all four: they run against the same worktree in the same
-    state, and starting four containers would make the build's output
+    One worker for all of it: they run against the same worktree in the same
+    state, and starting a container per category would make the build's output
     invisible to the tests. The worker is destroyed before this returns,
     whatever happens (section 11).
+
+    The runtime contract (concern 81) belongs *here* rather than beside the
+    diff checks below, for two reasons, both load-bearing:
+
+    * It must not run unless the commands passed. An application that does not
+      compile cannot be started, and starting one whose tests fail would spend
+      a browser's minute to rediscover that.
+    * It must run **inside concern 80's candidate boundary.** A dev server
+      writes caches, a browser writes a profile, a production build writes
+      output -- and the candidate that goes to a reviewer must be the one that
+      was measured. The patch captured below is reapplied in ``finally``, so
+      everything the application and the browser left behind is discarded
+      rather than classified as the coder's work.
     """
     planned = {
         category: profile.commands_for(category) for category in COMMAND_CATEGORIES
@@ -315,7 +343,8 @@ def _run_command_categories(
         if not commands and category is not VerificationType.SECURITY
     ]
     to_run = {category: commands for category, commands in planned.items() if commands}
-    if not to_run:
+    contract = profile.runtime
+    if not to_run and contract is None:
         return steps
 
     # Concern 80. ``binary=True`` is what makes this patch able to *rebuild*
@@ -370,6 +399,34 @@ def _run_command_categories(
                         },
                     )
                     break
+            if contract is not None and not any(step.failed for step in steps):
+                # Only when every command category that had something to run
+                # passed. A failed build, lint, test or audit must prevent the
+                # application from ever being started.
+                outcome = store_runtime_log(
+                    session,
+                    run.id,
+                    verify_runtime(
+                        worker,
+                        contract,
+                        worktree=workspace.path,
+                        deadline_monotonic=worker_deadline,
+                        probe=runtime_probe,
+                    ),
+                    prefix=prefix,
+                    settings=settings,
+                )
+                steps.append(recorder.record(_runtime_step(outcome)))
+                if steps[-1].failed:
+                    _emit(
+                        session, run, task, project, RunEventType.BUILD_FAILED,
+                        {
+                            "category": VerificationType.RUNTIME.value,
+                            "command": contract.start,
+                            "status": steps[-1].status.value,
+                            "infrastructure": outcome.infrastructure,
+                        },
+                    )
     finally:
         workspace.git.restore_patch(workspace.starting_commit, candidate_patch)
     return _in_pipeline_order(steps)
@@ -436,6 +493,29 @@ def _bootstrap_error_step(detail: str) -> VerificationStep:
     )
 
 
+def _runtime_step(outcome: RuntimeOutcome) -> VerificationStep:
+    """The runtime contract's verdict as a pipeline step (concern 81).
+
+    ``executed`` is true: a worker really did start the application and open
+    the page. The failure reason comes from the outcome rather than from the
+    category, which is what keeps "the candidate's application is wrong" and
+    "this orchestrator could not check" two different answers -- the first goes
+    back to the coder, the second fails closed as ``WORKER_FAILURE``.
+    """
+    return VerificationStep(
+        verification_type=VerificationType.RUNTIME,
+        status=outcome.status,
+        command=f"runtime contract ({outcome.evidence.get('application_command', '')})",
+        duration_ms=outcome.duration_ms,
+        log_artifact=outcome.log_artifact,
+        executed=True,
+        detail=outcome.detail,
+        output=outcome.output[-MAX_STEP_OUTPUT_CHARS:],
+        failure_reason_override=outcome.failure_reason_override,
+        evidence=outcome.evidence,
+    )
+
+
 def _skipped_step(category: VerificationType) -> VerificationStep:
     return VerificationStep(
         verification_type=category,
@@ -497,7 +577,10 @@ def _in_pipeline_order(steps: Sequence[VerificationStep]) -> list[VerificationSt
     out of the record; ordering here means the report still reads as the
     pipeline, not as the order the rows happened to be written in.
     """
-    order = {category: index for index, category in enumerate(COMMAND_CATEGORIES)}
+    order = {
+        category: index
+        for index, category in enumerate((*COMMAND_CATEGORIES, VerificationType.RUNTIME))
+    }
     return sorted(steps, key=lambda step: order.get(step.verification_type, 99))
 
 

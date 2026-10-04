@@ -39,6 +39,10 @@ asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "integration: tests that require a live database or external service",
+    # Concern 81: the runtime/browser mechanism is proven against a real
+    # Chromium in a real worker container. Deselect with `-m "not docker"` on a
+    # host without Docker or without the worker image built.
+    "docker: tests that require the Docker daemon and a built worker image",
 ]
 filterwarnings = ["error::DeprecationWarning:apps.*"]
 
